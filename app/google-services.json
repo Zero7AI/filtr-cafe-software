@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "33460817163",
+    "project_id": "filtr-coffee-007",
+    "storage_bucket": "filtr-coffee-007.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:33460817163:android:b298236b5ed8baeaf1660e",
+        "android_client_info": {
+          "package_name": "filtr.coffee"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBNvsVYLa1LdClTrppXwOqHoUJYWCvvPH4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:33460817163:android:b298236b5ed8baeaf1660f",
+        "android_client_info": {
+          "package_name": "filtr.coffee.staff"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBNvsVYLa1LdClTrppXwOqHoUJYWCvvPH4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

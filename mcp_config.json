@@ -1,0 +1,11 @@
+{
+    "mcpServers": {
+        "n8n": {
+            "type": "http",
+            "url": "https://n8n.143.110.191.173.nip.io/mcp-server/http",
+            "headers": {
+                "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2ODBiZDBhMy0xYjkxLTQ3YWItYTRkYy0wOWU3MGI2ZDQ0M2EiLCJpc3MiOiJuOG4iLCJhdWQiOiJtY3Atc2VydmVyLWFwaSIsImp0aSI6IjE1NWEyMTgwLWQwZTAtNDY5NS1iNGE0LTFiYzE3ZTk5Yjk5MSIsImlhdCI6MTc3ODk3NDg3N30.tbVgdHAaCEdNMJSbgedAQVtwpbqT2Ao6mu6OEhtUZs4"
+            }
+        }
+    }
+}

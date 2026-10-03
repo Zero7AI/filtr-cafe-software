@@ -1,0 +1,6 @@
+{
+  "name": "FILTR Billing",
+  "description": "Smart Billing, Menu Management, and Voice Order System for FILTR Coffee",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
