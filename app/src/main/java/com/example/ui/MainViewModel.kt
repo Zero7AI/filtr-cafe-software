@@ -2122,7 +2122,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startDownloadingUpdate(updateInfo: AppUpdateInfo) {
-        val token = _uiState.value.githubToken.takeIf { it.isNotBlank() }
+        val token = updateInfo.token ?: _uiState.value.githubToken.takeIf { it.isNotBlank() }
         _uiState.update {
             it.copy(
                 appUpdateStatus = AppUpdateStatus.Downloading(

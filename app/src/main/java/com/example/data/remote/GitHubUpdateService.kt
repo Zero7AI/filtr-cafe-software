@@ -24,7 +24,8 @@ data class AppUpdateInfo(
     val apkFileName: String,
     val apkSizeBytes: Long,
     val isUpdateAvailable: Boolean,
-    val publishedAt: String = ""
+    val publishedAt: String = "",
+    val token: String? = null
 )
 
 sealed interface AppUpdateStatus {
@@ -56,6 +57,9 @@ class GitHubUpdateService private constructor() {
 
         @Volatile
         private var instance: GitHubUpdateService? = null
+
+        @Volatile
+        private var lastResolvedToken: String? = null
 
         fun getInstance(): GitHubUpdateService {
             return instance ?: synchronized(this) {
@@ -100,6 +104,8 @@ class GitHubUpdateService private constructor() {
             } catch (e: Exception) {
                 Log.d(TAG, "Remote config fetch fallback: ${e.message}")
             }
+
+            lastResolvedToken = cleanToken.ifBlank { null }
 
             val url = "https://api.github.com/repos/$cleanOwner/$cleanRepo/releases/latest"
 
@@ -178,7 +184,8 @@ class GitHubUpdateService private constructor() {
                 apkFileName = apkFileName,
                 apkSizeBytes = apkSizeBytes,
                 isUpdateAvailable = isNewer,
-                publishedAt = publishedAt
+                publishedAt = publishedAt,
+                token = cleanToken.ifBlank { null }
             )
 
             Log.d(TAG, "Check complete: local=$currentVersionName, remote=$cleanVersionName, isNewer=$isNewer")
@@ -209,7 +216,8 @@ class GitHubUpdateService private constructor() {
                 .url(downloadUrl)
                 .header("User-Agent", "FILTR-Billing-App")
 
-            val cleanToken = token?.trim().orEmpty()
+            val cleanToken = token?.trim().takeIf { !it.isNullOrBlank() }
+                ?: lastResolvedToken.orEmpty()
             if (cleanToken.isNotBlank()) {
                 requestBuilder.header("Authorization", "Bearer $cleanToken")
                 // Required by GitHub API when requesting /releases/assets/{id}
