@@ -102,8 +102,9 @@ fun BillingScreen(
     modifier: Modifier = Modifier
 ) {
     val defaultCategories = listOf("All", "ICED COFFEE", "FRAPPE", "FRIES", "SANDWICH")
-    val dynamicCategories = allMenuItems.map { it.category }.distinct().filter { it.isNotBlank() }
-    val categories = (listOf("All") + defaultCategories + dynamicCategories).distinct()
+    val dynamicCategories = allMenuItems.map { it.category.uppercase() }.distinct().filter { it.isNotBlank() }
+    val customCats = state.customCategories.map { it.uppercase() }
+    val categories = (listOf("All") + defaultCategories + dynamicCategories + customCats).distinct()
     val totalCartItemsCount = state.cartItems.values.sum()
     val totalAmount = state.cartItems.entries.sumOf { (item, qty) -> item.price * qty }
 

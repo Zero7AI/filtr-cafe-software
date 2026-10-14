@@ -1,6 +1,8 @@
 package com.example.ui.screens
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,17 +18,22 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Coffee
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilterChip
@@ -41,12 +48,20 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.entity.MenuItemEntity
@@ -55,7 +70,6 @@ import com.example.ui.theme.AmberAccentSecondary
 import com.example.ui.theme.CoffeeBrownPrimary
 import com.example.ui.theme.CoffeeCardBorder
 import com.example.ui.theme.CoffeeOnPrimary
-import com.example.ui.theme.CreamBackground
 
 @Composable
 fun MenuMasterScreen(
@@ -67,6 +81,10 @@ fun MenuMasterScreen(
     onOpenAddEditDialog: (MenuItemEntity?) -> Unit,
     onToggleAvailability: (MenuItemEntity) -> Unit,
     onDeleteItem: (MenuItemEntity) -> Unit,
+    onMoveItemUp: (MenuItemEntity, List<MenuItemEntity>) -> Unit = { _, _ -> },
+    onMoveItemDown: (MenuItemEntity, List<MenuItemEntity>) -> Unit = { _, _ -> },
+    onSetItemPosition: (MenuItemEntity, Int, List<MenuItemEntity>) -> Unit = { _, _, _ -> },
+    onOpenAddCategoryDialog: () -> Unit = {},
     onRestoreDefaultMenu: () -> Unit = {},
     onSyncItemMasterToSheets: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -75,8 +93,11 @@ fun MenuMasterScreen(
     val uniqueAllMenuItems = allMenuItems.distinctBy { it.name.trim().lowercase() }
 
     val defaultCategories = listOf("All", "ICED COFFEE", "FRAPPE", "FRIES", "SANDWICH")
-    val dynamicCategories = uniqueAllMenuItems.map { it.category }.distinct().filter { it.isNotBlank() }
-    val categories = (listOf("All") + defaultCategories + dynamicCategories).distinct()
+    val dynamicCategories = uniqueAllMenuItems.map { it.category.uppercase() }.distinct().filter { it.isNotBlank() }
+    val customCats = state.customCategories.map { it.uppercase() }
+    val categories = (listOf("All") + defaultCategories + dynamicCategories + customCats).distinct()
+
+    var itemToSetPosition by remember { mutableStateOf<Pair<MenuItemEntity, Int>?>(null) }
 
     Box(modifier = modifier.fillMaxSize().background(Color(0xFFFAFAFA))) {
         Column(
@@ -145,12 +166,34 @@ fun MenuMasterScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Categories horizontal bar with + Add Category button
             LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(horizontal = 4.dp)
+                contentPadding = PaddingValues(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                // "+ Category" button
+                item {
+                    Surface(
+                        onClick = onOpenAddCategoryDialog,
+                        shape = RoundedCornerShape(20.dp),
+                        color = AmberAccentSecondary.copy(alpha = 0.18f),
+                        border = BorderStroke(1.dp, AmberAccentSecondary),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = CoffeeBrownPrimary, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("+ Category", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = CoffeeBrownPrimary)
+                        }
+                    }
+                }
+
                 items(categories) { category ->
-                    val isSelected = state.selectedCategory == category
+                    val isSelected = state.selectedCategory.equals(category, ignoreCase = true)
                     FilterChip(
                         selected = isSelected,
                         onClick = { onCategorySelected(category) },
@@ -174,7 +217,7 @@ fun MenuMasterScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(imageVector = Icons.Default.Coffee, contentDescription = null, modifier = Modifier.size(64.dp), tint = CoffeeCardBorder)
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text(text = "No menu items found", color = Color.Gray)
+                        Text(text = "No menu items found in ${state.selectedCategory}", color = Color.Gray)
                     }
                 }
             } else {
@@ -182,12 +225,17 @@ fun MenuMasterScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    items(uniqueMenuItems) { menuItem ->
+                    itemsIndexed(uniqueMenuItems, key = { _, item -> item.id }) { index, menuItem ->
                         ItemMasterRow(
+                            index = index,
+                            totalCount = uniqueMenuItems.size,
                             menuItem = menuItem,
                             onEdit = { onOpenAddEditDialog(menuItem) },
                             onToggleAvailability = { onToggleAvailability(menuItem) },
-                            onDelete = { onDeleteItem(menuItem) }
+                            onDelete = { onDeleteItem(menuItem) },
+                            onMoveUp = { onMoveItemUp(menuItem, uniqueMenuItems) },
+                            onMoveDown = { onMoveItemDown(menuItem, uniqueMenuItems) },
+                            onOpenSetPosition = { itemToSetPosition = Pair(menuItem, index + 1) }
                         )
                     }
                 }
@@ -214,16 +262,37 @@ fun MenuMasterScreen(
                 Text(text = "Add Item", fontWeight = FontWeight.Bold)
             }
         }
+
+        // Set Position Dialog
+        itemToSetPosition?.let { (item, pos) ->
+            SetPositionDialog(
+                itemName = item.name,
+                currentPosition = pos,
+                totalCount = uniqueMenuItems.size,
+                onDismiss = { itemToSetPosition = null },
+                onConfirm = { target0Indexed ->
+                    onSetItemPosition(item, target0Indexed, uniqueMenuItems)
+                    itemToSetPosition = null
+                }
+            )
+        }
     }
 }
 
 @Composable
 fun ItemMasterRow(
+    index: Int,
+    totalCount: Int,
     menuItem: MenuItemEntity,
     onEdit: () -> Unit,
     onToggleAvailability: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    onOpenSetPosition: () -> Unit
 ) {
+    var accumulatedDragY by remember { mutableFloatStateOf(0f) }
+
     ElevatedCard(
         shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -235,11 +304,106 @@ fun ItemMasterRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .padding(horizontal = 10.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            // Sequence Number Badge & Drag Reorder Handle
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(end = 8.dp)
+            ) {
+                // Drag Handle with vertical gesture support
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .pointerInput(menuItem.id, index) {
+                            detectVerticalDragGestures(
+                                onDragStart = { accumulatedDragY = 0f },
+                                onDragEnd = {
+                                    if (accumulatedDragY < -40f && index > 0) {
+                                        onMoveUp()
+                                    } else if (accumulatedDragY > 40f && index < totalCount - 1) {
+                                        onMoveDown()
+                                    }
+                                    accumulatedDragY = 0f
+                                },
+                                onVerticalDrag = { change, dragAmount ->
+                                    change.consume()
+                                    accumulatedDragY += dragAmount
+                                    if (accumulatedDragY < -55f && index > 0) {
+                                        onMoveUp()
+                                        accumulatedDragY = 0f
+                                    } else if (accumulatedDragY > 55f && index < totalCount - 1) {
+                                        onMoveDown()
+                                        accumulatedDragY = 0f
+                                    }
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DragHandle,
+                        contentDescription = "Drag to reorder",
+                        tint = Color(0xFFA1A1AA),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(2.dp))
+
+                // Position Number Badge (Tap to jump to position)
+                Surface(
+                    onClick = onOpenSetPosition,
+                    color = CoffeeBrownPrimary.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.size(30.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "#${index + 1}",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = CoffeeBrownPrimary
+                        )
+                    }
+                }
+
+                // Quick Up/Down buttons
+                Column(
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(start = 2.dp)
+                ) {
+                    IconButton(
+                        onClick = onMoveUp,
+                        enabled = index > 0,
+                        modifier = Modifier.size(20.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.KeyboardArrowUp,
+                            contentDescription = "Move Up",
+                            tint = if (index > 0) CoffeeBrownPrimary else Color(0xFFD4D4D8),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = onMoveDown,
+                        enabled = index < totalCount - 1,
+                        modifier = Modifier.size(20.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.KeyboardArrowDown,
+                            contentDescription = "Move Down",
+                            tint = if (index < totalCount - 1) CoffeeBrownPrimary else Color(0xFFD4D4D8),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+
+            // Item Details
+            Column(modifier = Modifier.weight(1f).padding(start = 4.dp)) {
                 Text(
                     text = menuItem.category.uppercase(),
                     style = MaterialTheme.typography.labelSmall,
@@ -250,13 +414,16 @@ fun ItemMasterRow(
                 Text(
                     text = menuItem.name,
                     style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp
                 )
                 if (menuItem.description.isNotBlank()) {
                     Text(
                         text = menuItem.description,
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color.Gray
+                        fontSize = 11.sp,
+                        color = Color.Gray,
+                        maxLines = 1
                     )
                 }
                 Spacer(modifier = Modifier.height(2.dp))
@@ -264,15 +431,17 @@ fun ItemMasterRow(
                     text = "Price: ₹${menuItem.price}",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
                     color = CoffeeBrownPrimary
                 )
             }
 
+            // Availability & Action Buttons
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
                         text = if (menuItem.isAvailable) "In Stock" else "Out of Stock",
-                        fontSize = 10.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
                         color = if (menuItem.isAvailable) MaterialTheme.colorScheme.primary else Color.Red
                     )
@@ -289,14 +458,119 @@ fun ItemMasterRow(
                     )
                 }
 
-                IconButton(onClick = onEdit) {
-                    Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit", tint = CoffeeBrownPrimary)
+                IconButton(onClick = onEdit, modifier = Modifier.size(36.dp)) {
+                    Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit", tint = CoffeeBrownPrimary, modifier = Modifier.size(18.dp))
                 }
 
-                IconButton(onClick = onDelete) {
-                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color.Gray)
+                IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
+                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color.Red.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
                 }
             }
         }
     }
+}
+
+@Composable
+fun AddCategoryDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    var categoryName by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Create New Category", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    text = "Enter a name for the new category (e.g. DESSERTS, SHAKES, SNACKS):",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF71717A)
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = categoryName,
+                    onValueChange = { categoryName = it },
+                    label = { Text("Category Name") },
+                    placeholder = { Text("e.g. DESSERTS") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (categoryName.isNotBlank()) {
+                        onConfirm(categoryName.trim().uppercase())
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = CoffeeBrownPrimary),
+                enabled = categoryName.isNotBlank()
+            ) {
+                Text("Create Category", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+fun SetPositionDialog(
+    itemName: String,
+    currentPosition: Int,
+    totalCount: Int,
+    onDismiss: () -> Unit,
+    onConfirm: (Int) -> Unit
+) {
+    var positionText by remember { mutableStateOf(currentPosition.toString()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Set Order Position", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    text = "Move '$itemName' to position (1 to $totalCount):",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF71717A)
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = positionText,
+                    onValueChange = { positionText = it.filter { ch -> ch.isDigit() } },
+                    label = { Text("Position Number") },
+                    placeholder = { Text("1") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val pos = positionText.toIntOrNull()
+                    if (pos != null && pos in 1..totalCount) {
+                        onConfirm(pos - 1)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = CoffeeBrownPrimary),
+                enabled = positionText.toIntOrNull()?.let { it in 1..totalCount } == true
+            ) {
+                Text("Set Position", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
 }

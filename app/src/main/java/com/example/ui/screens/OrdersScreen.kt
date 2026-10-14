@@ -130,15 +130,21 @@ fun OrdersScreen(
     }
 
     // Step 2: Then filter by status
-    val filteredOrders = dateFilteredOrders.filter { orderWithItems ->
+    val statusFilteredOrders = dateFilteredOrders.filter { orderWithItems ->
         when (state.statusFilter) {
-            "PENDING" -> !orderWithItems.order.isDelivered
+            "PENDING" -> !orderWithItems.order.isDelivered || !orderWithItems.order.isPaid
             "MADE" -> orderWithItems.order.isMade
             "UNPAID" -> !orderWithItems.order.isPaid
             "DELIVERED" -> orderWithItems.order.isDelivered
             else -> true
         }
     }
+
+    // Step 3: Prioritize UNPAID orders at the top / front, then sort by newest timestamp
+    val filteredOrders = statusFilteredOrders.sortedWith(
+        compareBy<OrderWithItems> { it.order.isPaid } // false (UNPAID) comes first!
+            .thenByDescending { it.order.timestamp }
+    )
 
     // Total revenue for the date range (independent of status filter) — always shows full day's total
     val totalDayRevenue = dateFilteredOrders.sumOf { it.order.totalAmount }
@@ -627,7 +633,11 @@ fun OrderCard(
         ),
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, Color(0xFFE4E4E7), RoundedCornerShape(16.dp))
+            .border(
+                width = if (!order.isPaid) 1.5.dp else 1.dp,
+                color = if (!order.isPaid) Color(0xFFEF4444) else Color(0xFFE4E4E7),
+                shape = RoundedCornerShape(16.dp)
+            )
             .testTag("order_card_${order.orderId}")
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
@@ -652,11 +662,28 @@ fun OrderCard(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (!order.isPaid) {
+                        Surface(
+                            color = Color(0xFFFEF2F2),
+                            shape = RoundedCornerShape(6.dp),
+                            border = BorderStroke(1.dp, Color(0xFFFCA5A5)),
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Text(
+                                text = "UNPAID",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Black,
+                                color = Color(0xFFDC2626),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
                     Text(
                         text = "₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
                         fontWeight = FontWeight.Black,
                         fontSize = 18.sp,
-                        color = Color(0xFF09090B)
+                        color = if (!order.isPaid) Color(0xFFDC2626) else Color(0xFF09090B)
                     )
 
                     IconButton(

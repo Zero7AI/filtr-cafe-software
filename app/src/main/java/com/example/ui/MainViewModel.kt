@@ -26,6 +26,7 @@ import com.example.data.remote.GitHubUpdateService
 import com.example.data.remote.SupabaseService
 import com.example.data.remote.ParsedVoiceOrder
 import com.example.data.repository.FiltrRepository
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -148,7 +149,11 @@ data class BillingUiState(
     val isCheckingForUpdate: Boolean = false,
     val githubRepoOwner: String = GitHubUpdateService.DEFAULT_REPO_OWNER,
     val githubRepoName: String = GitHubUpdateService.DEFAULT_REPO_NAME,
-    val githubToken: String = ""
+    val githubToken: String = "",
+    // Item Master Custom Ordering & Categories
+    val customItemOrder: List<String> = emptyList(),
+    val customCategories: List<String> = emptyList(),
+    val showAddCategoryDialog: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -159,6 +164,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
+
+    private fun loadCustomItemOrder(): List<String> {
+        val jsonStr = prefs.getString("menu_custom_item_order", null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(jsonStr)
+            val list = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val s = arr.getString(i).trim()
+                if (s.isNotBlank()) list.add(s)
+            }
+            list
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun loadCustomCategories(): List<String> {
+        val jsonStr = prefs.getString("menu_custom_categories", null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(jsonStr)
+            val list = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val s = arr.getString(i).trim().uppercase()
+                if (s.isNotBlank()) list.add(s)
+            }
+            list.distinct()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
 
     private fun loadStoryPhotoMetadataMap(): Map<String, StoryPhotoMetadata> {
         val jsonStr = prefs.getString("story_photos_metadata", null) ?: return emptyMap()
@@ -216,7 +251,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             receiptFooterLine3 = prefs.getString("receipt_footer_line3", "Made fresh - Crafted with obsession") ?: "Made fresh - Crafted with obsession",
             githubRepoOwner = prefs.getString("github_repo_owner", GitHubUpdateService.DEFAULT_REPO_OWNER) ?: GitHubUpdateService.DEFAULT_REPO_OWNER,
             githubRepoName = prefs.getString("github_repo_name", GitHubUpdateService.DEFAULT_REPO_NAME) ?: GitHubUpdateService.DEFAULT_REPO_NAME,
-            githubToken = prefs.getString("github_token", "") ?: ""
+            githubToken = prefs.getString("github_token", "") ?: "",
+            customItemOrder = loadCustomItemOrder(),
+            customCategories = loadCustomCategories()
         )
     )
     val uiState: StateFlow<BillingUiState> = _uiState.asStateFlow()
@@ -352,6 +389,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // Fetch remote custom item order and custom categories from Supabase
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val remoteOrderJson = SupabaseService.getInstance().fetchSyncMetadata("menu_item_order")
+                if (!remoteOrderJson.isNullOrBlank() && remoteOrderJson.startsWith("[")) {
+                    val arr = JSONArray(remoteOrderJson)
+                    val list = mutableListOf<String>()
+                    for (i in 0 until arr.length()) {
+                        val s = arr.getString(i).trim()
+                        if (s.isNotBlank()) list.add(s)
+                    }
+                    if (list.isNotEmpty()) {
+                        prefs.edit().putString("menu_custom_item_order", remoteOrderJson).apply()
+                        _uiState.update { it.copy(customItemOrder = list) }
+                    }
+                }
+                val remoteCatJson = SupabaseService.getInstance().fetchSyncMetadata("custom_categories")
+                if (!remoteCatJson.isNullOrBlank() && remoteCatJson.startsWith("[")) {
+                    val arr = JSONArray(remoteCatJson)
+                    val list = mutableListOf<String>()
+                    for (i in 0 until arr.length()) {
+                        val s = arr.getString(i).trim().uppercase()
+                        if (s.isNotBlank()) list.add(s)
+                    }
+                    if (list.isNotEmpty()) {
+                        val distinctList = list.distinct()
+                        prefs.edit().putString("menu_custom_categories", remoteCatJson).apply()
+                        _uiState.update { it.copy(customCategories = distinctList) }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d("MainViewModel", "Remote item order/category sync: ${e.message}")
+            }
+        }
+
         // Check for app updates via GitHub Releases on startup
         viewModelScope.launch {
             delay(3000) // Small delay to prioritize initial POS UI load
@@ -387,14 +459,105 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         menuItems,
         _uiState
     ) { items, state ->
-        items.distinctBy { it.name.trim().lowercase() }.filter { item ->
+        val filtered = items.distinctBy { it.name.trim().lowercase() }.filter { item ->
             val matchesCategory = state.selectedCategory == "All" || item.category.equals(state.selectedCategory, ignoreCase = true)
             val matchesSearch = state.searchQuery.isBlank() ||
                     item.name.lowercase().contains(state.searchQuery.lowercase()) ||
                     item.category.lowercase().contains(state.searchQuery.lowercase())
             matchesCategory && matchesSearch
         }
+
+        if (state.customItemOrder.isEmpty()) {
+            filtered
+        } else {
+            val orderMap = state.customItemOrder.withIndex().associate { it.value.lowercase().trim() to it.index }
+            filtered.sortedWith(
+                compareBy<MenuItemEntity> {
+                    orderMap[it.name.lowercase().trim()] ?: (10000 + it.id)
+                }.thenBy { it.name }
+            )
+        }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun saveCustomItemOrder(newOrder: List<String>) {
+        val distinctOrder = newOrder.map { it.trim() }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+        prefs.edit().putString("menu_custom_item_order", JSONArray(distinctOrder).toString()).apply()
+        _uiState.update { it.copy(customItemOrder = distinctOrder) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                SupabaseService.getInstance().saveSyncMetadata("menu_item_order", JSONArray(distinctOrder).toString())
+            } catch (e: Exception) {
+                Log.w("MainViewModel", "Failed to sync menu_item_order: ${e.message}")
+            }
+        }
+    }
+
+    fun moveMenuItem(item: MenuItemEntity, targetPosition: Int, categoryItems: List<MenuItemEntity>) {
+        val currentCategoryItems = categoryItems.toMutableList()
+        val currentIndex = currentCategoryItems.indexOfFirst { it.name.trim().equals(item.name.trim(), ignoreCase = true) }
+        if (currentIndex == -1 || targetPosition !in currentCategoryItems.indices || currentIndex == targetPosition) return
+
+        val moved = currentCategoryItems.removeAt(currentIndex)
+        currentCategoryItems.add(targetPosition, moved)
+
+        val currentGlobalOrder = _uiState.value.customItemOrder.toMutableList()
+        val categoryItemNames = currentCategoryItems.map { it.name.trim() }
+
+        val nonCategoryItems = currentGlobalOrder.filterNot { globalName ->
+            categoryItemNames.any { it.equals(globalName, ignoreCase = true) }
+        }
+        val newGlobalOrder = nonCategoryItems + categoryItemNames
+        saveCustomItemOrder(newGlobalOrder)
+    }
+
+    fun moveMenuItemUp(item: MenuItemEntity, categoryItems: List<MenuItemEntity>) {
+        val index = categoryItems.indexOfFirst { it.name.trim().equals(item.name.trim(), ignoreCase = true) }
+        if (index > 0) {
+            moveMenuItem(item, index - 1, categoryItems)
+        }
+    }
+
+    fun moveMenuItemDown(item: MenuItemEntity, categoryItems: List<MenuItemEntity>) {
+        val index = categoryItems.indexOfFirst { it.name.trim().equals(item.name.trim(), ignoreCase = true) }
+        if (index != -1 && index < categoryItems.size - 1) {
+            moveMenuItem(item, index + 1, categoryItems)
+        }
+    }
+
+    fun addCustomCategory(categoryName: String) {
+        val clean = categoryName.trim().uppercase()
+        if (clean.isBlank()) return
+        val current = _uiState.value.customCategories
+        if (!current.contains(clean)) {
+            val updated = current + clean
+            prefs.edit().putString("menu_custom_categories", JSONArray(updated).toString()).apply()
+            _uiState.update {
+                it.copy(
+                    customCategories = updated,
+                    selectedCategory = clean,
+                    showAddCategoryDialog = false,
+                    snackbarMessage = "Category '$clean' created!"
+                )
+            }
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    SupabaseService.getInstance().saveSyncMetadata("custom_categories", JSONArray(updated).toString())
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Failed to sync custom_categories: ${e.message}")
+                }
+            }
+        } else {
+            _uiState.update { it.copy(selectedCategory = clean, showAddCategoryDialog = false) }
+        }
+    }
+
+    fun openAddCategoryDialog() {
+        _uiState.update { it.copy(showAddCategoryDialog = true) }
+    }
+
+    fun dismissAddCategoryDialog() {
+        _uiState.update { it.copy(showAddCategoryDialog = false) }
+    }
 
     // Navigation Tab
     fun selectTab(tab: FiltrTab) {
@@ -1086,30 +1249,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else null
 
             val targetItem = editing ?: existingMatchingItem
+            val cleanName = name.trim()
+            val cleanCat = category.trim().uppercase()
 
             if (targetItem != null) {
+                val oldName = targetItem.name.trim()
                 repository.updateMenuItem(
                     targetItem.copy(
-                        name = name.trim(),
-                        category = category.trim(),
+                        name = cleanName,
+                        category = cleanCat,
                         price = price,
                         description = description.trim(),
                         isAvailable = isAvailable
                     )
                 )
-                _uiState.update { it.copy(snackbarMessage = "Updated ${name.trim()}") }
+                if (!oldName.equals(cleanName, ignoreCase = true)) {
+                    val currentOrder = _uiState.value.customItemOrder.toMutableList()
+                    val idx = currentOrder.indexOfFirst { it.equals(oldName, ignoreCase = true) }
+                    if (idx != -1) {
+                        currentOrder[idx] = cleanName
+                        saveCustomItemOrder(currentOrder)
+                    }
+                }
+                _uiState.update { it.copy(snackbarMessage = "Updated $cleanName") }
             } else {
                 repository.addMenuItem(
                     MenuItemEntity(
-                        name = name.trim(),
-                        category = category.trim(),
+                        name = cleanName,
+                        category = cleanCat,
                         price = price,
                         description = description.trim(),
                         isAvailable = isAvailable
                     )
                 )
-                _uiState.update { it.copy(snackbarMessage = "Added ${name.trim()} to Menu") }
+                val currentOrder = _uiState.value.customItemOrder
+                if (!currentOrder.any { it.equals(cleanName, ignoreCase = true) }) {
+                    saveCustomItemOrder(currentOrder + cleanName)
+                }
+                _uiState.update { it.copy(snackbarMessage = "Added $cleanName to Menu") }
             }
+
+            // If category is not in default or custom list, auto-add to customCategories
+            val defaultCats = listOf("ALL", "ICED COFFEE", "FRAPPE", "FRIES", "SANDWICH")
+            if (cleanCat.isNotBlank() && cleanCat !in defaultCats && cleanCat !in _uiState.value.customCategories) {
+                addCustomCategory(cleanCat)
+            }
+
             dismissAddEditItemDialog()
         }
     }
@@ -1244,27 +1429,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Delete Safeguards
+    // Delete Menu Item
     fun requestDeleteMenuItem(item: MenuItemEntity) {
-        val allOrders = ordersList.value
-        val isUsedInOrders = allOrders.any { orderWithItems ->
-            orderWithItems.items.any { it.itemName.equals(item.name, ignoreCase = true) }
-        }
-
-        if (isUsedInOrders) {
-            _uiState.update {
-                it.copy(
-                    itemDeleteWarningMessage = item,
-                    itemToDeleteConfirmation = null
-                )
-            }
-        } else {
-            _uiState.update {
-                it.copy(
-                    itemToDeleteConfirmation = item,
-                    itemDeleteWarningMessage = null
-                )
-            }
+        _uiState.update {
+            it.copy(
+                itemToDeleteConfirmation = item,
+                itemDeleteWarningMessage = null
+            )
         }
     }
 
@@ -1283,9 +1454,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun confirmDeleteMenuItem(item: MenuItemEntity) {
         viewModelScope.launch {
             repository.deleteMenuItem(item)
+            val currentOrder = _uiState.value.customItemOrder
+            val newOrder = currentOrder.filterNot { it.equals(item.name.trim(), ignoreCase = true) }
+            saveCustomItemOrder(newOrder)
             _uiState.update {
                 it.copy(
                     itemToDeleteConfirmation = null,
+                    itemDeleteWarningMessage = null,
                     snackbarMessage = "Removed '${item.name}' from Item Master"
                 )
             }

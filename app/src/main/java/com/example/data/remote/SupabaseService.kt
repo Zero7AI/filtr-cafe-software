@@ -1215,14 +1215,13 @@ class SupabaseService private constructor() {
     }
 
     /**
-     * Fetch remote GitHub update repository configuration from Supabase sync_metadata table.
-     * Allows remotely shifting the update repository to another account/repo from laptop without touching phones.
+     * Fetch metadata by key from Supabase sync_metadata table.
      */
-    suspend fun fetchUpdateRepoConfig(): String? = withContext(Dispatchers.IO) {
+    suspend fun fetchSyncMetadata(key: String): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         try {
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.github_update_repo&limit=1")
+                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.$key&limit=1")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
@@ -1239,20 +1238,20 @@ class SupabaseService private constructor() {
             }
             null
         } catch (e: Exception) {
-            Log.d(TAG, "fetchUpdateRepoConfig: ${e.message}")
+            Log.d(TAG, "fetchSyncMetadata($key): ${e.message}")
             null
         }
     }
 
     /**
-     * Save remote GitHub update repository configuration to Supabase sync_metadata table.
+     * Save metadata by key to Supabase sync_metadata table.
      */
-    suspend fun saveUpdateRepoConfig(repoConfig: String): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun saveSyncMetadata(key: String, value: String): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
             val body = JSONObject().apply {
-                put("key", "github_update_repo")
-                put("value", repoConfig)
+                put("key", key)
+                put("value", value)
                 put("updated_at", System.currentTimeMillis())
             }
             val req = Request.Builder()
@@ -1263,10 +1262,20 @@ class SupabaseService private constructor() {
                 .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
             executeRequest(req)?.close()
-            Result.success("GitHub update repository config saved to cloud")
+            Result.success("Metadata $key saved to cloud")
         } catch (e: Exception) {
-            Log.e(TAG, "saveUpdateRepoConfig error: ${e.message}")
+            Log.e(TAG, "saveSyncMetadata($key) error: ${e.message}")
             Result.failure(e)
         }
     }
+
+    /**
+     * Fetch remote GitHub update repository configuration from Supabase sync_metadata table.
+     */
+    suspend fun fetchUpdateRepoConfig(): String? = fetchSyncMetadata("github_update_repo")
+
+    /**
+     * Save remote GitHub update repository configuration to Supabase sync_metadata table.
+     */
+    suspend fun saveUpdateRepoConfig(repoConfig: String): Result<String> = saveSyncMetadata("github_update_repo", repoConfig)
 }

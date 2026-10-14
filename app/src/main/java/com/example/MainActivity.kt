@@ -658,6 +658,10 @@ class MainActivity : ComponentActivity() {
                                         onOpenAddEditDialog = { viewModel.openAddEditItemDialog(it) },
                                         onToggleAvailability = { viewModel.saveMenuItem(it.name, it.category, it.price, it.description, !it.isAvailable) },
                                         onDeleteItem = { viewModel.requestDeleteMenuItem(it) },
+                                        onMoveItemUp = { item, list -> viewModel.moveMenuItemUp(item, list) },
+                                        onMoveItemDown = { item, list -> viewModel.moveMenuItemDown(item, list) },
+                                        onSetItemPosition = { item, pos, list -> viewModel.moveMenuItem(item, pos, list) },
+                                        onOpenAddCategoryDialog = { viewModel.openAddCategoryDialog() },
                                         onRestoreDefaultMenu = { viewModel.restoreDefaultMenu() },
                                         onSyncItemMasterToSheets = { viewModel.syncItemMasterToSheets() }
                                     )
@@ -828,8 +832,8 @@ class MainActivity : ComponentActivity() {
                             uiState.itemToDeleteConfirmation?.let { item ->
                                 AlertDialog(
                                     onDismissRequest = { viewModel.dismissDeleteDialogs() },
-                                    title = { Text("Delete From Item Master?") },
-                                    text = { Text("Are you sure you want to permanently delete '${item.name}' from the menu master?") },
+                                    title = { Text("Delete From Item Master?", fontWeight = FontWeight.Bold) },
+                                    text = { Text("Are you sure you want to delete '${item.name}' from the menu master? (Past sales and order billing history will be preserved).") },
                                     confirmButton = {
                                         TextButton(onClick = { viewModel.confirmDeleteMenuItem(item) }) {
                                             Text("Yes, Delete", color = Color.Red, fontWeight = FontWeight.Bold)
@@ -968,7 +972,7 @@ class MainActivity : ComponentActivity() {
                             }
 
                             if (uiState.showAddEditItemDialog) {
-                                val existingCategories = allMenuItems.map { it.category }.distinct().filter { it.isNotBlank() }
+                                val existingCategories = (allMenuItems.map { it.category } + uiState.customCategories).distinct().filter { it.isNotBlank() }
                                 AddEditMenuItemDialog(
                                     itemToEdit = uiState.editingMenuItem,
                                     existingCategories = existingCategories,
@@ -976,6 +980,15 @@ class MainActivity : ComponentActivity() {
                                         viewModel.saveMenuItem(name, cat, price, desc, available)
                                     },
                                     onDismiss = { viewModel.dismissAddEditItemDialog() }
+                                )
+                            }
+
+                            if (uiState.showAddCategoryDialog) {
+                                com.example.ui.screens.AddCategoryDialog(
+                                    onDismiss = { viewModel.dismissAddCategoryDialog() },
+                                    onConfirm = { newCategory ->
+                                        viewModel.addCustomCategory(newCategory)
+                                    }
                                 )
                             }
 
