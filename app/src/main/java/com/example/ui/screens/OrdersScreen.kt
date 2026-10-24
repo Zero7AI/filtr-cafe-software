@@ -140,11 +140,10 @@ fun OrdersScreen(
         }
     }
 
-    // Step 3: Prioritize UNPAID orders at the top / front, then sort by newest timestamp
-    val filteredOrders = statusFilteredOrders.sortedWith(
-        compareBy<OrderWithItems> { it.order.isPaid } // false (UNPAID) comes first!
-            .thenByDescending { it.order.timestamp }
-    )
+    // Step 3: Strictly sort chronologically by timestamp (newest/most recent first)
+    val filteredOrders = remember(statusFilteredOrders) {
+        statusFilteredOrders.sortedByDescending { it.order.timestamp }
+    }
 
     // Total revenue for the date range (independent of status filter) — always shows full day's total
     val totalDayRevenue = dateFilteredOrders.sumOf { it.order.totalAmount }
@@ -460,7 +459,7 @@ fun OrdersScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                items(filteredOrders) { orderWithItems ->
+                items(items = filteredOrders, key = { it.order.orderId }) { orderWithItems ->
                     OrderCard(
                         orderWithItems = orderWithItems,
                         onToggleMade = { onToggleMade(orderWithItems) },
@@ -856,6 +855,7 @@ fun OrderCard(
                 StatusBadge(
                     text = if (order.isPaid) "Paid (${order.paymentMode.ifBlank { "CASH" }})" else "Unpaid",
                     isPositive = order.isPaid,
+                    isWarning = !order.isPaid,
                     icon = Icons.Default.Payment,
                     onClick = onOpenPaymentDialog,
                     modifier = Modifier.weight(1f).testTag("badge_paid_${order.orderId}")
@@ -906,14 +906,36 @@ fun StatusBadge(
     isPositive: Boolean,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     onClick: (() -> Unit)? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isWarning: Boolean = false
 ) {
+    val bgColor = when {
+        isPositive -> StatusGreen.copy(alpha = 0.15f)
+        isWarning -> Color(0xFFFEF2F2)
+        else -> Color.Gray.copy(alpha = 0.15f)
+    }
+    val borderColor = when {
+        isPositive -> StatusGreen.copy(alpha = 0.5f)
+        isWarning -> Color(0xFFFCA5A5)
+        else -> Color.Gray.copy(alpha = 0.3f)
+    }
+    val contentColor = when {
+        isPositive -> StatusGreen
+        isWarning -> Color(0xFFDC2626)
+        else -> Color.Gray
+    }
+    val textColor = when {
+        isPositive -> StatusGreen
+        isWarning -> Color(0xFFDC2626)
+        else -> Color.DarkGray
+    }
+
     Surface(
         onClick = { onClick?.invoke() },
         enabled = onClick != null,
-        color = if (isPositive) StatusGreen.copy(alpha = 0.15f) else Color.Gray.copy(alpha = 0.15f),
+        color = bgColor,
         shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, if (isPositive) StatusGreen.copy(alpha = 0.5f) else Color.Gray.copy(alpha = 0.3f)),
+        border = BorderStroke(1.dp, borderColor),
         modifier = modifier
     ) {
         Row(
@@ -924,7 +946,7 @@ fun StatusBadge(
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = if (isPositive) StatusGreen else Color.Gray,
+                tint = contentColor,
                 modifier = Modifier.size(12.dp)
             )
             Spacer(modifier = Modifier.width(3.dp))
@@ -932,7 +954,7 @@ fun StatusBadge(
                 text = text,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
-                color = if (isPositive) StatusGreen else Color.DarkGray
+                color = textColor
             )
         }
     }

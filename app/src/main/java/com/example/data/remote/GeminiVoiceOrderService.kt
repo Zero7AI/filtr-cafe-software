@@ -21,7 +21,8 @@ data class ParsedVoiceOrder(
     val customerName: String,
     val contactNumber: String,
     val items: List<ParsedOrderItem>,
-    val notes: String = ""
+    val notes: String = "",
+    val rawTranscript: String = ""
 )
 
 class GeminiVoiceOrderService {
@@ -159,25 +160,48 @@ class GeminiVoiceOrderService {
             val base64Audio = android.util.Base64.encodeToString(audioBytes, android.util.Base64.NO_WRAP)
 
             val promptText = """
-                You are an intelligent POS cashier assistant for FILTR Coffee Store.
-                Here is our official menu catalog and list of available SKUs:
+                You are an expert AI Cashier and POS Order Assistant for FILTR Coffee Store.
+                Here is our official store Menu Catalog & SKU List:
                 $menuSummary
 
-                Listen carefully to the voice recording of the spoken customer order.
-                Determine:
-                1. Customer Name (if mentioned in audio e.g., "for Rahul", "order for Priya"). If not mentioned, set to "Walk-in Customer".
-                2. Contact Number (if spoken e.g. 10 digit number). If not mentioned, set to "".
-                3. Special Notes or Customizations (if spoken e.g. "less sugar", "extra hot", "no ice", "spicy", "takeaway"). If not mentioned, set to "".
-                4. Ordered Items (match every item spoken directly to the item name from the menu catalog SKU list above, with quantity as integer).
+                === ACOUSTIC & AMBIENT NOISE FILTERING ===
+                - The audio is recorded at a busy physical coffee shop counter.
+                - Ambient noise may be present: espresso machine steam hissing, grinder noise, blender sounds, background music, and secondary voices.
+                - Isolate and focus ONLY on the primary customer speaking directly at the counter. Ignore background kitchen/barista talk.
+
+                === HINGLISH & CAFE VOCABULARY ===
+                - Customers frequently order in Hindi, English, or mixed Hinglish.
+                - Map Hindi numbers to integer quantities:
+                  * "ek" / "single" -> 1
+                  * "do" / "double" -> 2
+                  * "teen" -> 3
+                  * "chaar" -> 4
+                  * "paanch" -> 5
+                  * "chhe" -> 6
+                - Conversational fillers to ignore: "bhaiya", "suno", "de do", "kar dena", "bana do", "pack kar do".
+                - Modifiers & Notes:
+                  * "parcel", "packing", "takeaway", "pack kar do" -> Add "Takeaway" to notes.
+                  * "bina cheeni", "no sugar", "without sugar" -> Add "No sugar" to notes.
+                  * "kam meetha", "less sugar" -> Add "Less sugar" to notes.
+                  * "extra hot", "kadak", "zyada garam" -> Add "Extra hot" to notes.
+                  * "kam theekha", "less spicy" -> Add "Less spicy" to notes.
+                  * "extra cheese" -> Add "Extra cheese" to notes.
+                - Self-corrections: If customer says "ek cappuccino... nahi, ek hot filter coffee do", honor the final choice.
+                - Name & Phone: "for Rahul", "Rahul ke naam pe" -> customerName: "Rahul". Spoken 10-digit number -> contactNumber: "9876543210".
+
+                === SKU MATCHING ===
+                - Match each ordered item to the closest exact "Item Name" from the Menu Catalog SKU list above.
+                - Common nicknames: "kaapi" / "south filter" -> "CLASSIC", "vietnamese without milk" -> "OG VIETNAMESE WITHOUT MILK", "hottie" -> "CARAMEL HOTTIE" or "HAZELNUT HOTTIE" as spoken.
 
                 Return strictly JSON with no markdown formatting or backticks:
                 {
+                  "rawTranscript": "verbatim speech heard in Hinglish/English",
                   "customerName": "Walk-in Customer",
                   "contactNumber": "",
                   "notes": "",
                   "items": [
                     {
-                      "menuItemName": "exact item name from SKU list",
+                      "menuItemName": "exact item name from catalog",
                       "quantity": 1
                     }
                   ]
@@ -230,6 +254,7 @@ class GeminiVoiceOrderService {
                 val textResponse = parts?.optJSONObject(0)?.optString("text") ?: ""
 
                 val parsedOrderJson = JSONObject(textResponse.trim())
+                val rawTranscript = parsedOrderJson.optString("rawTranscript", "")
                 val customerName = parsedOrderJson.optString("customerName", "Walk-in Customer")
                 val contactNumber = parsedOrderJson.optString("contactNumber", "")
                 val notes = parsedOrderJson.optString("notes", "")
@@ -261,7 +286,8 @@ class GeminiVoiceOrderService {
                         customerName = if (customerName.isBlank()) "Walk-in Customer" else customerName,
                         contactNumber = contactNumber,
                         items = parsedItems,
-                        notes = notes
+                        notes = notes,
+                        rawTranscript = rawTranscript
                     )
                 )
             }

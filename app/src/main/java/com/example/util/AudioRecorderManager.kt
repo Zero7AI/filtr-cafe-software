@@ -10,6 +10,10 @@ class AudioRecorderManager(private val context: Context) {
     private var currentFile: File? = null
     var isRecording: Boolean = false
         private set
+    var recordingStartTimestamp: Long = 0L
+        private set
+    var lastRecordingDurationMs: Long = 0L
+        private set
 
     fun startRecording(): File? {
         return try {
@@ -24,17 +28,20 @@ class AudioRecorderManager(private val context: Context) {
             }
 
             mediaRecorder.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
+                // Hardware DSP noise suppression, speech beamforming & echo cancellation
+                setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioChannels(1) // Mono speech channel avoids stereo phasing issues
                 setOutputFile(outputFile.absolutePath)
-                setAudioSamplingRate(44100)
-                setAudioEncodingBitRate(96000)
+                setAudioSamplingRate(16000) // 16 kHz is standard for speech models
+                setAudioEncodingBitRate(64000)
                 prepare()
                 start()
             }
             recorder = mediaRecorder
             isRecording = true
+            recordingStartTimestamp = System.currentTimeMillis()
             outputFile
         } catch (e: Exception) {
             e.printStackTrace()
@@ -48,6 +55,7 @@ class AudioRecorderManager(private val context: Context) {
     fun stopRecording(): File? {
         if (!isRecording) return currentFile
         return try {
+            lastRecordingDurationMs = System.currentTimeMillis() - recordingStartTimestamp
             recorder?.apply {
                 stop()
                 release()

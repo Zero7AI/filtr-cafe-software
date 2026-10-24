@@ -150,6 +150,8 @@ data class BillingUiState(
     val githubRepoOwner: String = GitHubUpdateService.DEFAULT_REPO_OWNER,
     val githubRepoName: String = GitHubUpdateService.DEFAULT_REPO_NAME,
     val githubToken: String = "",
+    val isForceUpdate: Boolean = false,
+    val forceUpdateMessage: String = "",
     // Item Master Custom Ordering & Categories
     val customItemOrder: List<String> = emptyList(),
     val customCategories: List<String> = emptyList(),
@@ -290,6 +292,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
                 _uiState.update { it.copy(isNetworkAvailable = true) }
+                // Trigger immediate background sync of any pending orders to Supabase & Sheets when connection restored
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        repository.syncPendingOrdersToSupabase()
+                    } catch (e: Exception) {
+                        Log.w("MainViewModel", "Supabase sync on network reconnect failed: ${e.message}")
+                    }
+                    val url = _uiState.value.googleSheetsWebhookUrl
+                    if (url.isNotBlank()) {
+                        try {
+                            repository.syncPendingOrdersToGoogleSheets(url)
+                        } catch (e: Exception) {
+                            Log.w("MainViewModel", "Sheets sync on network reconnect failed: ${e.message}")
+                        }
+                    }
+                }
             }
             override fun onLost(network: android.net.Network) {
                 _uiState.update { it.copy(isNetworkAvailable = false) }
@@ -350,17 +368,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Automatic periodic Google Sheets Sync Loop (Attempts sync of any pending unsynced orders every 2 minutes)
-        viewModelScope.launch {
+        // Automatic periodic Cloud & Google Sheets Sync Loop (Attempts sync of any pending unsynced orders every 2 minutes)
+        viewModelScope.launch(Dispatchers.IO) {
             while (true) {
-                kotlinx.coroutines.delay(120 * 1000L) // 2 minute background safety sync for Sheets
+                kotlinx.coroutines.delay(120 * 1000L) // 2 minute background safety sync
+                try {
+                    repository.syncPendingOrdersToSupabase()
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Background Supabase sync failed, will retry: ${e.message}")
+                }
                 try {
                     val url = _uiState.value.googleSheetsWebhookUrl
                     if (url.isNotBlank()) {
                         repository.syncPendingOrdersToGoogleSheets(url)
                     }
                 } catch (e: Exception) {
-                    Log.w("MainViewModel", "Background sync failed, will retry: ${e.message}")
+                    Log.w("MainViewModel", "Background Sheets sync failed, will retry: ${e.message}")
                 }
             }
         }
@@ -1073,7 +1096,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun processVoiceAudio(audioBytes: ByteArray, mimeType: String = "audio/m4a") {
+    fun processVoiceAudio(audioBytes: ByteArray, mimeType: String = "audio/m4a", durationMs: Long = 0L) {
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -1087,6 +1110,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val items = menuItems.value
             val result = repository.parseVoiceAudio(audioBytes, mimeType, items)
+
+            // Asynchronously dispatch voice telemetry (audio file + diagnostic JSON) to Supabase Storage voice-orders bucket
+            val timestamp = System.currentTimeMillis()
+            val timeString = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date(timestamp))
+            val baseFileName = "voice_order_${timeString}_${timestamp % 1000}"
+
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val supabase = SupabaseService.getInstance()
+                    val audioFileName = "$baseFileName.m4a"
+                    val audioUploadResult = supabase.uploadVoiceOrderAudio(audioFileName, audioBytes)
+
+                    val isSuccess = result.isSuccess && result.getOrNull() != null
+                    val parsedOrder = result.getOrNull()
+                    val diagJson = org.json.JSONObject().apply {
+                        put("timestamp", timestamp)
+                        put("formattedTime", timeString)
+                        put("durationMs", durationMs)
+                        put("fileSizeBytes", audioBytes.size)
+                        put("mimeType", mimeType)
+                        put("isSuccess", isSuccess)
+                        put("audioUploaded", audioUploadResult.isSuccess)
+                        put("audioUrl", audioUploadResult.getOrNull() ?: "")
+                        put("rawTranscript", parsedOrder?.rawTranscript ?: "")
+                        put("parsedCustomerName", parsedOrder?.customerName ?: "")
+                        put("parsedContactNumber", parsedOrder?.contactNumber ?: "")
+                        put("parsedNotes", parsedOrder?.notes ?: "")
+                        val itemsArray = org.json.JSONArray()
+                        parsedOrder?.items?.forEach { item ->
+                            val itemObj = org.json.JSONObject().apply {
+                                put("name", item.menuItemName)
+                                put("quantity", item.quantity)
+                            }
+                            itemsArray.put(itemObj)
+                        }
+                        put("items", itemsArray)
+                        if (result.isFailure) {
+                            put("errorMessage", result.exceptionOrNull()?.message ?: "Unknown error")
+                        }
+                    }.toString(2)
+
+                    val diagFileName = "$baseFileName.json"
+                    supabase.uploadVoiceOrderDiagnostics(diagFileName, diagJson)
+                    Log.d("MainViewModel", "Voice telemetry uploaded successfully: $baseFileName")
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Failed to upload voice telemetry: ${e.message}")
+                }
+            }
 
             if (result.isSuccess && result.getOrNull() != null) {
                 val parsedOrder = result.getOrNull() ?: return@launch
@@ -2251,6 +2322,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val repo = _uiState.value.githubRepoName
         val token = _uiState.value.githubToken.takeIf { it.isNotBlank() }
         val currentVersion = BuildConfig.VERSION_NAME
+        val currentVersionCode = BuildConfig.VERSION_CODE
 
         _uiState.update { it.copy(isCheckingForUpdate = true) }
 
@@ -2259,6 +2331,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 owner = owner,
                 repo = repo,
                 currentVersionName = currentVersion,
+                currentVersionCode = currentVersionCode,
                 token = token
             )
 
@@ -2269,11 +2342,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update {
                         it.copy(
                             appUpdateStatus = AppUpdateStatus.Available(updateInfo),
-                            showAppUpdateDialog = true
+                            showAppUpdateDialog = true,
+                            isForceUpdate = updateInfo.isForceUpdate,
+                            forceUpdateMessage = updateInfo.forceUpdateMessage
                         )
                     }
                 } else {
-                    _uiState.update { it.copy(appUpdateStatus = AppUpdateStatus.Idle) }
+                    _uiState.update { 
+                        it.copy(
+                            appUpdateStatus = AppUpdateStatus.Idle,
+                            isForceUpdate = false,
+                            forceUpdateMessage = ""
+                        ) 
+                    }
                     if (isManualCheck) {
                         _uiState.update {
                             it.copy(snackbarMessage = "FILTR Billing is up to date (v$currentVersion)")
@@ -2349,6 +2430,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun dismissAppUpdateDialog() {
+        if (_uiState.value.isForceUpdate) {
+            // Cannot dismiss dialog during mandatory/force update
+            return
+        }
         _uiState.update { it.copy(showAppUpdateDialog = false) }
     }
 

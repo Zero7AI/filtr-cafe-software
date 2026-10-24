@@ -189,9 +189,24 @@ class FiltrRepository(
                                     }
                                 }
 
-                                // Update order status only if local does not have unsaved pending changes
-                                if (!localIsPending) {
-                                    orderDao.updateOrder(remoteOrder.order.copy(syncStatus = "SYNCED"))
+                                // Update order status: Reconcile status fields so remote updates (paid, made, delivered) reflect across devices
+                                val statusDiffers = localOrder.order.isPaid != remoteOrder.order.isPaid ||
+                                        localOrder.order.isDelivered != remoteOrder.order.isDelivered ||
+                                        localOrder.order.isMade != remoteOrder.order.isMade ||
+                                        localOrder.order.paymentMode != remoteOrder.order.paymentMode
+
+                                if (statusDiffers) {
+                                    orderDao.updateOrder(
+                                        localOrder.order.copy(
+                                            isPaid = remoteOrder.order.isPaid,
+                                            paymentMode = remoteOrder.order.paymentMode,
+                                            isMade = remoteOrder.order.isMade,
+                                            isDelivered = remoteOrder.order.isDelivered,
+                                            completedTimestamp = maxOf(localOrder.order.completedTimestamp, remoteOrder.order.completedTimestamp),
+                                            syncStatus = "SYNCED"
+                                        )
+                                    )
+                                    Log.d(TAG, "Supabase: Synced status update for $orderId (paid=${remoteOrder.order.isPaid}, made=${remoteOrder.order.isMade}, delivered=${remoteOrder.order.isDelivered})")
                                 }
                             }
                         }
@@ -917,15 +932,16 @@ class FiltrRepository(
             orderDao.resetAllOrderItemsCompleted(orderId)
         }
 
-        // Sync full order to Supabase
+        // Sync made status to Supabase via field update (non-destructive)
         if (supabaseService.isInitialized) {
             try {
-                val fullOrder = orderDao.getOrderById(orderId)
-                if (fullOrder != null) {
-                    val res = supabaseService.saveOrder(fullOrder)
-                    if (res.isSuccess) {
-                        orderDao.updateSyncStatus(orderId, "SYNCED")
-                    }
+                val res = supabaseService.updateOrderFields(orderId, mapOf(
+                    "isMade" to isMade,
+                    "completedTimestamp" to now,
+                    "syncStatus" to "SYNCED"
+                ))
+                if (res.isSuccess) {
+                    orderDao.updateSyncStatus(orderId, "SYNCED")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync made status to Supabase: ${e.message}")
@@ -1132,6 +1148,21 @@ class FiltrRepository(
             orderDao.updateSyncStatus(orderWithItems.order.orderId, "FAILED")
         }
         return result
+    }
+
+    suspend fun syncPendingOrdersToSupabase(): Result<String> {
+        if (!supabaseService.isInitialized) return Result.failure(Exception("Supabase not initialized"))
+        val unsynced = orderDao.getUnsyncedOrders()
+        if (unsynced.isEmpty()) return Result.success("All orders already synced to Supabase")
+        var syncedCount = 0
+        for (orderWithItems in unsynced) {
+            val res = supabaseService.saveOrder(orderWithItems)
+            if (res.isSuccess) {
+                orderDao.updateSyncStatus(orderWithItems.order.orderId, "SYNCED")
+                syncedCount++
+            }
+        }
+        return Result.success("Synced $syncedCount pending orders to Supabase")
     }
 
     suspend fun syncPendingOrdersToGoogleSheets(webhookUrl: String): Result<String> {

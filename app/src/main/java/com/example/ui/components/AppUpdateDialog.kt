@@ -35,6 +35,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,15 +55,22 @@ import java.util.Locale
 @Composable
 fun AppUpdateDialog(
     status: AppUpdateStatus,
+    isForceUpdate: Boolean = false,
+    forceUpdateMessage: String = "",
     onStartDownload: (AppUpdateInfo) -> Unit,
     onInstallApk: (File) -> Unit,
     onRetryCheck: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onExitApp: (() -> Unit)? = null
 ) {
     AlertDialog(
+        properties = DialogProperties(
+            dismissOnBackPress = !isForceUpdate,
+            dismissOnClickOutside = !isForceUpdate
+        ),
         onDismissRequest = {
-            // Do not dismiss during active download to prevent interrupted download state
-            if (status !is AppUpdateStatus.Downloading) {
+            // Do not dismiss during active download or when force update is active
+            if (!isForceUpdate && status !is AppUpdateStatus.Downloading) {
                 onDismiss()
             }
         },
@@ -71,19 +79,24 @@ fun AppUpdateDialog(
                 modifier = Modifier
                     .size(48.dp)
                     .clip(CircleShape)
-                    .background(CoffeeBrownPrimary.copy(alpha = 0.12f)),
+                    .background(
+                        if (isForceUpdate) MaterialTheme.colorScheme.error.copy(alpha = 0.12f)
+                        else CoffeeBrownPrimary.copy(alpha = 0.12f)
+                    ),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = when (status) {
-                        is AppUpdateStatus.ReadyToInstall -> Icons.Default.CheckCircle
-                        is AppUpdateStatus.Error -> Icons.Default.ErrorOutline
+                    imageVector = when {
+                        isForceUpdate -> Icons.Default.ErrorOutline
+                        status is AppUpdateStatus.ReadyToInstall -> Icons.Default.CheckCircle
+                        status is AppUpdateStatus.Error -> Icons.Default.ErrorOutline
                         else -> Icons.Default.SystemUpdate
                     },
                     contentDescription = "App Update",
-                    tint = when (status) {
-                        is AppUpdateStatus.ReadyToInstall -> Color(0xFF10B981)
-                        is AppUpdateStatus.Error -> MaterialTheme.colorScheme.error
+                    tint = when {
+                        isForceUpdate -> MaterialTheme.colorScheme.error
+                        status is AppUpdateStatus.ReadyToInstall -> Color(0xFF10B981)
+                        status is AppUpdateStatus.Error -> MaterialTheme.colorScheme.error
                         else -> CoffeeBrownPrimary
                     },
                     modifier = Modifier.size(28.dp)
@@ -92,22 +105,41 @@ fun AppUpdateDialog(
         },
         title = {
             Text(
-                text = when (status) {
-                    is AppUpdateStatus.Available -> "Update Available 🚀"
-                    is AppUpdateStatus.Downloading -> "Downloading Update..."
-                    is AppUpdateStatus.ReadyToInstall -> "Ready to Install"
-                    is AppUpdateStatus.Error -> "Update Failed"
+                text = when {
+                    isForceUpdate && status is AppUpdateStatus.Available -> "Mandatory Update Required ⚠️"
+                    status is AppUpdateStatus.Available -> "Update Available 🚀"
+                    status is AppUpdateStatus.Downloading -> "Downloading Update..."
+                    status is AppUpdateStatus.ReadyToInstall -> "Ready to Install"
+                    status is AppUpdateStatus.Error -> "Update Failed"
                     else -> "Software Update"
                 },
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,
-                color = CoffeeBrownPrimary
+                color = if (isForceUpdate) MaterialTheme.colorScheme.error else CoffeeBrownPrimary
             )
         },
         text = {
             Column(
                 modifier = Modifier.fillMaxWidth()
             ) {
+                if (isForceUpdate && status is AppUpdateStatus.Available) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
+                    ) {
+                        Text(
+                            text = if (forceUpdateMessage.isNotBlank()) forceUpdateMessage
+                            else "A required update for FILTR Billing is available. Please update now to continue taking orders.",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
                 when (status) {
                     is AppUpdateStatus.Available -> {
                         val update = status.updateInfo
@@ -154,7 +186,7 @@ fun AppUpdateDialog(
                             text = "What's New:",
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp,
-                            color = CoffeeBrownPrimary
+                            color = if (isForceUpdate) MaterialTheme.colorScheme.error else CoffeeBrownPrimary
                         )
 
                         Spacer(modifier = Modifier.height(4.dp))
@@ -187,7 +219,7 @@ fun AppUpdateDialog(
                                 .fillMaxWidth()
                                 .height(8.dp)
                                 .clip(RoundedCornerShape(4.dp)),
-                            color = CoffeeBrownPrimary,
+                            color = if (isForceUpdate) MaterialTheme.colorScheme.error else CoffeeBrownPrimary,
                             trackColor = CoffeeBrownPrimary.copy(alpha = 0.2f)
                         )
 
@@ -208,7 +240,7 @@ fun AppUpdateDialog(
                                 text = "${status.progressPercent}%",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp,
-                                color = CoffeeBrownPrimary
+                                color = if (isForceUpdate) MaterialTheme.colorScheme.error else CoffeeBrownPrimary
                             )
                             Text(
                                 text = "$downloadedMb MB / $totalMb MB",
@@ -291,12 +323,20 @@ fun AppUpdateDialog(
             }
         },
         dismissButton = {
-            if (status !is AppUpdateStatus.Downloading) {
-                TextButton(onClick = onDismiss) {
-                    Text(
-                        text = if (status is AppUpdateStatus.Available) "Later" else "Close",
-                        color = Color.Gray
-                    )
+            if (!isForceUpdate) {
+                if (status !is AppUpdateStatus.Downloading) {
+                    TextButton(onClick = onDismiss) {
+                        Text(
+                            text = if (status is AppUpdateStatus.Available) "Later" else "Close",
+                            color = Color.Gray
+                        )
+                    }
+                }
+            } else {
+                onExitApp?.let { exit ->
+                    TextButton(onClick = exit) {
+                        Text("Exit App", color = Color.Gray)
+                    }
                 }
             }
         },

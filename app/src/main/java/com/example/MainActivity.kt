@@ -820,7 +820,7 @@ class MainActivity : ComponentActivity() {
                                     isParsing = uiState.isParsingVoice,
                                     onStartListening = { viewModel.startListeningVoice() },
                                     onProcessTranscript = { viewModel.processVoiceTranscript(it) },
-                                    onProcessAudio = { bytes, mimeType -> viewModel.processVoiceAudio(bytes, mimeType) },
+                                    onProcessAudio = { bytes, mimeType, durationMs -> viewModel.processVoiceAudio(bytes, mimeType, durationMs) },
                                     onCancel = { viewModel.cancelVoiceListening() },
                                     modifier = Modifier
                                         .align(Alignment.BottomEnd)
@@ -940,6 +940,8 @@ class MainActivity : ComponentActivity() {
                             if (uiState.showAppUpdateDialog) {
                                 AppUpdateDialog(
                                     status = uiState.appUpdateStatus,
+                                    isForceUpdate = uiState.isForceUpdate,
+                                    forceUpdateMessage = uiState.forceUpdateMessage,
                                     onStartDownload = { updateInfo ->
                                         viewModel.startDownloadingUpdate(updateInfo)
                                     },
@@ -951,6 +953,9 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onDismiss = {
                                         viewModel.dismissAppUpdateDialog()
+                                    },
+                                    onExitApp = {
+                                        (context as? android.app.Activity)?.finishAffinity()
                                     }
                                 )
                             }

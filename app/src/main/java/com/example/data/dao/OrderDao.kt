@@ -21,7 +21,7 @@ interface OrderDao {
     @Query("SELECT * FROM orders WHERE orderId = :orderId")
     suspend fun getOrderById(orderId: String): OrderWithItems?
 
-    @Insert(onConflict = OnConflictStrategy.ABORT)
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrder(order: OrderEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

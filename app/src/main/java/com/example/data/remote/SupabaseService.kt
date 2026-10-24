@@ -98,7 +98,10 @@ class SupabaseService private constructor() {
                 .build()
             val upsertResp = executeRequest(upsertOrderReq)
             if (upsertResp?.isSuccessful != true) {
-                Log.w(TAG, "saveOrder upsert failed: ${upsertResp?.code}")
+                val code = upsertResp?.code
+                Log.w(TAG, "saveOrder upsert failed: $code")
+                upsertResp?.close()
+                return@withContext Result.failure(Exception("Supabase order upsert failed with HTTP $code"))
             }
             upsertResp?.close()
 
@@ -169,8 +172,15 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .patch(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Order fields updated")
+            val resp = executeRequest(req)
+            val isSuccess = resp?.isSuccessful == true
+            val code = resp?.code
+            resp?.close()
+            if (isSuccess) {
+                Result.success("Order fields updated")
+            } else {
+                Result.failure(Exception("Order fields update failed with HTTP $code"))
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -280,10 +290,10 @@ class SupabaseService private constructor() {
         while (true) {
             if (isInitialized) {
                 try {
-                    // Sync active recent orders (last 3 days) sorted newest-first to ensure live sync
-                    val syncWindowMs = System.currentTimeMillis() - (3L * 24 * 60 * 60 * 1000)
+                    // Sync active recent orders (last 7 days, up to 300 orders) sorted newest-first to ensure live cross-device sync
+                    val syncWindowMs = System.currentTimeMillis() - (7L * 24 * 60 * 60 * 1000)
                     val req = Request.Builder()
-                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=100")
+                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=300")
                         .addHeader("apikey", SERVICE_ROLE_KEY)
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
@@ -1278,4 +1288,122 @@ class SupabaseService private constructor() {
      * Save remote GitHub update repository configuration to Supabase sync_metadata table.
      */
     suspend fun saveUpdateRepoConfig(repoConfig: String): Result<String> = saveSyncMetadata("github_update_repo", repoConfig)
+
+    // ==================== VOICE ORDER CLOUD TELEMETRY ====================
+    private val VOICE_ORDERS_BUCKET = "voice-orders"
+
+    /**
+     * Uploads voice order recording (.m4a) to Supabase Storage bucket `voice-orders`.
+     */
+    suspend fun uploadVoiceOrderAudio(fileName: String, audioBytes: ByteArray): Result<String> = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext Result.failure(Exception("Supabase not initialized"))
+        try {
+            val body = audioBytes.toRequestBody("audio/mp4".toMediaType())
+            val req = Request.Builder()
+                .url("$STORAGE_BASE_URL/object/$VOICE_ORDERS_BUCKET/$fileName")
+                .addHeader("apikey", SERVICE_ROLE_KEY)
+                .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                .addHeader("Content-Type", "audio/mp4")
+                .addHeader("x-upsert", "true")
+                .post(body)
+                .build()
+            val response = executeRequest(req)
+            if (response?.isSuccessful == true) {
+                val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$VOICE_ORDERS_BUCKET/$fileName"
+                response.close()
+                Result.success(publicUrl)
+            } else {
+                val code = response?.code
+                val err = response?.body?.string() ?: "HTTP $code"
+                response?.close()
+                Result.failure(Exception("Voice audio upload failed: $err"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Uploads companion JSON diagnostics (.json) to Supabase Storage bucket `voice-orders`.
+     */
+    suspend fun uploadVoiceOrderDiagnostics(fileName: String, jsonDiagnostics: String): Result<String> = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext Result.failure(Exception("Supabase not initialized"))
+        try {
+            val body = jsonDiagnostics.toRequestBody(JSON_MEDIA_TYPE)
+            val req = Request.Builder()
+                .url("$STORAGE_BASE_URL/object/$VOICE_ORDERS_BUCKET/$fileName")
+                .addHeader("apikey", SERVICE_ROLE_KEY)
+                .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                .addHeader("Content-Type", "application/json")
+                .addHeader("x-upsert", "true")
+                .post(body)
+                .build()
+            val response = executeRequest(req)
+            if (response?.isSuccessful == true) {
+                val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$VOICE_ORDERS_BUCKET/$fileName"
+                response.close()
+                Result.success(publicUrl)
+            } else {
+                val code = response?.code
+                val err = response?.body?.string() ?: "HTTP $code"
+                response?.close()
+                Result.failure(Exception("Diagnostics upload failed: $err"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Remote update policy model to enforce mandatory app updates across all staff devices.
+     */
+    data class AppUpdatePolicy(
+        val forceUpdate: Boolean = false,
+        val minVersionCode: Int = 0,
+        val minVersionName: String = "",
+        val title: String = "",
+        val message: String = ""
+    )
+
+    /**
+     * Fetches mandatory update policy from Supabase sync_metadata.
+     */
+    suspend fun fetchAppUpdatePolicy(): AppUpdatePolicy? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            // First check if github_update_repo JSON contains force_update or min_version_code
+            val repoConfig = fetchUpdateRepoConfig()
+            if (!repoConfig.isNullOrBlank() && repoConfig.startsWith("{")) {
+                val json = JSONObject(repoConfig)
+                val force = json.optBoolean("force_update", false)
+                val minCode = json.optInt("min_version_code", 0)
+                if (force || minCode > 0) {
+                    return@withContext AppUpdatePolicy(
+                        forceUpdate = force,
+                        minVersionCode = minCode,
+                        minVersionName = json.optString("min_version_name", ""),
+                        title = json.optString("title", "Mandatory Update Required"),
+                        message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders.")
+                    )
+                }
+            }
+
+            // Also check dedicated app_update_policy key
+            val policyRaw = fetchSyncMetadata("app_update_policy")
+            if (!policyRaw.isNullOrBlank()) {
+                val json = JSONObject(policyRaw)
+                return@withContext AppUpdatePolicy(
+                    forceUpdate = json.optBoolean("force_update", false),
+                    minVersionCode = json.optInt("min_version_code", 0),
+                    minVersionName = json.optString("min_version_name", ""),
+                    title = json.optString("title", "Mandatory Update Required"),
+                    message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders.")
+                )
+            }
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAppUpdatePolicy failed: ${e.message}")
+            null
+        }
+    }
 }

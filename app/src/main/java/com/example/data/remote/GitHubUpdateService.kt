@@ -24,6 +24,8 @@ data class AppUpdateInfo(
     val apkFileName: String,
     val apkSizeBytes: Long,
     val isUpdateAvailable: Boolean,
+    val isForceUpdate: Boolean = false,
+    val forceUpdateMessage: String = "",
     val publishedAt: String = "",
     val token: String? = null
 )
@@ -76,6 +78,7 @@ class GitHubUpdateService private constructor() {
         owner: String? = null,
         repo: String? = null,
         currentVersionName: String,
+        currentVersionCode: Int = 0,
         token: String? = null
     ): Result<AppUpdateInfo> = withContext(Dispatchers.IO) {
         try {
@@ -176,6 +179,13 @@ class GitHubUpdateService private constructor() {
             val isNewer = isNewerVersion(tagName, currentVersionName)
             val cleanVersionName = tagName.removePrefix("v").removePrefix("V")
 
+            val policy = SupabaseService.getInstance().fetchAppUpdatePolicy()
+            val isMandatoryByCode = policy != null && policy.minVersionCode > 0 && currentVersionCode < policy.minVersionCode
+            val isMandatoryByName = policy != null && policy.minVersionName.isNotBlank() && isNewerVersion(policy.minVersionName, currentVersionName)
+            val isMandatoryByFlag = policy != null && policy.forceUpdate && isNewer
+            val isForce = isMandatoryByCode || isMandatoryByName || isMandatoryByFlag
+            val isAvailable = isNewer || isMandatoryByCode || isMandatoryByName
+
             val updateInfo = AppUpdateInfo(
                 versionName = cleanVersionName,
                 releaseTitle = releaseTitle,
@@ -183,12 +193,14 @@ class GitHubUpdateService private constructor() {
                 apkDownloadUrl = apkDownloadUrl,
                 apkFileName = apkFileName,
                 apkSizeBytes = apkSizeBytes,
-                isUpdateAvailable = isNewer,
+                isUpdateAvailable = isAvailable,
+                isForceUpdate = isForce,
+                forceUpdateMessage = policy?.message ?: "",
                 publishedAt = publishedAt,
                 token = cleanToken.ifBlank { null }
             )
 
-            Log.d(TAG, "Check complete: local=$currentVersionName, remote=$cleanVersionName, isNewer=$isNewer")
+            Log.d(TAG, "Check complete: local=$currentVersionName (code=$currentVersionCode), remote=$cleanVersionName, isNewer=$isNewer, isForce=$isForce")
             Result.success(updateInfo)
         } catch (e: Exception) {
             Log.e(TAG, "Error checking for update: ${e.message}", e)

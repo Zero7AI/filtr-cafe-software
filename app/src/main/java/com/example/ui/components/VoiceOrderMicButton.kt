@@ -78,7 +78,7 @@ fun VoiceOrderMicButton(
     isParsing: Boolean,
     onStartListening: () -> Unit,
     onProcessTranscript: (String) -> Unit,
-    onProcessAudio: (ByteArray, String) -> Unit,
+    onProcessAudio: (ByteArray, String, Long) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -243,8 +243,9 @@ fun VoiceOrderMicButton(
                         if (audioFile != null && audioFile.exists() && audioFile.length() > 0) {
                             val bytes = audioFile.readBytes()
                             audioFile.delete()
+                            val durationMs = audioRecorderManager.lastRecordingDurationMs
                             if (bytes.isNotEmpty()) {
-                                onProcessAudio(bytes, "audio/m4a")
+                                onProcessAudio(bytes, "audio/m4a", durationMs)
                             }
                         }
                     }
