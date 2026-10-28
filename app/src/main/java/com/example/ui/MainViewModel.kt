@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -308,6 +309,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
+                // Check for app updates on network reconnection
+                viewModelScope.launch {
+                    checkForAppUpdates(isManualCheck = false)
+                }
             }
             override fun onLost(network: android.net.Network) {
                 _uiState.update { it.copy(isNetworkAvailable = false) }
@@ -370,8 +375,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // Automatic periodic Cloud & Google Sheets Sync Loop (Attempts sync of any pending unsynced orders every 2 minutes)
         viewModelScope.launch(Dispatchers.IO) {
+            var loopCount = 0
             while (true) {
                 kotlinx.coroutines.delay(120 * 1000L) // 2 minute background safety sync
+                loopCount++
                 try {
                     repository.syncPendingOrdersToSupabase()
                 } catch (e: Exception) {
@@ -384,6 +391,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Background Sheets sync failed, will retry: ${e.message}")
+                }
+                // Check for mandatory updates every 10 minutes in background
+                if (loopCount % 5 == 0) {
+                    withContext(Dispatchers.Main) {
+                        checkForAppUpdates(isManualCheck = false)
+                    }
                 }
             }
         }
@@ -740,6 +753,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         notes: String? = null
     ) {
         viewModelScope.launch {
+            if (_uiState.value.isForceUpdate) {
+                _uiState.update { 
+                    it.copy(
+                        showAppUpdateDialog = true, 
+                        snackbarMessage = "Mandatory Update Required. Please update the application to continue."
+                    ) 
+                }
+                return@launch
+            }
             if (_uiState.value.isPlacingOrder || voiceItems.isEmpty()) return@launch
 
             _uiState.update { it.copy(isPlacingOrder = true) }
@@ -821,6 +843,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun submitOrder() {
         viewModelScope.launch {
             val state = _uiState.value
+            if (state.isForceUpdate) {
+                _uiState.update { 
+                    it.copy(
+                        showAppUpdateDialog = true, 
+                        snackbarMessage = "Mandatory Update Required. Please update the application to continue."
+                    ) 
+                }
+                return@launch
+            }
             if (state.isPlacingOrder || state.cartItems.isEmpty()) {
                 if (state.cartItems.isEmpty()) {
                     _uiState.update { it.copy(snackbarMessage = "Cart is empty!") }
