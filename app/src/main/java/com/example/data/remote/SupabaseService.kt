@@ -1228,7 +1228,9 @@ class SupabaseService private constructor() {
      * Fetch metadata by key from Supabase sync_metadata table.
      */
     suspend fun fetchSyncMetadata(key: String): String? = withContext(Dispatchers.IO) {
-        if (!isInitialized) return@withContext null
+        if (!_isInitialized) {
+            initialize()
+        }
         try {
             val req = Request.Builder()
                 .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.$key&limit=1")
@@ -1362,14 +1364,19 @@ class SupabaseService private constructor() {
         val minVersionCode: Int = 0,
         val minVersionName: String = "",
         val title: String = "",
-        val message: String = ""
+        val message: String = "",
+        val apkDownloadUrl: String = "",
+        val apkFileName: String = "",
+        val apkSizeBytes: Long = 0L
     )
 
     /**
      * Fetches mandatory update policy from Supabase sync_metadata.
      */
     suspend fun fetchAppUpdatePolicy(): AppUpdatePolicy? = withContext(Dispatchers.IO) {
-        if (!isInitialized) return@withContext null
+        if (!_isInitialized) {
+            initialize()
+        }
         try {
             // First check if github_update_repo JSON contains force_update or min_version_code
             val repoConfig = fetchUpdateRepoConfig()
@@ -1383,7 +1390,10 @@ class SupabaseService private constructor() {
                         minVersionCode = minCode,
                         minVersionName = json.optString("min_version_name", ""),
                         title = json.optString("title", "Mandatory Update Required"),
-                        message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders.")
+                        message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders."),
+                        apkDownloadUrl = json.optString("apk_download_url", ""),
+                        apkFileName = json.optString("apk_file_name", "filtr-billing-v1.3.apk"),
+                        apkSizeBytes = json.optLong("apk_size_bytes", 0L)
                     )
                 }
             }
@@ -1397,7 +1407,10 @@ class SupabaseService private constructor() {
                     minVersionCode = json.optInt("min_version_code", 0),
                     minVersionName = json.optString("min_version_name", ""),
                     title = json.optString("title", "Mandatory Update Required"),
-                    message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders.")
+                    message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders."),
+                    apkDownloadUrl = json.optString("apk_download_url", ""),
+                    apkFileName = json.optString("apk_file_name", "filtr-billing-v1.3.apk"),
+                    apkSizeBytes = json.optLong("apk_size_bytes", 0L)
                 )
             }
             null

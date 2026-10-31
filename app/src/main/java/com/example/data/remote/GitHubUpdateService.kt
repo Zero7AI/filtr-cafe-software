@@ -110,6 +110,13 @@ class GitHubUpdateService private constructor() {
 
             lastResolvedToken = cleanToken.ifBlank { null }
 
+            // Check remote policy from Supabase early
+            val policy = try { SupabaseService.getInstance().fetchAppUpdatePolicy() } catch (e: Exception) { null }
+            val isMandatoryByCode = policy != null && policy.minVersionCode > 0 && currentVersionCode < policy.minVersionCode
+            val isMandatoryByName = policy != null && policy.minVersionName.isNotBlank() && isNewerVersion(policy.minVersionName, currentVersionName)
+            val isMandatoryByFlag = policy != null && policy.forceUpdate
+            val isMandatory = isMandatoryByCode || isMandatoryByName || isMandatoryByFlag
+
             val url = "https://api.github.com/repos/$cleanOwner/$cleanRepo/releases/latest"
 
             val requestBuilder = Request.Builder()
@@ -121,11 +128,56 @@ class GitHubUpdateService private constructor() {
                 requestBuilder.header("Authorization", "Bearer $cleanToken")
             }
 
-            val response = client.newCall(requestBuilder.build()).execute()
+            val response = try {
+                client.newCall(requestBuilder.build()).execute()
+            } catch (e: Exception) {
+                if (isMandatory && policy != null) {
+                    Log.i(TAG, "GitHub API call failed (${e.message}), but Supabase policy requires mandatory update: serving policy info")
+                    val fallbackDownloadUrl = policy.apkDownloadUrl.ifBlank {
+                        "https://github.com/$cleanOwner/$cleanRepo/releases/download/v${policy.minVersionName}/filtr-billing-v${policy.minVersionName}.apk"
+                    }
+                    return@withContext Result.success(
+                        AppUpdateInfo(
+                            versionName = policy.minVersionName,
+                            releaseTitle = policy.title.ifBlank { "Mandatory Update Required ⚠️" },
+                            releaseNotes = policy.message,
+                            apkDownloadUrl = fallbackDownloadUrl,
+                            apkFileName = policy.apkFileName.ifBlank { "filtr-billing-v${policy.minVersionName}.apk" },
+                            apkSizeBytes = policy.apkSizeBytes,
+                            isUpdateAvailable = true,
+                            isForceUpdate = true,
+                            forceUpdateMessage = policy.message,
+                            token = null
+                        )
+                    )
+                }
+                throw e
+            }
+
             if (!response.isSuccessful) {
                 val code = response.code
                 val errBody = response.body?.string().orEmpty()
                 Log.w(TAG, "GitHub API returned HTTP $code: $errBody")
+                if (isMandatory && policy != null) {
+                    Log.i(TAG, "GitHub API HTTP $code, using Supabase policy for mandatory update")
+                    val fallbackDownloadUrl = policy.apkDownloadUrl.ifBlank {
+                        "https://github.com/$cleanOwner/$cleanRepo/releases/download/v${policy.minVersionName}/filtr-billing-v${policy.minVersionName}.apk"
+                    }
+                    return@withContext Result.success(
+                        AppUpdateInfo(
+                            versionName = policy.minVersionName,
+                            releaseTitle = policy.title.ifBlank { "Mandatory Update Required ⚠️" },
+                            releaseNotes = policy.message,
+                            apkDownloadUrl = fallbackDownloadUrl,
+                            apkFileName = policy.apkFileName.ifBlank { "filtr-billing-v${policy.minVersionName}.apk" },
+                            apkSizeBytes = policy.apkSizeBytes,
+                            isUpdateAvailable = true,
+                            isForceUpdate = true,
+                            forceUpdateMessage = policy.message,
+                            token = null
+                        )
+                    )
+                }
                 return@withContext Result.failure(
                     Exception(
                         when (code) {
@@ -179,11 +231,7 @@ class GitHubUpdateService private constructor() {
             val isNewer = isNewerVersion(tagName, currentVersionName)
             val cleanVersionName = tagName.removePrefix("v").removePrefix("V")
 
-            val policy = SupabaseService.getInstance().fetchAppUpdatePolicy()
-            val isMandatoryByCode = policy != null && policy.minVersionCode > 0 && currentVersionCode < policy.minVersionCode
-            val isMandatoryByName = policy != null && policy.minVersionName.isNotBlank() && isNewerVersion(policy.minVersionName, currentVersionName)
-            val isMandatoryByFlag = policy != null && policy.forceUpdate && isNewer
-            val isForce = isMandatoryByCode || isMandatoryByName || isMandatoryByFlag
+            val isForce = isMandatoryByCode || isMandatoryByName || (isMandatoryByFlag && isNewer)
             val isAvailable = isNewer || isMandatoryByCode || isMandatoryByName
 
             val updateInfo = AppUpdateInfo(
@@ -230,13 +278,24 @@ class GitHubUpdateService private constructor() {
 
             val cleanToken = token?.trim().takeIf { !it.isNullOrBlank() }
                 ?: lastResolvedToken.orEmpty()
-            if (cleanToken.isNotBlank()) {
+            val isApiUrl = downloadUrl.contains("api.github.com/repos/")
+            if (cleanToken.isNotBlank() && isApiUrl) {
                 requestBuilder.header("Authorization", "Bearer $cleanToken")
                 // Required by GitHub API when requesting /releases/assets/{id}
                 requestBuilder.header("Accept", "application/octet-stream")
             }
 
-            val response = client.newCall(requestBuilder.build()).execute()
+            var response = client.newCall(requestBuilder.build()).execute()
+            if (!response.isSuccessful && cleanToken.isNotBlank() && isApiUrl) {
+                response.close()
+                val browserFallbackUrl = "https://github.com/${DEFAULT_REPO_OWNER}/${DEFAULT_REPO_NAME}/releases/download/v1.3/filtr-billing-v1.3.apk"
+                Log.w(TAG, "API download failed, falling back to direct CDN: $browserFallbackUrl")
+                val fallbackReq = Request.Builder()
+                    .url(browserFallbackUrl)
+                    .header("User-Agent", "FILTR-Billing-App")
+                    .build()
+                response = client.newCall(fallbackReq).execute()
+            }
             if (!response.isSuccessful) {
                 return@withContext Result.failure(Exception("Failed to download APK (HTTP ${response.code})"))
             }

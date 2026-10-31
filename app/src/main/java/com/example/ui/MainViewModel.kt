@@ -505,8 +505,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
-                // Check for mandatory updates every 10 minutes in background
-                if (loopCount % 5 == 0) {
+                // Check for mandatory updates every 4 minutes in background
+                if (loopCount % 2 == 0) {
                     withContext(Dispatchers.Main) {
                         checkForAppUpdates(isManualCheck = false)
                     }
@@ -575,7 +575,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // Check for app updates via GitHub Releases on startup
         viewModelScope.launch {
-            delay(3000) // Small delay to prioritize initial POS UI load
+            delay(1000) // Fast initial check immediately upon launch
             checkForAppUpdates(isManualCheck = false)
         }
     }
@@ -710,6 +710,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Navigation Tab
     fun selectTab(tab: FiltrTab) {
+        if (_uiState.value.isForceUpdate) {
+            _uiState.update { 
+                it.copy(
+                    showAppUpdateDialog = true,
+                    snackbarMessage = "Mandatory Update Required. Please update the application to continue."
+                ) 
+            }
+            return
+        }
         _uiState.update { it.copy(currentTab = tab) }
     }
 
@@ -762,6 +771,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Cart Operations
     fun addToCart(item: MenuItemEntity) {
+        if (_uiState.value.isForceUpdate) {
+            _uiState.update { 
+                it.copy(
+                    showAppUpdateDialog = true,
+                    snackbarMessage = "Mandatory Update Required. Please update the application to continue."
+                ) 
+            }
+            return
+        }
         _uiState.update { state ->
             val existingKey = state.cartItems.keys.find { it.id == item.id }
             val targetItem = existingKey ?: item
@@ -1229,6 +1247,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // AI Voice Order Handling
     fun startListeningVoice() {
+        if (_uiState.value.isForceUpdate) {
+            _uiState.update { 
+                it.copy(
+                    showAppUpdateDialog = true, 
+                    snackbarMessage = "Mandatory Update Required. Please update the application to continue."
+                ) 
+            }
+            return
+        }
         _uiState.update {
             it.copy(
                 isListeningVoice = true,
@@ -2460,6 +2487,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ==================== IN-APP OTA APP UPDATES (GitHub Releases) ====================
+
+    private var lastUpdateCheckMs = 0L
+
+    fun onActivityResumed() {
+        if (_uiState.value.isForceUpdate) {
+            _uiState.update { it.copy(showAppUpdateDialog = true) }
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastUpdateCheckMs > 60 * 1000L) {
+            lastUpdateCheckMs = now
+            checkForAppUpdates(isManualCheck = false)
+        }
+    }
+
+    fun showMandatoryUpdateDialog() {
+        _uiState.update { it.copy(showAppUpdateDialog = true) }
+    }
 
     fun checkForAppUpdates(isManualCheck: Boolean = false) {
         val owner = _uiState.value.githubRepoOwner

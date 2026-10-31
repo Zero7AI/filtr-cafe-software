@@ -1119,6 +1119,13 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
+                            // Persistent lockout: Ensure update dialog cannot be suppressed while force update is active
+                            if (uiState.isForceUpdate && !uiState.showAppUpdateDialog) {
+                                LaunchedEffect(uiState.isForceUpdate) {
+                                    viewModel.showMandatoryUpdateDialog()
+                                }
+                            }
+
                             if (uiState.showAccountsUpiDialog) {
                                 AccountsUpiDialog(
                                     upiAccounts = upiAccounts,
@@ -1276,6 +1283,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.onActivityResumed()
     }
 
     override fun onDestroy() {
