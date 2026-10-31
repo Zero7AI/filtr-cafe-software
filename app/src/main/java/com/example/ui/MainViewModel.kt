@@ -33,13 +33,17 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import com.example.data.entity.ChecklistCompletionEntity
+import com.example.data.entity.ChecklistTaskEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Job
@@ -59,8 +63,41 @@ enum class FiltrTab {
     CUSTOMERS,
     RECEIPT_DESIGN,
     PROFIT_LOSS,
-    VOICE_ORDER
+    VOICE_ORDER,
+    CHECKLIST
 }
+
+data class ChecklistItemUiModel(
+    val task: ChecklistTaskEntity,
+    val completion: ChecklistCompletionEntity?
+) {
+    val isCompleted: Boolean get() = completion?.isCompleted == true
+    val isOutOfStock: Boolean get() = completion?.isOutOfStock == true
+    val completedTimestamp: Long get() = completion?.completedTimestamp ?: 0L
+    val completedBy: String get() = completion?.completedBy ?: "Staff"
+}
+
+data class ChecklistSectionUiModel(
+    val sectionId: String,
+    val sectionName: String,
+    val items: List<ChecklistItemUiModel>,
+    val isExpanded: Boolean = true
+) {
+    val totalCount: Int get() = items.size
+    val completedCount: Int get() = items.count { it.isCompleted }
+    val pendingCount: Int get() = totalCount - completedCount
+    val isAllCompleted: Boolean get() = totalCount > 0 && completedCount == totalCount
+    val completionPercentage: Int get() = if (totalCount == 0) 0 else (completedCount * 100) / totalCount
+}
+
+data class ChecklistOverallStats(
+    val dateKey: String,
+    val formattedDate: String,
+    val totalCount: Int,
+    val completedCount: Int,
+    val pendingCount: Int,
+    val percentage: Int
+)
 
 data class BillingUiState(
     val currentTab: FiltrTab = FiltrTab.BILLING,
@@ -156,14 +193,18 @@ data class BillingUiState(
     // Item Master Custom Ordering & Categories
     val customItemOrder: List<String> = emptyList(),
     val customCategories: List<String> = emptyList(),
-    val showAddCategoryDialog: Boolean = false
+    val showAddCategoryDialog: Boolean = false,
+    // Daily Check List
+    val showAddChecklistTaskDialog: Boolean = false,
+    val collapsedChecklistSectionIds: Set<String> = emptySet()
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = FiltrDatabase.getDatabase(application, viewModelScope)
     private val repository = FiltrRepository(
         database.menuDao(), database.orderDao(), database.upiAccountDao(),
-        database.inventoryDao(), database.customerDao(), database.fixedCostDao()
+        database.inventoryDao(), database.customerDao(), database.fixedCostDao(),
+        database.checklistDao()
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
@@ -285,6 +326,72 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val fixedCosts: StateFlow<List<FixedCostEntity>> = repository.allFixedCosts
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val todayDateKey: String
+        get() = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+
+    val checklistSections: StateFlow<List<ChecklistSectionUiModel>> = combine(
+        repository.allChecklistTasks,
+        repository.getChecklistCompletionsForDate(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())),
+        _uiState.map { it.collapsedChecklistSectionIds }.distinctUntilChanged()
+    ) { tasks: List<ChecklistTaskEntity>, completions: List<ChecklistCompletionEntity>, collapsedSectionIds: Set<String> ->
+        val completionMap = completions.associateBy { it.taskId }
+        val sectionOrder = listOf("01_OPENING", "02_CLEANING", "03_ROUTINE", "04_CLOSING", "05_GENERAL")
+        val sectionNames = mapOf(
+            "01_OPENING" to "01. Opening & Daily Preparation",
+            "02_CLEANING" to "02. Cleaning & Store Hygiene",
+            "03_ROUTINE" to "03. Routine Store Checks",
+            "04_CLOSING" to "04. Closing Checklist",
+            "05_GENERAL" to "05. General Tasks"
+        )
+        
+        val grouped = tasks.groupBy { it.sectionId }
+        val allSections = (sectionOrder + grouped.keys).distinct()
+        
+        allSections.mapNotNull { secId ->
+            val sectionTasks = grouped[secId] ?: emptyList()
+            if (sectionTasks.isEmpty() && secId !in listOf("01_OPENING", "02_CLEANING", "03_ROUTINE", "04_CLOSING")) {
+                null
+            } else {
+                val items = sectionTasks.sortedBy { it.orderIndex }.map { task ->
+                    ChecklistItemUiModel(
+                        task = task,
+                        completion = completionMap[task.id]
+                    )
+                }
+                val secName = sectionTasks.firstOrNull()?.sectionName ?: (sectionNames[secId] ?: secId)
+                ChecklistSectionUiModel(
+                    sectionId = secId,
+                    sectionName = secName,
+                    items = items,
+                    isExpanded = secId !in collapsedSectionIds
+                )
+            }
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val checklistStats: StateFlow<ChecklistOverallStats> = checklistSections.map { sections ->
+        val total = sections.sumOf { it.totalCount }
+        val completed = sections.sumOf { it.completedCount }
+        val pending = total - completed
+        val pct = if (total == 0) 0 else (completed * 100) / total
+        val dateFmt = SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date())
+        ChecklistOverallStats(
+            dateKey = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()),
+            formattedDate = dateFmt,
+            totalCount = total,
+            completedCount = completed,
+            pendingCount = pending,
+            percentage = pct
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ChecklistOverallStats(
+        dateKey = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()),
+        formattedDate = SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date()),
+        totalCount = 0,
+        completedCount = 0,
+        pendingCount = 0,
+        percentage = 0
+    ))
+
     private var customerSearchJob: Job? = null
 
     init {
@@ -352,6 +459,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (initialized) {
                     Log.d("MainViewModel", "Supabase connected successfully — starting Supabase listeners")
                     repository.startSupabaseListeners(viewModelScope)
+                    repository.reconcileChecklistFromCloud(todayDateKey)
                 } else {
                     Log.w("MainViewModel", "Supabase init failed — falling back to Firestore")
                     initFirestoreFallback()
@@ -391,6 +499,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Background Sheets sync failed, will retry: ${e.message}")
+                }
+                try {
+                    repository.reconcileChecklistFromCloud(todayDateKey)
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
                 // Check for mandatory updates every 10 minutes in background
                 if (loopCount % 5 == 0) {
@@ -2486,6 +2599,77 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 githubToken = cleanToken,
                 snackbarMessage = "GitHub Update settings saved!"
             )
+        }
+    }
+
+    // ==========================================
+    // DAILY CHECK LIST ACTIONS
+    // ==========================================
+
+    fun toggleChecklistTask(taskId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.toggleChecklistTask(taskId, todayDateKey, "Staff")
+        }
+    }
+
+    fun toggleChecklistSectionExpanded(sectionId: String) {
+        _uiState.update { current ->
+            val collapsed = current.collapsedChecklistSectionIds.toMutableSet()
+            if (collapsed.contains(sectionId)) {
+                collapsed.remove(sectionId)
+            } else {
+                collapsed.add(sectionId)
+            }
+            current.copy(collapsedChecklistSectionIds = collapsed)
+        }
+    }
+
+    fun openAddChecklistTaskDialog() {
+        _uiState.update { it.copy(showAddChecklistTaskDialog = true) }
+    }
+
+    fun dismissAddChecklistTaskDialog() {
+        _uiState.update { it.copy(showAddChecklistTaskDialog = false) }
+    }
+
+    fun addChecklistTask(title: String, section: String, notes: String = "") {
+        if (title.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val sectionMap = mapOf(
+                "OPENING" to Pair("01_OPENING", "01. Opening & Daily Preparation"),
+                "01_OPENING" to Pair("01_OPENING", "01. Opening & Daily Preparation"),
+                "CLEANING" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
+                "HYGIENE" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
+                "02_CLEANING" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
+                "ROUTINE" to Pair("03_ROUTINE", "03. Routine Store Checks"),
+                "03_ROUTINE" to Pair("03_ROUTINE", "03. Routine Store Checks"),
+                "CLOSING" to Pair("04_CLOSING", "04. Closing Checklist"),
+                "04_CLOSING" to Pair("04_CLOSING", "04. Closing Checklist"),
+                "GENERAL" to Pair("05_GENERAL", "05. General Tasks"),
+                "05_GENERAL" to Pair("05_GENERAL", "05. General Tasks")
+            )
+            val (secId, secName) = sectionMap[section] ?: Pair(section, section)
+            repository.addChecklistTask(
+                sectionId = secId,
+                sectionName = secName,
+                title = title.trim(),
+                description = notes.trim()
+            )
+            withContext(Dispatchers.Main) {
+                dismissAddChecklistTaskDialog()
+            }
+        }
+    }
+
+    fun deleteChecklistTask(task: ChecklistTaskEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.deleteChecklistTask(task)
+        }
+    }
+
+    fun refreshChecklist() {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.reconcileChecklistFromCloud(todayDateKey)
         }
     }
 

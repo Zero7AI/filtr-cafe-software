@@ -1406,4 +1406,22 @@ class SupabaseService private constructor() {
             null
         }
     }
+
+    // ==================== CHECKLIST CLOUD SYNC (via sync_metadata) ====================
+
+    suspend fun fetchCloudChecklistCompletions(dateKey: String): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("checklist_state_$dateKey")
+    }
+
+    suspend fun saveCloudChecklistCompletions(dateKey: String, json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("checklist_state_$dateKey", json)
+    }
+
+    suspend fun fetchCloudCustomTasks(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("checklist_custom_tasks")
+    }
+
+    suspend fun saveCloudCustomTasks(json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("checklist_custom_tasks", json)
+    }
 }

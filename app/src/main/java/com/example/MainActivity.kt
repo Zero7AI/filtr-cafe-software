@@ -36,6 +36,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Assessment
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Coffee
 import androidx.compose.material.icons.filled.Inventory
 import androidx.compose.material.icons.filled.ListAlt
@@ -101,6 +102,7 @@ import com.example.ui.components.SettingsDialog
 import com.example.ui.components.VoiceOrderMicButton
 import com.example.ui.components.VoiceOrderReviewDialog
 import com.example.ui.screens.BillingScreen
+import com.example.ui.screens.ChecklistScreen
 import com.example.ui.screens.CustomersScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.InventoriesScreen
@@ -199,9 +201,131 @@ class MainActivity : ComponentActivity() {
 
                 ModalNavigationDrawer(
                     drawerState = drawerState,
-                    gesturesEnabled = !isStaffMode,
+                    gesturesEnabled = true,
                     drawerContent = {
-                        if (!isStaffMode) {
+                        if (isStaffMode) {
+                            ModalDrawerSheet(
+                                drawerContainerColor = Color(0xFF09090B),
+                                drawerContentColor = Color.White,
+                                modifier = Modifier
+                                    .width(300.dp)
+                                    .pointerInput(Unit) {
+                                        detectHorizontalDragGestures { change, dragAmount ->
+                                            if (dragAmount < -20f) {
+                                                scope.launch { drawerState.close() }
+                                            }
+                                        }
+                                    }
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(20.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(vertical = 16.dp)
+                                    ) {
+                                        Surface(
+                                            color = Color.White,
+                                            shape = CircleShape,
+                                            modifier = Modifier.size(44.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Coffee,
+                                                contentDescription = "FILTR Logo",
+                                                tint = Color(0xFF09090B),
+                                                modifier = Modifier.padding(10.dp)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Column {
+                                            Text("FILTR COFFEE", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
+                                            Text("Staff Operations Hub", fontSize = 12.sp, color = Color.White.copy(alpha = 0.6f))
+                                        }
+                                    }
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
+
+                                    NavigationDrawerItem(
+                                        label = { Text("New Order Billing", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.PointOfSale, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.BILLING,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.BILLING)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
+                                            selectedIconColor = Color.White,
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Daily Check List", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.CHECKLIST,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.CHECKLIST)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFF10B981).copy(alpha = 0.25f),
+                                            selectedIconColor = Color(0xFF10B981),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Kitchen Orders / KDS", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.ORDERS,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.ORDERS)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
+                                            selectedIconColor = Color.White,
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Voice Ordering", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Mic, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.VOICE_ORDER,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.VOICE_ORDER)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.2f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        } else {
                             ModalDrawerSheet(
                                 drawerContainerColor = Color(0xFF09090B),
                                 drawerContentColor = Color.White,
@@ -295,6 +419,25 @@ class MainActivity : ComponentActivity() {
                                         colors = NavigationDrawerItemDefaults.colors(
                                             selectedContainerColor = Color.White.copy(alpha = 0.2f),
                                             selectedIconColor = Color.White,
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Daily Check List", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.CHECKLIST,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.CHECKLIST)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFF10B981).copy(alpha = 0.25f),
+                                            selectedIconColor = Color(0xFF10B981),
                                             selectedTextColor = Color.White,
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
@@ -809,6 +952,22 @@ class MainActivity : ComponentActivity() {
                                         onDismissFixedCostDialog = { viewModel.dismissFixedCostDialog() },
                                         onSaveFixedCost = { viewModel.saveFixedCost(it) },
                                         onBackfillOrders = { startMs, endMs -> viewModel.backfillOrdersForDateRange(startMs, endMs) }
+                                    )
+                                }
+                                FiltrTab.CHECKLIST -> {
+                                    val checklistSections by viewModel.checklistSections.collectAsStateWithLifecycle()
+                                    val checklistStats by viewModel.checklistStats.collectAsStateWithLifecycle()
+                                    ChecklistScreen(
+                                        sections = checklistSections,
+                                        stats = checklistStats,
+                                        onToggleTask = { viewModel.toggleChecklistTask(it) },
+                                        onToggleSection = { viewModel.toggleChecklistSectionExpanded(it) },
+                                        onOpenAddTask = { viewModel.openAddChecklistTaskDialog() },
+                                        onRefresh = { viewModel.refreshChecklist() },
+                                        showAddDialog = uiState.showAddChecklistTaskDialog,
+                                        onDismissAddDialog = { viewModel.dismissAddChecklistTaskDialog() },
+                                        onAddTask = { title, section, notes -> viewModel.addChecklistTask(title, section, notes) },
+                                        onDeleteTask = { viewModel.deleteChecklistTask(it) }
                                     )
                                 }
                             }

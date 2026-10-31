@@ -5,12 +5,15 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
 import com.example.data.dao.InventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
+import com.example.data.entity.ChecklistCompletionEntity
+import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.CustomerEntity
 import com.example.data.entity.FixedCostEntity
 import com.example.data.entity.InventoryItemEntity
@@ -29,9 +32,10 @@ import kotlinx.coroutines.launch
     entities = [
         MenuItemEntity::class, OrderEntity::class, OrderItemEntity::class, UpiAccountEntity::class,
         InventoryItemEntity::class, InventoryOrderEntity::class, InventoryOrderItemEntity::class,
-        InventoryUsageEntity::class, CustomerEntity::class, FixedCostEntity::class
+        InventoryUsageEntity::class, CustomerEntity::class, FixedCostEntity::class,
+        ChecklistTaskEntity::class, ChecklistCompletionEntity::class
     ],
-    version = 12,
+    version = 13,
     exportSchema = false
 )
 abstract class FiltrDatabase : RoomDatabase() {
@@ -41,6 +45,7 @@ abstract class FiltrDatabase : RoomDatabase() {
     abstract fun inventoryDao(): InventoryDao
     abstract fun customerDao(): CustomerDao
     abstract fun fixedCostDao(): FixedCostDao
+    abstract fun checklistDao(): ChecklistDao
 
     companion object {
         @Volatile
@@ -154,6 +159,35 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_12_13 = object : androidx.room.migration.Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `checklist_tasks` (
+                        `id` TEXT NOT NULL PRIMARY KEY,
+                        `sectionId` TEXT NOT NULL,
+                        `sectionName` TEXT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `description` TEXT NOT NULL DEFAULT '',
+                        `isDefault` INTEGER NOT NULL DEFAULT 1,
+                        `orderIndex` INTEGER NOT NULL DEFAULT 0,
+                        `isWeeklyMondayOnly` INTEGER NOT NULL DEFAULT 0,
+                        `createdAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                """.trimIndent())
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `checklist_completions` (
+                        `dateKey` TEXT NOT NULL,
+                        `taskId` TEXT NOT NULL,
+                        `isCompleted` INTEGER NOT NULL DEFAULT 0,
+                        `completedTimestamp` INTEGER NOT NULL DEFAULT 0,
+                        `completedBy` TEXT NOT NULL DEFAULT 'Staff',
+                        `isOutOfStock` INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(`dateKey`, `taskId`)
+                    )
+                """.trimIndent())
+            }
+        }
+
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -161,7 +195,7 @@ abstract class FiltrDatabase : RoomDatabase() {
                     FiltrDatabase::class.java,
                     "filtr_coffee_db"
                 )
-                .addMigrations(MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
+                .addMigrations(MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)
                 .fallbackToDestructiveMigration() // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))
                 .build()
@@ -181,6 +215,7 @@ abstract class FiltrDatabase : RoomDatabase() {
                     populateInitialMenu(database.menuDao())
                     populateInitialUpiAccount(database.upiAccountDao())
                     populateInitialFixedCosts(database.fixedCostDao())
+                    populateInitialChecklistTasks(database.checklistDao())
                 }
             }
         }
@@ -190,6 +225,7 @@ abstract class FiltrDatabase : RoomDatabase() {
             INSTANCE?.let { database ->
                 scope.launch(Dispatchers.IO) {
                     populateInitialFixedCosts(database.fixedCostDao())
+                    populateInitialChecklistTasks(database.checklistDao())
                 }
             }
         }
@@ -255,6 +291,248 @@ abstract class FiltrDatabase : RoomDatabase() {
                 MenuItemEntity(name = "Paneer Sandwich", category = "SANDWICH", price = 119.0, description = "Paneer + Olive + Onion + Cucumber (Extra Cheese Slice ₹15)")
             )
             menuDao.insertAll(initialItems)
+        }
+
+        suspend fun populateInitialChecklistTasks(checklistDao: ChecklistDao) {
+            val existing = checklistDao.getAllTasksSync()
+            if (existing.isNotEmpty()) return
+
+            val defaultTasks = listOf(
+                // 01. OPENING & DAILY PREPARATION
+                ChecklistTaskEntity(
+                    id = "task_open_1",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Switch ON counter lights & verify all lights are working",
+                    description = "Check all bulbs, strip lights, and outdoor brand signage",
+                    orderIndex = 1
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_2",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Check refrigerator and deep freezer are ON & working",
+                    description = "Verify cooling temperature display and power supply indicator",
+                    orderIndex = 2
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_3",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Deep Freezer Check: Ice cream, French fries, Ice, Mozzarella cheese, Whipped cream, Sweet corn",
+                    description = "Ensure packaging is intact and required stock is readily accessible",
+                    orderIndex = 3
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_4",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Refrigerator Check: Milk, Butter, Paneer, Cucumber, Onion",
+                    description = "Take out butter from refrigerator as per daily required quantity",
+                    orderIndex = 4
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_5",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Prepare milk mixture (2 Litres milk + 500g whipped cream)",
+                    description = "Follow exact recipe ratio. Mix thoroughly and store cold",
+                    orderIndex = 5
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_6",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Prepare coffee extract (1kg coffee + 5 Litres water)",
+                    description = "Brew as per standard extraction SOP",
+                    orderIndex = 6
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_7",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Prepare coffee recipe mixture ready for billing rush",
+                    description = "Check consistency and label containers with date/time",
+                    orderIndex = 7
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_8",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Fill all sauce dispenser bottles & seasonings",
+                    description = "Chocolate, caramel, peri-peri, mayo and mustard bottles filled",
+                    orderIndex = 8
+                ),
+                ChecklistTaskEntity(
+                    id = "task_open_9",
+                    sectionId = "01_OPENING",
+                    sectionName = "01. Opening & Daily Preparation",
+                    title = "Check cucumber and onion cutting / availability",
+                    description = "Freshly sliced vegetables ready for sandwich assembly",
+                    orderIndex = 9
+                ),
+
+                // 02. CLEANING & STORE HYGIENE
+                ChecklistTaskEntity(
+                    id = "task_clean_1",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Clean main kitchen counter & sandwich preparation area",
+                    description = "Sanitize chopping boards, slicers, and prep surfaces",
+                    orderIndex = 1
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_2",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Clean all shelves & keep all ingredients in proper positions",
+                    description = "Organize syrup bottles, coffee beans, cups and lids",
+                    orderIndex = 2
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_3",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Clean stove, burners, fryer & surrounding area",
+                    description = "Wipe off oil splatters and clean drip trays",
+                    orderIndex = 3
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_4",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Keep dustbins clean, emptied if full & replace liner",
+                    description = "Maintain separate wet and dry waste bins",
+                    orderIndex = 4
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_5",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Sweep & mop the kitchen floor — keep completely dry",
+                    description = "Prevent slip hazards around the prep and billing stations",
+                    orderIndex = 5
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_6",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Outside cleaning: Sweep floor (Jhadu), clean tables & chairs",
+                    description = "Sanitize customer dining tables and outside seating area",
+                    orderIndex = 6
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_7",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Check front entrance / road: Pick up plastics & waste",
+                    description = "Keep store perimeter clean and welcoming",
+                    orderIndex = 7
+                ),
+                ChecklistTaskEntity(
+                    id = "task_clean_8",
+                    sectionId = "02_CLEANING",
+                    sectionName = "02. Cleaning & Store Hygiene",
+                    title = "Clean all fans & ventilation filters (Every Monday)",
+                    description = "Weekly deep clean of wall fans, exhaust fans, and AC vents",
+                    isWeeklyMondayOnly = true,
+                    orderIndex = 8
+                ),
+
+                // 03. ROUTINE STORE CHECKS
+                ChecklistTaskEntity(
+                    id = "task_routine_1",
+                    sectionId = "03_ROUTINE",
+                    sectionName = "03. Routine Store Checks",
+                    title = "12:00 PM Check — Kitchen, counter & dining tables clean",
+                    description = "Afternoon peak preparation: wipe counters and clear plates",
+                    orderIndex = 1
+                ),
+                ChecklistTaskEntity(
+                    id = "task_routine_2",
+                    sectionId = "03_ROUTINE",
+                    sectionName = "03. Routine Store Checks",
+                    title = "2:00 PM Check — Check milk/ice stock & sweep dining area",
+                    description = "Mid-day replenishment check and dustbin clearance",
+                    orderIndex = 2
+                ),
+                ChecklistTaskEntity(
+                    id = "task_routine_3",
+                    sectionId = "03_ROUTINE",
+                    sectionName = "03. Routine Store Checks",
+                    title = "5:00 PM Check — Evening peak preparation & sauce fill",
+                    description = "Prep counter for evening coffee orders",
+                    orderIndex = 3
+                ),
+                ChecklistTaskEntity(
+                    id = "task_routine_4",
+                    sectionId = "03_ROUTINE",
+                    sectionName = "03. Routine Store Checks",
+                    title = "7:00 PM Check — Wipe tables & pick up outer road waste",
+                    description = "Maintain clean customer entrance and outdoor sitting area",
+                    orderIndex = 4
+                ),
+                ChecklistTaskEntity(
+                    id = "task_routine_5",
+                    sectionId = "03_ROUTINE",
+                    sectionName = "03. Routine Store Checks",
+                    title = "8:30 PM Check — Kitchen clean & stock levels review",
+                    description = "Pre-closing prep and inventory check for night rush",
+                    orderIndex = 5
+                ),
+                ChecklistTaskEntity(
+                    id = "task_routine_6",
+                    sectionId = "03_ROUTINE",
+                    sectionName = "03. Routine Store Checks",
+                    title = "9:00 PM Check — Final evening hygiene & prep stations",
+                    description = "Clear used cups, wipe coffee machines and steamer wands",
+                    orderIndex = 6
+                ),
+
+                // 04. CLOSING CHECKLIST
+                ChecklistTaskEntity(
+                    id = "task_close_1",
+                    sectionId = "04_CLOSING",
+                    sectionName = "04. Closing Checklist",
+                    title = "Store all refrigerator & deep freezer items safely inside",
+                    description = "Ice cream, fries, cheese, cream, milk, paneer, butter properly stored",
+                    orderIndex = 1
+                ),
+                ChecklistTaskEntity(
+                    id = "task_close_2",
+                    sectionId = "04_CLOSING",
+                    sectionName = "04. Closing Checklist",
+                    title = "CRITICAL: Refrigerator and deep freezer switches remain ON",
+                    description = "DO NOT switch off cooling appliances overnight",
+                    orderIndex = 2
+                ),
+                ChecklistTaskEntity(
+                    id = "task_close_3",
+                    sectionId = "04_CLOSING",
+                    sectionName = "04. Closing Checklist",
+                    title = "Switch OFF all counter lights, display signage, fans & machines",
+                    description = "Espresso grinder, sandwich press, induction stove OFF",
+                    orderIndex = 3
+                ),
+                ChecklistTaskEntity(
+                    id = "task_close_4",
+                    sectionId = "04_CLOSING",
+                    sectionName = "04. Closing Checklist",
+                    title = "Kitchen deep cleaned, dustbins emptied & floor mopped dry",
+                    description = "Cover all opened sauce containers and dry all utensils",
+                    orderIndex = 4
+                ),
+                ChecklistTaskEntity(
+                    id = "task_close_5",
+                    sectionId = "04_CLOSING",
+                    sectionName = "04. Closing Checklist",
+                    title = "Water taps tightly closed & main entrance shutter/door locked",
+                    description = "Verify plumbing is safe and cash drawer / premises secured",
+                    orderIndex = 5
+                )
+            )
+
+            checklistDao.insertTasks(defaultTasks)
         }
     }
 }

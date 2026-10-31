@@ -1,12 +1,15 @@
 package com.example.data.repository
 
 import android.util.Log
+import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
 import com.example.data.dao.InventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
+import com.example.data.entity.ChecklistCompletionEntity
+import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.CustomerEntity
 import com.example.data.entity.FixedCostEntity
 import com.example.data.entity.InventoryItemEntity
@@ -30,6 +33,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -41,6 +46,7 @@ class FiltrRepository(
     private val inventoryDao: InventoryDao? = null,
     private val customerDao: CustomerDao? = null,
     private val fixedCostDao: FixedCostDao? = null,
+    private val checklistDao: ChecklistDao? = null,
     private val sheetsSyncService: GoogleSheetsSyncService = GoogleSheetsSyncService(),
     private val geminiVoiceService: GeminiVoiceOrderService = GeminiVoiceOrderService(),
     private val firestoreService: FirestoreService = FirestoreService.getInstance(),
@@ -59,6 +65,11 @@ class FiltrRepository(
     val allInventoryUsages: Flow<List<InventoryUsageEntity>> = inventoryDao?.getAllUsages() ?: flowOf(emptyList())
     val allCustomers: Flow<List<CustomerEntity>> = customerDao?.getAllCustomers() ?: flowOf(emptyList())
     val allFixedCosts: Flow<List<FixedCostEntity>> = fixedCostDao?.getAllFixedCosts() ?: flowOf(emptyList())
+    val allChecklistTasks: Flow<List<ChecklistTaskEntity>> = checklistDao?.getAllTasks() ?: flowOf(emptyList())
+
+    fun getChecklistCompletionsForDate(dateKey: String): Flow<List<ChecklistCompletionEntity>> {
+        return checklistDao?.getCompletionsForDate(dateKey) ?: flowOf(emptyList())
+    }
 
     // ==================== FIRESTORE REAL-TIME LISTENERS ====================
 
@@ -1595,6 +1606,217 @@ class FiltrRepository(
 
     suspend fun deleteFixedCost(monthKey: String) {
         fixedCostDao?.deleteByMonth(monthKey)
+    }
+
+    // ==================== DAILY STORE CHECKLIST ====================
+
+    suspend fun toggleChecklistTask(
+        taskId: String,
+        dateKey: String,
+        completedBy: String = "Staff"
+    ): Result<Unit> {
+        return try {
+            val existing = checklistDao?.getCompletion(dateKey, taskId)
+            val newStatus = !(existing?.isCompleted ?: false)
+            val completion = ChecklistCompletionEntity(
+                dateKey = dateKey,
+                taskId = taskId,
+                isCompleted = newStatus,
+                completedTimestamp = if (newStatus) System.currentTimeMillis() else 0L,
+                completedBy = completedBy
+            )
+            checklistDao?.insertOrUpdateCompletion(completion)
+
+            // Asynchronously sync completions to cloud metadata
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    syncChecklistCompletionsToCloud(dateKey)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync checklist completions: ${e.message}")
+                }
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "toggleChecklistTask error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun toggleChecklistTask(
+        taskId: String,
+        dateKey: String,
+        isCompleted: Boolean,
+        completedBy: String = "Staff"
+    ): Result<Unit> {
+        return try {
+            val completion = ChecklistCompletionEntity(
+                dateKey = dateKey,
+                taskId = taskId,
+                isCompleted = isCompleted,
+                completedTimestamp = if (isCompleted) System.currentTimeMillis() else 0L,
+                completedBy = completedBy
+            )
+            checklistDao?.insertOrUpdateCompletion(completion)
+
+            // Asynchronously sync completions to cloud metadata
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    syncChecklistCompletionsToCloud(dateKey)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync checklist completions: ${e.message}")
+                }
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "toggleChecklistTask error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun addChecklistTask(
+        sectionId: String,
+        sectionName: String,
+        title: String,
+        description: String = ""
+    ): Result<ChecklistTaskEntity> {
+        return try {
+            val id = "custom_" + System.currentTimeMillis()
+            val task = ChecklistTaskEntity(
+                id = id,
+                sectionId = sectionId,
+                sectionName = sectionName,
+                title = title.trim(),
+                description = description.trim(),
+                isDefault = false,
+                orderIndex = 100,
+                createdAt = System.currentTimeMillis()
+            )
+            checklistDao?.insertTask(task)
+
+            // Push custom tasks to cloud metadata
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    syncCustomTasksToCloud()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync custom tasks: ${e.message}")
+                }
+            }
+            Result.success(task)
+        } catch (e: Exception) {
+            Log.e(TAG, "addChecklistTask error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteChecklistTask(taskId: String): Result<Unit> {
+        return try {
+            checklistDao?.deleteTaskById(taskId)
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    syncCustomTasksToCloud()
+                } catch (_: Exception) {}
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteChecklistTask(task: ChecklistTaskEntity): Result<Unit> {
+        return deleteChecklistTask(task.id)
+    }
+
+    suspend fun syncChecklistCompletionsToCloud(dateKey: String) {
+        val dao = checklistDao ?: return
+        val completions = dao.getCompletionsForDateSync(dateKey)
+        val arr = JSONArray()
+        completions.forEach { c ->
+            val obj = JSONObject().apply {
+                put("taskId", c.taskId)
+                put("isCompleted", c.isCompleted)
+                put("completedTimestamp", c.completedTimestamp)
+                put("completedBy", c.completedBy)
+                put("isOutOfStock", c.isOutOfStock)
+            }
+            arr.put(obj)
+        }
+        supabaseService.saveCloudChecklistCompletions(dateKey, arr.toString())
+    }
+
+    suspend fun syncCustomTasksToCloud() {
+        val dao = checklistDao ?: return
+        val allTasks = dao.getAllTasksSync().filter { !it.isDefault }
+        val arr = JSONArray()
+        allTasks.forEach { t ->
+            val obj = JSONObject().apply {
+                put("id", t.id)
+                put("sectionId", t.sectionId)
+                put("sectionName", t.sectionName)
+                put("title", t.title)
+                put("description", t.description)
+                put("orderIndex", t.orderIndex)
+                put("isWeeklyMondayOnly", t.isWeeklyMondayOnly)
+                put("createdAt", t.createdAt)
+            }
+            arr.put(obj)
+        }
+        supabaseService.saveCloudCustomTasks(arr.toString())
+    }
+
+    suspend fun reconcileChecklistFromCloud(dateKey: String) {
+        val dao = checklistDao ?: return
+        try {
+            // 1. Reconcile custom tasks
+            val customTasksJson = supabaseService.fetchCloudCustomTasks()
+            if (!customTasksJson.isNullOrBlank() && customTasksJson.startsWith("[")) {
+                val arr = JSONArray(customTasksJson)
+                val cloudTasks = mutableListOf<ChecklistTaskEntity>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    cloudTasks.add(
+                        ChecklistTaskEntity(
+                            id = o.getString("id"),
+                            sectionId = o.optString("sectionId", "01_OPENING"),
+                            sectionName = o.optString("sectionName", "01. Opening & Daily Preparation"),
+                            title = o.getString("title"),
+                            description = o.optString("description", ""),
+                            isDefault = false,
+                            orderIndex = o.optInt("orderIndex", 100),
+                            isWeeklyMondayOnly = o.optBoolean("isWeeklyMondayOnly", false),
+                            createdAt = o.optLong("createdAt", System.currentTimeMillis())
+                        )
+                    )
+                }
+                if (cloudTasks.isNotEmpty()) {
+                    dao.insertTasks(cloudTasks)
+                }
+            }
+
+            // 2. Reconcile completions for dateKey
+            val completionsJson = supabaseService.fetchCloudChecklistCompletions(dateKey)
+            if (!completionsJson.isNullOrBlank() && completionsJson.startsWith("[")) {
+                val arr = JSONArray(completionsJson)
+                val cloudCompletions = mutableListOf<ChecklistCompletionEntity>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    cloudCompletions.add(
+                        ChecklistCompletionEntity(
+                            dateKey = dateKey,
+                            taskId = o.getString("taskId"),
+                            isCompleted = o.optBoolean("isCompleted", false),
+                            completedTimestamp = o.optLong("completedTimestamp", 0L),
+                            completedBy = o.optString("completedBy", "Staff"),
+                            isOutOfStock = o.optBoolean("isOutOfStock", false)
+                        )
+                    )
+                }
+                if (cloudCompletions.isNotEmpty()) {
+                    dao.insertOrUpdateCompletions(cloudCompletions)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "reconcileChecklistFromCloud failed: ${e.message}")
+        }
     }
 }
 

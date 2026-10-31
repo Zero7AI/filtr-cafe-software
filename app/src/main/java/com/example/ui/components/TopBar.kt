@@ -75,9 +75,9 @@ fun FiltrTopBar(
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = if (onOpenDrawer != null && !isStaffMode) Modifier.clickable { onOpenDrawer() } else Modifier
+                modifier = if (onOpenDrawer != null) Modifier.clickable { onOpenDrawer() } else Modifier
             ) {
-                if (onOpenDrawer != null && !isStaffMode) {
+                if (onOpenDrawer != null) {
                     IconButton(onClick = onOpenDrawer) {
                         Icon(
                             imageVector = Icons.Default.Menu,
