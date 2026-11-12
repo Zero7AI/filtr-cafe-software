@@ -15,7 +15,6 @@ import com.example.voice.engine.MenuCatalog
 import com.example.voice.model.VoiceOrderState
 import com.example.voice.model.VoiceOrderLineItem
 import com.example.voice.model.VoiceStateMachineEnum
-import com.example.voice.speech.InProcessVoskRecognizer
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,7 +34,7 @@ class VoiceOrderViewModel : ViewModel() {
             counterId = "Counter POS 1",
             deviceId = android.os.Build.MODEL,
             state = VoiceStateMachineEnum.LISTENING,
-            statusMessage = "Starting Offline Voice Engine & Flight Recorder..."
+            statusMessage = "Starting Deepgram Voice Engine..."
         )
     )
     val orderState: StateFlow<VoiceOrderState> = _orderState.asStateFlow()
@@ -116,6 +115,7 @@ class VoiceOrderViewModel : ViewModel() {
 
     fun syncMenuItemsWithRoom(menuItems: List<MenuItemEntity>) {
         MenuCatalog.syncWithRoomMenuItems(menuItems)
+        captureService?.voskRecognizer?.updateMenuContext(menuItems)
         val activePhrases = MenuCatalog.getActiveGrammarPhrases()
         captureService?.voskRecognizer?.updateGrammar(activePhrases)
     }
@@ -126,7 +126,7 @@ class VoiceOrderViewModel : ViewModel() {
         captureService?.voskRecognizer?.isEnabled?.set(next)
         _orderState.value = _orderState.value.copy(
             statusMessage = if (next) {
-                "Offline Voice STT Active"
+                "Deepgram Voice AI Active"
             } else {
                 "Voice Listening Paused"
             }

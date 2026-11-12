@@ -93,6 +93,9 @@ fun ChecklistScreen(
     onDeleteTask: (ChecklistTaskEntity) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val config = androidx.compose.ui.platform.LocalConfiguration.current
+    val isCompactPhone = config.screenWidthDp < 375 || config.screenHeightDp < 740
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -100,8 +103,8 @@ fun ChecklistScreen(
     ) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            contentPadding = PaddingValues(if (isCompactPhone) 12.dp else 16.dp),
+            verticalArrangement = Arrangement.spacedBy(if (isCompactPhone) 12.dp else 16.dp)
         ) {
             // Header Row: Title, Date & Add Task Button
             item {
@@ -110,10 +113,10 @@ fun ChecklistScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                         Text(
                             text = "Daily Check List",
-                            style = MaterialTheme.typography.headlineMedium,
+                            style = if (isCompactPhone) MaterialTheme.typography.titleLarge else MaterialTheme.typography.headlineMedium,
                             fontWeight = FontWeight.Bold,
                             color = ShadcnBlack
                         )
@@ -129,7 +132,8 @@ fun ChecklistScreen(
                             Text(
                                 text = stats.formattedDate,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = ShadcnMutedText
+                                color = ShadcnMutedText,
+                                maxLines = 1
                             )
                         }
                     }

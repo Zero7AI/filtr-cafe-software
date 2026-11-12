@@ -114,7 +114,7 @@ fun FiltrTopBar(
                         color = Color.White
                     )
                     Text(
-                        text = "POS",
+                        text = if (isStaffMode) "STAFF" else "POS",
                         style = MaterialTheme.typography.bodySmall,
                         fontSize = 10.sp,
                         color = Color.White.copy(alpha = 0.7f)

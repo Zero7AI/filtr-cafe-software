@@ -85,6 +85,7 @@ fun OrdersScreen(
     state: BillingUiState,
     ordersList: List<OrderWithItems>,
     menuItems: List<MenuItemEntity> = emptyList(),
+    isStaffMode: Boolean = false,
     onFilterChanged: (String) -> Unit,
     onToggleMade: (OrderWithItems) -> Unit,
     onTogglePaid: (OrderWithItems) -> Unit,
@@ -132,7 +133,10 @@ fun OrdersScreen(
     // Step 2: Then filter by status
     val statusFilteredOrders = dateFilteredOrders.filter { orderWithItems ->
         when (state.statusFilter) {
-            "PENDING" -> !orderWithItems.order.isDelivered || !orderWithItems.order.isPaid
+            "PENDING" -> !orderWithItems.order.isPaid ||
+                !orderWithItems.order.isMade ||
+                !orderWithItems.order.isDelivered ||
+                orderWithItems.items.any { it.completedQuantity < it.quantity }
             "MADE" -> orderWithItems.order.isMade
             "UNPAID" -> !orderWithItems.order.isPaid
             "DELIVERED" -> orderWithItems.order.isDelivered
@@ -162,12 +166,15 @@ fun OrdersScreen(
         else -> "ALL"
     }
 
+    val config = androidx.compose.ui.platform.LocalConfiguration.current
+    val isCompactPhone = config.screenWidthDp < 375 || config.screenHeightDp < 740
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFFFAFAFA))
-            .padding(top = 8.dp)
-            .padding(12.dp)
+            .padding(top = if (isCompactPhone) 4.dp else 8.dp)
+            .padding(horizontal = if (isCompactPhone) 8.dp else 12.dp, vertical = if (isCompactPhone) 6.dp else 10.dp)
             .testTag("orders_screen")
     ) {
         // Top Total Revenue & Total Orders Banner
@@ -176,51 +183,53 @@ fun OrdersScreen(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF09090B)),
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 8.dp)
+                .padding(bottom = if (isCompactPhone) 6.dp else 8.dp)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .padding(horizontal = if (isCompactPhone) 10.dp else 12.dp, vertical = if (isCompactPhone) 6.dp else 8.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Left Column: Bill Amount & Total Orders Processed
+                    // Left Column: Bill Amount (Admin only) & Total Orders Processed
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        // Total Bill Amount
-                        Column {
-                            Text(
-                                text = "TOTAL BILL ($dateLabel)",
-                                fontSize = 9.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White.copy(alpha = 0.7f),
-                                letterSpacing = 0.5.sp,
-                                maxLines = 1,
-                                softWrap = false
-                            )
-                            Text(
-                                text = "₹${String.format(Locale.US, "%.0f", totalDayRevenue)}",
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Black,
-                                color = Color.White,
-                                maxLines = 1,
-                                softWrap = false
+                        if (!isStaffMode) {
+                            // Total Bill Amount (Hidden in FILTR Staff app)
+                            Column {
+                                Text(
+                                    text = "TOTAL BILL ($dateLabel)",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White.copy(alpha = 0.7f),
+                                    letterSpacing = 0.5.sp,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                                Text(
+                                    text = "₹${String.format(Locale.US, "%.0f", totalDayRevenue)}",
+                                    fontSize = if (isCompactPhone) 15.sp else 17.sp,
+                                    fontWeight = FontWeight.Black,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            }
+
+                            // Divider between Bill Amount and Total Orders
+                            Box(
+                                modifier = Modifier
+                                    .height(26.dp)
+                                    .width(1.dp)
+                                    .background(Color.White.copy(alpha = 0.2f))
                             )
                         }
-
-                        // Divider between Bill Amount and Total Orders
-                        Box(
-                            modifier = Modifier
-                                .height(28.dp)
-                                .width(1.dp)
-                                .background(Color.White.copy(alpha = 0.2f))
-                        )
 
                         // Total Orders Count
                         Column {
@@ -316,45 +325,66 @@ fun OrdersScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // UPI / Cash breakdown
-                    Surface(
-                        color = Color.White.copy(alpha = 0.12f),
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    if (!isStaffMode) {
+                        // UPI / Cash breakdown (Admin only)
+                        Surface(
+                            color = Color.White.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(4.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.QrCode,
-                                contentDescription = "UPI",
-                                tint = Color.White.copy(alpha = 0.8f),
-                                modifier = Modifier.size(10.dp)
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.QrCode,
+                                    contentDescription = "UPI",
+                                    tint = Color.White.copy(alpha = 0.8f),
+                                    modifier = Modifier.size(10.dp)
+                                )
+                                Text(
+                                    text = " ₹${String.format(Locale.US, "%.0f", upiTotal)}",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White.copy(alpha = 0.85f),
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                                Text(
+                                    text = " • ",
+                                    fontSize = 9.sp,
+                                    color = Color.White.copy(alpha = 0.4f)
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.Payments,
+                                    contentDescription = "Cash",
+                                    tint = Color.White.copy(alpha = 0.8f),
+                                    modifier = Modifier.size(10.dp)
+                                )
+                                Text(
+                                    text = " ₹${String.format(Locale.US, "%.0f", cashTotal)}",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White.copy(alpha = 0.85f),
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            }
+                        }
+                    } else {
+                        val pendingTotalCount = dateFilteredOrders.count {
+                            !it.order.isPaid || !it.order.isMade || !it.order.isDelivered ||
+                                it.items.any { item -> item.completedQuantity < item.quantity }
+                        }
+                        Surface(
+                            color = Color(0xFFF59E0B).copy(alpha = 0.18f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
                             Text(
-                                text = " ₹${String.format(Locale.US, "%.0f", upiTotal)}",
+                                text = "Pending: $pendingTotalCount",
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = Color.White.copy(alpha = 0.85f),
-                                maxLines = 1,
-                                softWrap = false
-                            )
-                            Text(
-                                text = " • ",
-                                fontSize = 9.sp,
-                                color = Color.White.copy(alpha = 0.4f)
-                            )
-                            Icon(
-                                imageVector = Icons.Default.Payments,
-                                contentDescription = "Cash",
-                                tint = Color.White.copy(alpha = 0.8f),
-                                modifier = Modifier.size(10.dp)
-                            )
-                            Text(
-                                text = " ₹${String.format(Locale.US, "%.0f", cashTotal)}",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White.copy(alpha = 0.85f),
+                                color = Color(0xFFFBBF24),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                                 maxLines = 1,
                                 softWrap = false
                             )

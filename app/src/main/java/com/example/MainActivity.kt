@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Coffee
+import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Inventory
 import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.MenuBook
@@ -92,8 +93,10 @@ import com.example.BuildConfig
 import com.example.ui.FiltrTab
 import com.example.ui.MainViewModel
 import com.example.ui.components.AccountsUpiDialog
+import com.example.ui.components.ActiveDevicesDialog
 import com.example.ui.components.AddEditMenuItemDialog
 import com.example.ui.components.AppUpdateDialog
+import com.example.ui.components.DeviceAccessGateDialog
 import com.example.ui.components.FiltrTopBar
 import com.example.ui.components.OrderReceiptDialog
 import com.example.ui.components.PrinterConnectionDialog
@@ -187,7 +190,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val isStaffMode = context.packageName == "filtr.coffee.staff"
+                val isStaffMode = context.packageName == "filtr.coffee.staff" || BuildConfig.IS_STAFF_APP
                 val snackbarHostState = remember { SnackbarHostState() }
                 val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
                 val scope = rememberCoroutineScope()
@@ -249,11 +252,30 @@ class MainActivity : ComponentActivity() {
                                     HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
 
                                     NavigationDrawerItem(
-                                        label = { Text("New Order Billing", fontWeight = FontWeight.Bold) },
+                                        label = { Text("New Order", fontWeight = FontWeight.Bold) },
                                         icon = { Icon(imageVector = Icons.Default.PointOfSale, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.BILLING,
                                         onClick = {
                                             viewModel.selectTab(FiltrTab.BILLING)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
+                                            selectedIconColor = Color.White,
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Orders", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.ORDERS,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.ORDERS)
                                             scope.launch { drawerState.close() }
                                         },
                                         colors = NavigationDrawerItemDefaults.colors(
@@ -279,44 +301,6 @@ class MainActivity : ComponentActivity() {
                                             selectedContainerColor = Color(0xFF10B981).copy(alpha = 0.25f),
                                             selectedIconColor = Color(0xFF10B981),
                                             selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Kitchen Orders / KDS", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.ORDERS,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.ORDERS)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
-                                            selectedIconColor = Color.White,
-                                            selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Voice Ordering", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Mic, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.VOICE_ORDER,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.VOICE_ORDER)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.2f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
@@ -640,6 +624,22 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     NavigationDrawerItem(
+                                        label = { Text("Devices & Access Control", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Devices, contentDescription = null, tint = Color(0xFF34D399)) },
+                                        selected = false,
+                                        onClick = {
+                                            viewModel.openActiveDevicesDialog()
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.9f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    NavigationDrawerItem(
                                         label = { Text("Sheets Sync & Settings", fontWeight = FontWeight.Medium) },
                                         icon = { Icon(imageVector = Icons.Default.Settings, contentDescription = null) },
                                         selected = false,
@@ -695,35 +695,67 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.testTag("tab_billing")
                                 )
 
-                                NavigationBarItem(
-                                    selected = uiState.currentTab == FiltrTab.VOICE_ORDER,
-                                    onClick = { viewModel.selectTab(FiltrTab.VOICE_ORDER) },
-                                    icon = { Icon(imageVector = Icons.Default.Mic, contentDescription = "Voice Order") },
-                                    label = { Text("Voice Order", fontWeight = FontWeight.Bold) },
-                                    colors = NavigationBarItemDefaults.colors(
-                                        selectedIconColor = Color(0xFF09090B),
-                                        selectedTextColor = Color.White,
-                                        indicatorColor = Color(0xFFF59E0B),
-                                        unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                        unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                    ),
-                                    modifier = Modifier.testTag("tab_voice_order")
-                                )
+                                if (isStaffMode) {
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.ORDERS,
+                                        onClick = { viewModel.selectTab(FiltrTab.ORDERS) },
+                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = "Orders") },
+                                        label = { Text("Orders", fontWeight = FontWeight.Bold) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_orders")
+                                    )
 
-                                NavigationBarItem(
-                                    selected = uiState.currentTab == FiltrTab.ORDERS,
-                                    onClick = { viewModel.selectTab(FiltrTab.ORDERS) },
-                                    icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = "Orders") },
-                                    label = { Text("Orders", fontWeight = FontWeight.Bold) },
-                                    colors = NavigationBarItemDefaults.colors(
-                                        selectedIconColor = Color(0xFF09090B),
-                                        selectedTextColor = Color.White,
-                                        indicatorColor = Color.White,
-                                        unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                        unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                    ),
-                                    modifier = Modifier.testTag("tab_orders")
-                                )
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.CHECKLIST,
+                                        onClick = { viewModel.selectTab(FiltrTab.CHECKLIST) },
+                                        icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check List") },
+                                        label = { Text("Check List", fontWeight = FontWeight.Bold) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color(0xFF10B981),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_checklist")
+                                    )
+                                } else {
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.VOICE_ORDER,
+                                        onClick = { viewModel.selectTab(FiltrTab.VOICE_ORDER) },
+                                        icon = { Icon(imageVector = Icons.Default.Mic, contentDescription = "Voice Order") },
+                                        label = { Text("Voice Order", fontWeight = FontWeight.Bold) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_voice_order")
+                                    )
+
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.ORDERS,
+                                        onClick = { viewModel.selectTab(FiltrTab.ORDERS) },
+                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = "Orders") },
+                                        label = { Text("Orders", fontWeight = FontWeight.Bold) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_orders")
+                                    )
+                                }
                             }
                         },
                         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
@@ -768,6 +800,7 @@ class MainActivity : ComponentActivity() {
                                         state = uiState,
                                         ordersList = ordersList,
                                         menuItems = allMenuItems,
+                                        isStaffMode = isStaffMode,
                                         onFilterChanged = { viewModel.setStatusFilter(it) },
                                         onToggleMade = { viewModel.toggleOrderMadeStatus(it) },
                                         onTogglePaid = { viewModel.toggleOrderPaidStatus(it) },
@@ -1124,6 +1157,35 @@ class MainActivity : ComponentActivity() {
                                 LaunchedEffect(uiState.isForceUpdate) {
                                     viewModel.showMandatoryUpdateDialog()
                                 }
+                            }
+
+                            if (!uiState.isForceUpdate && uiState.deviceAccessStatus != "ACTIVE") {
+                                DeviceAccessGateDialog(
+                                    isStaffApp = isStaffMode,
+                                    accessStatus = uiState.deviceAccessStatus,
+                                    savedOperatorName = uiState.operatorName,
+                                    deviceModel = viewModel.currentDeviceModel,
+                                    errorMessage = uiState.accessGateError,
+                                    isVerifying = uiState.isVerifyingAccess,
+                                    onVerify = { name, passcode -> viewModel.verifyDeviceAccess(name, passcode) },
+                                    onRefreshStatus = { viewModel.refreshDeviceAccessStatus() },
+                                    onExitApp = { (context as? android.app.Activity)?.finishAffinity() }
+                                )
+                            }
+
+                            if (uiState.showActiveDevicesDialog && !isStaffMode) {
+                                ActiveDevicesDialog(
+                                    devices = uiState.registeredDevices,
+                                    currentDeviceId = viewModel.currentDeviceId,
+                                    accessPolicy = uiState.accessPolicyConfig,
+                                    isLoading = uiState.isLoadingDevices,
+                                    onRefresh = { viewModel.refreshRegisteredDevices() },
+                                    onUpdateDeviceStatus = { key, status -> viewModel.updateRemoteDeviceStatus(key, status) },
+                                    onSavePolicy = { adminCode, staffCode, reqApproval, forceReverify ->
+                                        viewModel.saveAccessPolicy(adminCode, staffCode, reqApproval, forceReverify)
+                                    },
+                                    onDismiss = { viewModel.dismissActiveDevicesDialog() }
+                                )
                             }
 
                             if (uiState.showAccountsUpiDialog) {

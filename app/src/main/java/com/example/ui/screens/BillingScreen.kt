@@ -37,6 +37,8 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Coffee
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Remove
@@ -60,6 +62,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -68,6 +71,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -108,6 +112,13 @@ fun BillingScreen(
     val totalCartItemsCount = state.cartItems.values.sum()
     val totalAmount = state.cartItems.entries.sumOf { (item, qty) -> item.price * qty }
 
+    val config = LocalConfiguration.current
+    val isCompactScreen = config.screenHeightDp < 780 || config.screenWidthDp < 380
+    val isVeryNarrow = config.screenWidthDp < 330
+    var isCustomerExpanded by remember(isCompactScreen) {
+        mutableStateOf(!isCompactScreen || state.customerName.isNotBlank() || state.contactNumber.isNotBlank())
+    }
+
     val currentCategoryIndex = categories.indexOf(state.selectedCategory).coerceAtLeast(0)
     var totalDragX by remember { mutableFloatStateOf(0f) }
 
@@ -115,8 +126,8 @@ fun BillingScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(top = 8.dp)
-                .padding(bottom = if (totalCartItemsCount > 0) 160.dp else 16.dp)
+                .padding(top = if (isCompactScreen) 4.dp else 8.dp)
+                .padding(bottom = if (totalCartItemsCount > 0) (if (isCompactScreen) 136.dp else 156.dp) else 8.dp)
                 .pointerInput(categories, state.selectedCategory) {
                     detectHorizontalDragGestures(
                         onDragStart = { totalDragX = 0f },
@@ -138,126 +149,239 @@ fun BillingScreen(
                     )
                 }
         ) {
-            // Top Customer Details Card
+            // Top Customer Details Card (Collapsible for responsive compact mobile screens)
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
-                shape = RoundedCornerShape(16.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(12.dp)
-                    .border(1.dp, Color(0xFFE4E4E7), RoundedCornerShape(16.dp))
+                    .padding(horizontal = if (isCompactScreen) 10.dp else 12.dp, vertical = if (isCompactScreen) 4.dp else 8.dp)
+                    .border(1.dp, Color(0xFFE4E4E7), RoundedCornerShape(12.dp))
                     .testTag("customer_info_card")
             ) {
-                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
-                    Text(
-                        text = "CUSTOMER & ORDER DETAILS",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF09090B),
-                        letterSpacing = 1.sp
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = if (isCustomerExpanded) 8.dp else 6.dp)) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { isCustomerExpanded = !isCustomerExpanded },
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(modifier = Modifier.weight(1f)) {
-                            OutlinedTextField(
-                                value = state.customerName,
-                                onValueChange = onCustomerNameChanged,
-                                label = { Text("Customer Name") },
-                                placeholder = { Text("Walk-in Customer") },
-                                leadingIcon = { Icon(imageVector = Icons.Default.Person, contentDescription = null, tint = Color(0xFF09090B)) },
-                                singleLine = true,
-                                shape = RoundedCornerShape(10.dp),
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedTextColor = Color(0xFF09090B),
-                                    unfocusedTextColor = Color(0xFF09090B),
-                                    focusedContainerColor = Color.White,
-                                    unfocusedContainerColor = Color(0xFFFAFAFA),
-                                    focusedLabelColor = Color(0xFF09090B),
-                                    unfocusedLabelColor = Color(0xFF71717A),
-                                    focusedBorderColor = Color(0xFF09090B),
-                                    unfocusedBorderColor = Color(0xFFD4D4D8)
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("customer_name_input")
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Icon(
+                                imageVector = Icons.Default.Person,
+                                contentDescription = null,
+                                tint = Color(0xFF09090B),
+                                modifier = Modifier.size(15.dp)
                             )
-                            // Auto-suggest dropdown
-                            androidx.compose.material3.DropdownMenu(
-                                expanded = state.showCustomerSuggestions && state.customerSuggestions.isNotEmpty(),
-                                onDismissRequest = { onDismissCustomerSuggestions() },
-                                modifier = Modifier.fillMaxWidth(0.45f)
-                            ) {
-                                state.customerSuggestions.forEach { customer ->
-                                    androidx.compose.material3.DropdownMenuItem(
-                                        text = {
-                                            Column {
-                                                Text(
-                                                    text = customer.name,
-                                                    fontWeight = FontWeight.Bold,
-                                                    fontSize = 14.sp,
-                                                    color = Color(0xFF09090B)
-                                                )
-                                                if (customer.contactNumber.isNotBlank()) {
-                                                    Text(
-                                                        text = customer.contactNumber,
-                                                        fontSize = 11.sp,
-                                                        color = Color(0xFF71717A)
-                                                    )
-                                                }
-                                            }
-                                        },
-                                        onClick = { onSelectCustomerSuggestion(customer) },
-                                        trailingIcon = {
-                                            Surface(
-                                                color = Color(0xFFF4F4F5),
-                                                shape = RoundedCornerShape(4.dp)
-                                            ) {
-                                                Text(
-                                                    text = "${customer.totalOrders}",
-                                                    fontSize = 10.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = Color(0xFF52525B),
-                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isCustomerExpanded) {
+                                    "CUSTOMER & ORDER DETAILS"
+                                } else {
+                                    val cust = state.customerName.ifBlank { "Walk-in Customer" }
+                                    val phone = if (state.contactNumber.isNotBlank()) " • ${state.contactNumber}" else ""
+                                    "Customer: $cust$phone"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF09090B),
+                                maxLines = 1
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = if (isCustomerExpanded) "Hide" else "Edit",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF71717A)
+                            )
+                            Icon(
+                                imageVector = if (isCustomerExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = if (isCustomerExpanded) "Collapse customer details" else "Expand customer details",
+                                tint = Color(0xFF71717A),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+
+                    AnimatedVisibility(visible = isCustomerExpanded) {
+                        Column {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            val fieldsModifier = Modifier.fillMaxWidth()
+                            if (isVeryNarrow) {
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = fieldsModifier) {
+                                    Box(modifier = Modifier.fillMaxWidth()) {
+                                        OutlinedTextField(
+                                            value = state.customerName,
+                                            onValueChange = onCustomerNameChanged,
+                                            label = { Text("Customer Name") },
+                                            placeholder = { Text("Walk-in Customer") },
+                                            leadingIcon = { Icon(imageVector = Icons.Default.Person, contentDescription = null, tint = Color(0xFF09090B)) },
+                                            singleLine = true,
+                                            shape = RoundedCornerShape(10.dp),
+                                            colors = OutlinedTextFieldDefaults.colors(
+                                                focusedTextColor = Color(0xFF09090B),
+                                                unfocusedTextColor = Color(0xFF09090B),
+                                                focusedContainerColor = Color.White,
+                                                unfocusedContainerColor = Color(0xFFFAFAFA),
+                                                focusedLabelColor = Color(0xFF09090B),
+                                                unfocusedLabelColor = Color(0xFF71717A),
+                                                focusedBorderColor = Color(0xFF09090B),
+                                                unfocusedBorderColor = Color(0xFFD4D4D8)
+                                            ),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("customer_name_input")
+                                        )
+                                        androidx.compose.material3.DropdownMenu(
+                                            expanded = state.showCustomerSuggestions && state.customerSuggestions.isNotEmpty(),
+                                            onDismissRequest = { onDismissCustomerSuggestions() },
+                                            modifier = Modifier.fillMaxWidth(0.75f)
+                                        ) {
+                                            state.customerSuggestions.forEach { customer ->
+                                                androidx.compose.material3.DropdownMenuItem(
+                                                    text = {
+                                                        Column {
+                                                            Text(text = customer.name, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF09090B))
+                                                            if (customer.contactNumber.isNotBlank()) {
+                                                                Text(text = customer.contactNumber, fontSize = 11.sp, color = Color(0xFF71717A))
+                                                            }
+                                                        }
+                                                    },
+                                                    onClick = { onSelectCustomerSuggestion(customer) }
                                                 )
                                             }
                                         }
+                                    }
+                                    OutlinedTextField(
+                                        value = state.contactNumber,
+                                        onValueChange = onContactNumberChanged,
+                                        label = { Text("Contact (Optional)") },
+                                        placeholder = { Text("Phone Number") },
+                                        leadingIcon = { Icon(imageVector = Icons.Default.Phone, contentDescription = null, tint = Color(0xFF09090B)) },
+                                        singleLine = true,
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedTextColor = Color(0xFF09090B),
+                                            unfocusedTextColor = Color(0xFF09090B),
+                                            focusedContainerColor = Color.White,
+                                            unfocusedContainerColor = Color(0xFFFAFAFA),
+                                            focusedLabelColor = Color(0xFF09090B),
+                                            unfocusedLabelColor = Color(0xFF71717A),
+                                            focusedBorderColor = Color(0xFF09090B),
+                                            unfocusedBorderColor = Color(0xFFD4D4D8)
+                                        ),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("customer_contact_input")
+                                    )
+                                }
+                            } else {
+                                Row(
+                                    modifier = fieldsModifier,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Box(modifier = Modifier.weight(1f)) {
+                                        OutlinedTextField(
+                                            value = state.customerName,
+                                            onValueChange = onCustomerNameChanged,
+                                            label = { Text("Customer Name") },
+                                            placeholder = { Text("Walk-in Customer") },
+                                            leadingIcon = { Icon(imageVector = Icons.Default.Person, contentDescription = null, tint = Color(0xFF09090B)) },
+                                            singleLine = true,
+                                            shape = RoundedCornerShape(10.dp),
+                                            colors = OutlinedTextFieldDefaults.colors(
+                                                focusedTextColor = Color(0xFF09090B),
+                                                unfocusedTextColor = Color(0xFF09090B),
+                                                focusedContainerColor = Color.White,
+                                                unfocusedContainerColor = Color(0xFFFAFAFA),
+                                                focusedLabelColor = Color(0xFF09090B),
+                                                unfocusedLabelColor = Color(0xFF71717A),
+                                                focusedBorderColor = Color(0xFF09090B),
+                                                unfocusedBorderColor = Color(0xFFD4D4D8)
+                                            ),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("customer_name_input")
+                                        )
+                                        // Auto-suggest dropdown
+                                        androidx.compose.material3.DropdownMenu(
+                                            expanded = state.showCustomerSuggestions && state.customerSuggestions.isNotEmpty(),
+                                            onDismissRequest = { onDismissCustomerSuggestions() },
+                                            modifier = Modifier.fillMaxWidth(0.45f)
+                                        ) {
+                                            state.customerSuggestions.forEach { customer ->
+                                                androidx.compose.material3.DropdownMenuItem(
+                                                    text = {
+                                                        Column {
+                                                            Text(
+                                                                text = customer.name,
+                                                                fontWeight = FontWeight.Bold,
+                                                                fontSize = 14.sp,
+                                                                color = Color(0xFF09090B)
+                                                            )
+                                                            if (customer.contactNumber.isNotBlank()) {
+                                                                Text(
+                                                                    text = customer.contactNumber,
+                                                                    fontSize = 11.sp,
+                                                                    color = Color(0xFF71717A)
+                                                                )
+                                                            }
+                                                        }
+                                                    },
+                                                    onClick = { onSelectCustomerSuggestion(customer) },
+                                                    trailingIcon = {
+                                                        Surface(
+                                                            color = Color(0xFFF4F4F5),
+                                                            shape = RoundedCornerShape(4.dp)
+                                                        ) {
+                                                            Text(
+                                                                text = "${customer.totalOrders}",
+                                                                fontSize = 10.sp,
+                                                                fontWeight = FontWeight.Bold,
+                                                                color = Color(0xFF52525B),
+                                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            )
+                                                        }
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    OutlinedTextField(
+                                        value = state.contactNumber,
+                                        onValueChange = onContactNumberChanged,
+                                        label = { Text("Contact (Optional)") },
+                                        placeholder = { Text("Phone Number") },
+                                        leadingIcon = { Icon(imageVector = Icons.Default.Phone, contentDescription = null, tint = Color(0xFF09090B)) },
+                                        singleLine = true,
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedTextColor = Color(0xFF09090B),
+                                            unfocusedTextColor = Color(0xFF09090B),
+                                            focusedContainerColor = Color.White,
+                                            unfocusedContainerColor = Color(0xFFFAFAFA),
+                                            focusedLabelColor = Color(0xFF09090B),
+                                            unfocusedLabelColor = Color(0xFF71717A),
+                                            focusedBorderColor = Color(0xFF09090B),
+                                            unfocusedBorderColor = Color(0xFFD4D4D8)
+                                        ),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("customer_contact_input")
                                     )
                                 }
                             }
                         }
-
-                        OutlinedTextField(
-                            value = state.contactNumber,
-                            onValueChange = onContactNumberChanged,
-                            label = { Text("Contact (Optional)") },
-                            placeholder = { Text("Phone Number") },
-                            leadingIcon = { Icon(imageVector = Icons.Default.Phone, contentDescription = null, tint = Color(0xFF09090B)) },
-                            singleLine = true,
-                            shape = RoundedCornerShape(10.dp),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color(0xFF09090B),
-                                unfocusedTextColor = Color(0xFF09090B),
-                                focusedContainerColor = Color.White,
-                                unfocusedContainerColor = Color(0xFFFAFAFA),
-                                focusedLabelColor = Color(0xFF09090B),
-                                unfocusedLabelColor = Color(0xFF71717A),
-                                focusedBorderColor = Color(0xFF09090B),
-                                unfocusedBorderColor = Color(0xFFD4D4D8)
-                            ),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("customer_contact_input")
-                        )
                     }
                 }
             }
 
             // Search and Category Selector
-            Column(modifier = Modifier.padding(horizontal = 12.dp)) {
+            Column(modifier = Modifier.padding(horizontal = if (isCompactScreen) 10.dp else 12.dp)) {
                 OutlinedTextField(
                     value = state.searchQuery,
                     onValueChange = onSearchQueryChanged,
@@ -326,10 +450,15 @@ fun BillingScreen(
                 }
             } else {
                 LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
-                    contentPadding = PaddingValues(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    columns = GridCells.Fixed(if (config.screenWidthDp >= 600) 3 else 2),
+                    contentPadding = PaddingValues(
+                        start = if (isCompactScreen) 10.dp else 12.dp,
+                        end = if (isCompactScreen) 10.dp else 12.dp,
+                        top = 6.dp,
+                        bottom = 84.dp
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(if (isCompactScreen) 8.dp else 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(if (isCompactScreen) 8.dp else 10.dp),
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("menu_grid")
@@ -355,11 +484,11 @@ fun BillingScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(12.dp)
+                .padding(if (isCompactScreen) 8.dp else 12.dp)
         ) {
             Surface(
                 color = Color(0xFF09090B),
-                shape = RoundedCornerShape(20.dp),
+                shape = RoundedCornerShape(16.dp),
                 shadowElevation = 8.dp,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -368,7 +497,7 @@ fun BillingScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(14.dp)
+                        .padding(if (isCompactScreen) 10.dp else 14.dp)
                 ) {
                     BasicTextField(
                         value = state.orderNotes,

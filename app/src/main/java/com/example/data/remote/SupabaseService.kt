@@ -1259,7 +1259,9 @@ class SupabaseService private constructor() {
      * Save metadata by key to Supabase sync_metadata table.
      */
     suspend fun saveSyncMetadata(key: String, value: String): Result<String> = withContext(Dispatchers.IO) {
-        if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
+        if (!_isInitialized) {
+            initialize()
+        }
         try {
             val body = JSONObject().apply {
                 put("key", key)
@@ -1436,5 +1438,210 @@ class SupabaseService private constructor() {
 
     suspend fun saveCloudCustomTasks(json: String): Result<String> = withContext(Dispatchers.IO) {
         saveSyncMetadata("checklist_custom_tasks", json)
+    }
+
+    // ==================== DEEPGRAM REMOTE CONFIG ====================
+
+    data class DeepgramConfig(
+        val apiKey: String = "",
+        val model: String = "nova-3",
+        val language: String = "multi"
+    )
+
+    suspend fun fetchDeepgramConfig(): DeepgramConfig? = withContext(Dispatchers.IO) {
+        try {
+            val raw = fetchSyncMetadata("deepgram_config") ?: return@withContext null
+            if (!raw.startsWith("{")) return@withContext null
+            val json = JSONObject(raw)
+            DeepgramConfig(
+                apiKey = json.optString("api_key", ""),
+                model = json.optString("model", "nova-3").ifBlank { "nova-3" },
+                language = json.optString("language", "multi").ifBlank { "multi" }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchDeepgramConfig failed: ${e.message}")
+            null
+        }
+    }
+
+    // ==================== DEVICE ACCESS REGISTRY & PASSCODE POLICY ====================
+
+    data class AccessPolicyConfig(
+        val adminPasscode: String = "FILTR007",
+        val staffPasscode: String = "1234",
+        val passcodeEpoch: Int = 1,
+        val requireOwnerApprovalForAdmin: Boolean = false
+    )
+
+    data class DeviceRegistration(
+        val registryKey: String,
+        val deviceId: String,
+        val appRole: String, // "ADMIN" or "STAFF"
+        val operatorName: String,
+        val deviceModel: String,
+        val androidVersion: String,
+        val appVersionName: String,
+        val appVersionCode: Int,
+        val status: String, // "ACTIVE", "PENDING", "REVOKED"
+        val passcodeEpoch: Int = 1,
+        val firstSeenMs: Long = System.currentTimeMillis(),
+        val lastSeenMs: Long = System.currentTimeMillis()
+    )
+
+    suspend fun fetchAccessPolicyConfig(): AccessPolicyConfig = withContext(Dispatchers.IO) {
+        try {
+            val raw = fetchSyncMetadata("access_policy_config")
+            if (!raw.isNullOrBlank() && raw.startsWith("{")) {
+                val json = JSONObject(raw)
+                return@withContext AccessPolicyConfig(
+                    adminPasscode = json.optString("admin_passcode", "FILTR007"),
+                    staffPasscode = json.optString("staff_passcode", "1234"),
+                    passcodeEpoch = json.optInt("passcode_epoch", 1),
+                    requireOwnerApprovalForAdmin = json.optBoolean("require_owner_approval_for_admin", false)
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAccessPolicyConfig fallback: ${e.message}")
+        }
+        AccessPolicyConfig()
+    }
+
+    suspend fun saveAccessPolicyConfig(policy: AccessPolicyConfig): Result<String> = withContext(Dispatchers.IO) {
+        val json = JSONObject().apply {
+            put("admin_passcode", policy.adminPasscode)
+            put("staff_passcode", policy.staffPasscode)
+            put("passcode_epoch", policy.passcodeEpoch)
+            put("require_owner_approval_for_admin", policy.requireOwnerApprovalForAdmin)
+        }
+        saveSyncMetadata("access_policy_config", json.toString())
+    }
+
+    private fun parseDeviceRegistration(key: String, rawValue: String): DeviceRegistration? {
+        return try {
+            val json = JSONObject(rawValue)
+            DeviceRegistration(
+                registryKey = key,
+                deviceId = json.optString("device_id", ""),
+                appRole = json.optString("app_role", "STAFF"),
+                operatorName = json.optString("operator_name", "Unknown Device"),
+                deviceModel = json.optString("device_model", "Android"),
+                androidVersion = json.optString("android_version", ""),
+                appVersionName = json.optString("app_version_name", ""),
+                appVersionCode = json.optInt("app_version_code", 0),
+                status = json.optString("status", "ACTIVE"),
+                passcodeEpoch = json.optInt("passcode_epoch", 1),
+                firstSeenMs = json.optLong("first_seen_ms", System.currentTimeMillis()),
+                lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis())
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun deviceRegistrationToJson(reg: DeviceRegistration): String {
+        return JSONObject().apply {
+            put("device_id", reg.deviceId)
+            put("app_role", reg.appRole)
+            put("operator_name", reg.operatorName)
+            put("device_model", reg.deviceModel)
+            put("android_version", reg.androidVersion)
+            put("app_version_name", reg.appVersionName)
+            put("app_version_code", reg.appVersionCode)
+            put("status", reg.status)
+            put("passcode_epoch", reg.passcodeEpoch)
+            put("first_seen_ms", reg.firstSeenMs)
+            put("last_seen_ms", reg.lastSeenMs)
+        }.toString()
+    }
+
+    /**
+     * Registers or updates device heartbeat while preserving remote REVOKED/PENDING status
+     * set by the Owner/Admin.
+     */
+    suspend fun syncDeviceHeartbeat(
+        deviceId: String,
+        appRole: String,
+        operatorName: String,
+        deviceModel: String,
+        androidVersion: String,
+        appVersionName: String,
+        appVersionCode: Int,
+        localStatus: String,
+        passcodeEpoch: Int
+    ): DeviceRegistration? = withContext(Dispatchers.IO) {
+        if (!_isInitialized) initialize()
+        val key = "device_reg_${appRole.lowercase()}_$deviceId"
+        return@withContext try {
+            val existingRaw = fetchSyncMetadata(key)
+            val existing = if (!existingRaw.isNullOrBlank()) parseDeviceRegistration(key, existingRaw) else null
+
+            // Remote REVOKED always overrides local session; PENDING stays PENDING unless locally approved or remote ACTIVE
+            val resolvedStatus = when {
+                existing?.status == "REVOKED" -> "REVOKED"
+                existing?.status == "ACTIVE" && localStatus == "PENDING" -> "ACTIVE"
+                existing?.status == "PENDING" && localStatus != "ACTIVE" -> "PENDING"
+                else -> localStatus
+            }
+
+            val updated = DeviceRegistration(
+                registryKey = key,
+                deviceId = deviceId,
+                appRole = appRole,
+                operatorName = operatorName.ifBlank { existing?.operatorName ?: "Unassigned Device" },
+                deviceModel = deviceModel,
+                androidVersion = androidVersion,
+                appVersionName = appVersionName,
+                appVersionCode = appVersionCode,
+                status = resolvedStatus,
+                passcodeEpoch = passcodeEpoch,
+                firstSeenMs = existing?.firstSeenMs ?: System.currentTimeMillis(),
+                lastSeenMs = System.currentTimeMillis()
+            )
+            saveSyncMetadata(key, deviceRegistrationToJson(updated))
+            updated
+        } catch (e: Exception) {
+            Log.w(TAG, "syncDeviceHeartbeat failed: ${e.message}")
+            null
+        }
+    }
+
+    suspend fun fetchAllRegisteredDevices(): List<DeviceRegistration> = withContext(Dispatchers.IO) {
+        if (!_isInitialized) initialize()
+        try {
+            val req = Request.Builder()
+                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=like.device_reg_%25&order=updated_at.desc")
+                .addHeader("apikey", SERVICE_ROLE_KEY)
+                .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                .get()
+                .build()
+            val response = executeRequest(req)
+            val bodyStr = response?.body?.string()
+            response?.close()
+            if (bodyStr.isNullOrBlank()) return@withContext emptyList()
+            val arr = JSONArray(bodyStr)
+            val devices = mutableListOf<DeviceRegistration>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val key = obj.optString("key", "")
+                val value = obj.optString("value", "")
+                parseDeviceRegistration(key, value)?.let { devices.add(it) }
+            }
+            devices.sortedByDescending { it.lastSeenMs }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAllRegisteredDevices failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    suspend fun setDeviceAccessStatus(registryKey: String, newStatus: String): Result<String> = withContext(Dispatchers.IO) {
+        if (!_isInitialized) initialize()
+        try {
+            val existingRaw = fetchSyncMetadata(registryKey) ?: return@withContext Result.failure(Exception("Device not found"))
+            val existing = parseDeviceRegistration(registryKey, existingRaw) ?: return@withContext Result.failure(Exception("Invalid device record"))
+            val updated = existing.copy(status = newStatus)
+            saveSyncMetadata(registryKey, deviceRegistrationToJson(updated))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 }

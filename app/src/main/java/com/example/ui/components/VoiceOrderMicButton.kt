@@ -192,7 +192,7 @@ fun VoiceOrderMicButton(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "✨ Gemini 3.5 Flash Lite Parsing Order...",
+                            text = "🎙️ Deepgram AI Parsing Order...",
                             color = Color.White,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
@@ -284,7 +284,7 @@ fun VoiceOrderMicButton(
             },
             title = {
                 Text(
-                    text = "AI Voice Order (Gemini 3.5 Flash Lite)",
+                    text = "AI Voice Order (Deepgram Nova-3)",
                     fontWeight = FontWeight.Bold,
                     fontSize = 18.sp,
                     color = MaterialTheme.colorScheme.onSurface
@@ -296,7 +296,7 @@ fun VoiceOrderMicButton(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "💡 Tip: Press & hold the Mic button for 4-5 seconds to speak naturally! Gemini 3.5 Flash Lite will automatically match your coffee SKUs and autofill the order.",
+                        text = "💡 Tip: Tap the Mic button to record your Hinglish/English order, then tap again to parse automatically with Deepgram Nova-3.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -311,7 +311,7 @@ fun VoiceOrderMicButton(
                             CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
-                                text = "Gemini 3.5 Flash Lite is parsing your voice order...",
+                                text = "Deepgram AI is transcribing and matching menu items...",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium
                             )

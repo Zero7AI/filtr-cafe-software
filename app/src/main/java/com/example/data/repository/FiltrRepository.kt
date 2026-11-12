@@ -23,6 +23,7 @@ import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
 import com.example.data.entity.UpiAccountEntity
+import com.example.data.remote.DeepgramVoiceService
 import com.example.data.remote.FirestoreService
 import com.example.data.remote.SupabaseService
 import com.example.data.remote.GeminiVoiceOrderService
@@ -49,6 +50,7 @@ class FiltrRepository(
     private val checklistDao: ChecklistDao? = null,
     private val sheetsSyncService: GoogleSheetsSyncService = GoogleSheetsSyncService(),
     private val geminiVoiceService: GeminiVoiceOrderService = GeminiVoiceOrderService(),
+    private val deepgramVoiceService: DeepgramVoiceService = DeepgramVoiceService.getInstance(),
     private val firestoreService: FirestoreService = FirestoreService.getInstance(),
     private val supabaseService: SupabaseService = SupabaseService.getInstance()
 ) {
@@ -1250,11 +1252,11 @@ class FiltrRepository(
     // ==================== AI VOICE ORDER (PRESERVED) ====================
 
     suspend fun parseVoiceOrder(transcript: String, availableItems: List<MenuItemEntity>): Result<ParsedVoiceOrder> {
-        return geminiVoiceService.parseVoiceOrder(transcript, availableItems)
+        return deepgramVoiceService.parseTranscriptToOrder(transcript, availableItems)
     }
 
     suspend fun parseVoiceAudio(audioBytes: ByteArray, mimeType: String, availableItems: List<MenuItemEntity>): Result<ParsedVoiceOrder> {
-        return geminiVoiceService.parseVoiceAudio(audioBytes, mimeType, availableItems)
+        return deepgramVoiceService.parseVoiceAudio(audioBytes, mimeType, availableItems)
     }
 
     suspend fun generateStoryNote(title: String, date: String = ""): Result<String> {

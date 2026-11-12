@@ -17,10 +17,26 @@ android {
     applicationId = "filtr.coffee"
     minSdk = 24
     targetSdk = 36
-    versionCode = 4
-    versionName = "1.3"
+    versionCode = 5
+    versionName = "1.4"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+  }
+
+  flavorDimensions += "role"
+  productFlavors {
+    create("billing") {
+      dimension = "role"
+      applicationId = "filtr.coffee"
+      resValue("string", "app_name", "FILTR Billing")
+      buildConfigField("boolean", "IS_STAFF_APP", "false")
+    }
+    create("staff") {
+      dimension = "role"
+      applicationId = "filtr.coffee.staff"
+      resValue("string", "app_name", "FILTR Staff")
+      buildConfigField("boolean", "IS_STAFF_APP", "true")
+    }
   }
 
   signingConfigs {
@@ -55,6 +71,7 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+    resValues = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
   androidResources {
@@ -113,12 +130,6 @@ dependencies {
   // implementation(libs.play.services.location)
   // On-Device Neural Voice Activity Detector (Silero VAD v5 ONNX - 2.3 MB, <0.5ms inference)
   implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
-
-  // In-process Offline Speech Recognition (Vosk)
-  implementation("com.alphacephei:vosk-android:0.3.47") {
-    exclude(group = "net.java.dev.jna", module = "jna")
-  }
-  implementation("net.java.dev.jna:jna:5.13.0@aar")
 
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)

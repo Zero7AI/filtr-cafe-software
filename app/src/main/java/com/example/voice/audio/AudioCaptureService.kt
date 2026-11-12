@@ -15,7 +15,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import com.example.voice.speech.InProcessVoskRecognizer
+import com.example.voice.speech.DeepgramTurnRecognizer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AudioCaptureService : Service(), VoiceActivityDetector.VadListener {
@@ -28,7 +28,7 @@ class AudioCaptureService : Service(), VoiceActivityDetector.VadListener {
 
     private lateinit var vad: VoiceActivityDetector
     lateinit var sileroVad: SileroVadDetector
-    lateinit var voskRecognizer: InProcessVoskRecognizer
+    lateinit var voskRecognizer: DeepgramTurnRecognizer
 
     var audioLevelCallback: ((Double) -> Unit)? = null
     var speechStateCallback: ((Boolean) -> Unit)? = null
@@ -56,7 +56,7 @@ class AudioCaptureService : Service(), VoiceActivityDetector.VadListener {
 
         sileroVad = SileroVadDetector(this)
         vad = VoiceActivityDetector(sileroVad = sileroVad, listener = this)
-        voskRecognizer = InProcessVoskRecognizer(
+        voskRecognizer = DeepgramTurnRecognizer(
             context = this,
             onTranscriptResult = { text, isFinal, modality ->
                 transcriptCallback?.invoke(text, isFinal, modality)

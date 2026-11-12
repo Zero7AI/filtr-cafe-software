@@ -196,7 +196,16 @@ data class BillingUiState(
     val showAddCategoryDialog: Boolean = false,
     // Daily Check List
     val showAddChecklistTaskDialog: Boolean = false,
-    val collapsedChecklistSectionIds: Set<String> = emptySet()
+    val collapsedChecklistSectionIds: Set<String> = emptySet(),
+    // Device Access Control & Registry
+    val deviceAccessStatus: String = "ACTIVE", // "ACTIVE", "UNVERIFIED", "PENDING", "REVOKED"
+    val operatorName: String = "",
+    val accessGateError: String = "",
+    val isVerifyingAccess: Boolean = false,
+    val showActiveDevicesDialog: Boolean = false,
+    val registeredDevices: List<SupabaseService.DeviceRegistration> = emptyList(),
+    val isLoadingDevices: Boolean = false,
+    val accessPolicyConfig: SupabaseService.AccessPolicyConfig = SupabaseService.AccessPolicyConfig()
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -208,6 +217,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
+    val isStaffApp: Boolean = application.packageName == "filtr.coffee.staff" || BuildConfig.IS_STAFF_APP
+    val currentDeviceId: String = try {
+        android.provider.Settings.Secure.getString(application.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+            ?.takeIf { it.isNotBlank() } ?: "dev_${android.os.Build.MODEL.hashCode()}"
+    } catch (_: Exception) {
+        "dev_${android.os.Build.MODEL.hashCode()}"
+    }
+    val currentDeviceModel: String = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
 
     private fun loadCustomItemOrder(): List<String> {
         val jsonStr = prefs.getString("menu_custom_item_order", null) ?: return emptyList()
@@ -297,7 +314,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             githubRepoName = prefs.getString("github_repo_name", GitHubUpdateService.DEFAULT_REPO_NAME) ?: GitHubUpdateService.DEFAULT_REPO_NAME,
             githubToken = prefs.getString("github_token", "") ?: "",
             customItemOrder = loadCustomItemOrder(),
-            customCategories = loadCustomCategories()
+            customCategories = loadCustomCategories(),
+            deviceAccessStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED",
+            operatorName = prefs.getString("device_operator_name", "") ?: ""
         )
     )
     val uiState: StateFlow<BillingUiState> = _uiState.asStateFlow()
@@ -505,8 +524,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
-                // Check for mandatory updates every 4 minutes in background
+                // Check for mandatory updates and device access status every 4 minutes in background
                 if (loopCount % 2 == 0) {
+                    syncDeviceAccessHeartbeat()
                     withContext(Dispatchers.Main) {
                         checkForAppUpdates(isManualCheck = false)
                     }
@@ -573,7 +593,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Check for app updates via GitHub Releases on startup
+        // Check for app updates and verify device access on startup
+        viewModelScope.launch(Dispatchers.IO) {
+            syncDeviceAccessHeartbeat()
+        }
         viewModelScope.launch {
             delay(1000) // Fast initial check immediately upon launch
             checkForAppUpdates(isManualCheck = false)
@@ -708,17 +731,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(showAddCategoryDialog = false) }
     }
 
-    // Navigation Tab
-    fun selectTab(tab: FiltrTab) {
-        if (_uiState.value.isForceUpdate) {
-            _uiState.update { 
+    private fun ensureAppAllowed(): Boolean {
+        val state = _uiState.value
+        if (state.isForceUpdate) {
+            _uiState.update {
                 it.copy(
                     showAppUpdateDialog = true,
                     snackbarMessage = "Mandatory Update Required. Please update the application to continue."
-                ) 
+                )
             }
-            return
+            return false
         }
+        if (state.deviceAccessStatus != "ACTIVE") {
+            _uiState.update {
+                it.copy(snackbarMessage = "Device verification required before continuing.")
+            }
+            return false
+        }
+        return true
+    }
+
+    // Navigation Tab
+    fun selectTab(tab: FiltrTab) {
+        if (!ensureAppAllowed()) return
         _uiState.update { it.copy(currentTab = tab) }
     }
 
@@ -771,15 +806,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Cart Operations
     fun addToCart(item: MenuItemEntity) {
-        if (_uiState.value.isForceUpdate) {
-            _uiState.update { 
-                it.copy(
-                    showAppUpdateDialog = true,
-                    snackbarMessage = "Mandatory Update Required. Please update the application to continue."
-                ) 
-            }
-            return
-        }
+        if (!ensureAppAllowed()) return
         _uiState.update { state ->
             val existingKey = state.cartItems.keys.find { it.id == item.id }
             val targetItem = existingKey ?: item
@@ -884,15 +911,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         notes: String? = null
     ) {
         viewModelScope.launch {
-            if (_uiState.value.isForceUpdate) {
-                _uiState.update { 
-                    it.copy(
-                        showAppUpdateDialog = true, 
-                        snackbarMessage = "Mandatory Update Required. Please update the application to continue."
-                    ) 
-                }
-                return@launch
-            }
+            if (!ensureAppAllowed()) return@launch
             if (_uiState.value.isPlacingOrder || voiceItems.isEmpty()) return@launch
 
             _uiState.update { it.copy(isPlacingOrder = true) }
@@ -973,16 +992,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Submit Order
     fun submitOrder() {
         viewModelScope.launch {
+            if (!ensureAppAllowed()) return@launch
             val state = _uiState.value
-            if (state.isForceUpdate) {
-                _uiState.update { 
-                    it.copy(
-                        showAppUpdateDialog = true, 
-                        snackbarMessage = "Mandatory Update Required. Please update the application to continue."
-                    ) 
-                }
-                return@launch
-            }
             if (state.isPlacingOrder || state.cartItems.isEmpty()) {
                 if (state.cartItems.isEmpty()) {
                     _uiState.update { it.copy(snackbarMessage = "Cart is empty!") }
@@ -1247,15 +1258,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // AI Voice Order Handling
     fun startListeningVoice() {
-        if (_uiState.value.isForceUpdate) {
-            _uiState.update { 
-                it.copy(
-                    showAppUpdateDialog = true, 
-                    snackbarMessage = "Mandatory Update Required. Please update the application to continue."
-                ) 
-            }
-            return
-        }
+        if (!ensureAppAllowed()) return
         _uiState.update {
             it.copy(
                 isListeningVoice = true,
@@ -1275,7 +1278,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     isParsingVoice = true,
                     parsedVoiceOrder = null,
                     showVoiceOrderReviewDialog = false,
-                    snackbarMessage = "✨ Gemini 3.5 Flash Lite analyzing voice recording..."
+                    snackbarMessage = "🎙️ Deepgram Nova-3 analyzing voice recording..."
                 )
             }
 
@@ -1361,10 +1364,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             } else {
+                val errMsg = result.exceptionOrNull()?.message ?: "Could not parse voice recording. Please try speaking clearly."
                 _uiState.update {
                     it.copy(
                         isParsingVoice = false,
-                        snackbarMessage = "Could not parse voice recording. Please try speaking clearly."
+                        snackbarMessage = errMsg
                     )
                 }
             }
@@ -2498,6 +2502,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val now = System.currentTimeMillis()
         if (now - lastUpdateCheckMs > 60 * 1000L) {
             lastUpdateCheckMs = now
+            viewModelScope.launch(Dispatchers.IO) {
+                syncDeviceAccessHeartbeat()
+            }
             checkForAppUpdates(isManualCheck = false)
         }
     }
@@ -2521,7 +2528,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 repo = repo,
                 currentVersionName = currentVersion,
                 currentVersionCode = currentVersionCode,
-                token = token
+                token = token,
+                isStaffApp = isStaffApp
             )
 
             _uiState.update { it.copy(isCheckingForUpdate = false) }
@@ -2715,6 +2723,201 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshChecklist() {
         viewModelScope.launch(Dispatchers.IO) {
             repository.reconcileChecklistFromCloud(todayDateKey)
+        }
+    }
+
+    // ==========================================
+    // DEVICE TRACKING, PASSCODE & ACCESS CONTROL
+    // ==========================================
+
+    suspend fun syncDeviceAccessHeartbeat() {
+        try {
+            val supabase = SupabaseService.getInstance()
+            val policy = supabase.fetchAccessPolicyConfig()
+            val appRole = if (isStaffApp) "STAFF" else "ADMIN"
+            val localStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED"
+            val localOperator = prefs.getString("device_operator_name", "") ?: ""
+            val localEpoch = prefs.getInt("device_passcode_epoch", 1)
+
+            val remoteReg = supabase.syncDeviceHeartbeat(
+                deviceId = currentDeviceId,
+                appRole = appRole,
+                operatorName = localOperator,
+                deviceModel = currentDeviceModel,
+                androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                appVersionName = BuildConfig.VERSION_NAME,
+                appVersionCode = BuildConfig.VERSION_CODE,
+                localStatus = localStatus,
+                passcodeEpoch = localEpoch
+            )
+
+            var effectiveStatus = localStatus
+            if (remoteReg != null) {
+                effectiveStatus = when {
+                    remoteReg.status == "REVOKED" -> "REVOKED"
+                    remoteReg.status == "ACTIVE" && localStatus == "PENDING" -> "ACTIVE"
+                    else -> localStatus
+                }
+            }
+
+            if (effectiveStatus == "ACTIVE" && localEpoch < policy.passcodeEpoch) {
+                effectiveStatus = "UNVERIFIED"
+            }
+
+            if (effectiveStatus != localStatus) {
+                prefs.edit().putString("device_access_status", effectiveStatus).apply()
+            }
+
+            _uiState.update {
+                it.copy(
+                    deviceAccessStatus = effectiveStatus,
+                    accessPolicyConfig = policy
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "syncDeviceAccessHeartbeat skipped (offline?): ${e.message}")
+        }
+    }
+
+    fun verifyDeviceAccess(operatorName: String, passcode: String) {
+        if (operatorName.isBlank() || passcode.isBlank()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isVerifyingAccess = true, accessGateError = "") }
+            try {
+                val supabase = SupabaseService.getInstance()
+                val policy = supabase.fetchAccessPolicyConfig()
+                val expected = if (isStaffApp) policy.staffPasscode else policy.adminPasscode
+
+                if (!passcode.trim().equals(expected.trim(), ignoreCase = false)) {
+                    _uiState.update {
+                        it.copy(
+                            isVerifyingAccess = false,
+                            accessGateError = "Incorrect passcode. Please check with the Store Owner."
+                        )
+                    }
+                    return@launch
+                }
+
+                val targetStatus = if (!isStaffApp && policy.requireOwnerApprovalForAdmin) "PENDING" else "ACTIVE"
+                val appRole = if (isStaffApp) "STAFF" else "ADMIN"
+                val remoteReg = supabase.syncDeviceHeartbeat(
+                    deviceId = currentDeviceId,
+                    appRole = appRole,
+                    operatorName = operatorName.trim(),
+                    deviceModel = currentDeviceModel,
+                    androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                    appVersionName = BuildConfig.VERSION_NAME,
+                    appVersionCode = BuildConfig.VERSION_CODE,
+                    localStatus = targetStatus,
+                    passcodeEpoch = policy.passcodeEpoch
+                )
+
+                val finalStatus = if (remoteReg?.status == "REVOKED") "REVOKED" else targetStatus
+                prefs.edit()
+                    .putString("device_access_status", finalStatus)
+                    .putString("device_operator_name", operatorName.trim())
+                    .putInt("device_passcode_epoch", policy.passcodeEpoch)
+                    .apply()
+
+                _uiState.update {
+                    it.copy(
+                        isVerifyingAccess = false,
+                        deviceAccessStatus = finalStatus,
+                        operatorName = operatorName.trim(),
+                        accessGateError = "",
+                        accessPolicyConfig = policy
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isVerifyingAccess = false,
+                        accessGateError = "Verification failed: ${e.message ?: "Check internet connection"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshDeviceAccessStatus() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isVerifyingAccess = true, accessGateError = "") }
+            withContext(Dispatchers.IO) {
+                syncDeviceAccessHeartbeat()
+            }
+            _uiState.update { it.copy(isVerifyingAccess = false) }
+        }
+    }
+
+    fun openActiveDevicesDialog() {
+        _uiState.update { it.copy(showActiveDevicesDialog = true) }
+        refreshRegisteredDevices()
+    }
+
+    fun dismissActiveDevicesDialog() {
+        _uiState.update { it.copy(showActiveDevicesDialog = false) }
+    }
+
+    fun refreshRegisteredDevices() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingDevices = true) }
+            val supabase = SupabaseService.getInstance()
+            val devices = supabase.fetchAllRegisteredDevices()
+            val policy = supabase.fetchAccessPolicyConfig()
+            _uiState.update {
+                it.copy(
+                    isLoadingDevices = false,
+                    registeredDevices = devices,
+                    accessPolicyConfig = policy
+                )
+            }
+        }
+    }
+
+    fun updateRemoteDeviceStatus(registryKey: String, newStatus: String) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingDevices = true) }
+            val res = SupabaseService.getInstance().setDeviceAccessStatus(registryKey, newStatus)
+            if (res.isSuccess) {
+                _uiState.update { it.copy(snackbarMessage = "Device access updated to $newStatus") }
+            } else {
+                _uiState.update { it.copy(snackbarMessage = "Failed: ${res.exceptionOrNull()?.message}") }
+            }
+            refreshRegisteredDevices()
+        }
+    }
+
+    fun saveAccessPolicy(
+        adminPasscode: String,
+        staffPasscode: String,
+        requireApproval: Boolean,
+        forceReverifyAll: Boolean
+    ) {
+        viewModelScope.launch {
+            val current = _uiState.value.accessPolicyConfig
+            val nextEpoch = if (forceReverifyAll) current.passcodeEpoch + 1 else current.passcodeEpoch
+            val updated = SupabaseService.AccessPolicyConfig(
+                adminPasscode = adminPasscode,
+                staffPasscode = staffPasscode,
+                passcodeEpoch = nextEpoch,
+                requireOwnerApprovalForAdmin = requireApproval
+            )
+            val res = SupabaseService.getInstance().saveAccessPolicyConfig(updated)
+            if (res.isSuccess) {
+                // Keep this Admin phone authenticated on the new epoch automatically
+                prefs.edit().putInt("device_passcode_epoch", nextEpoch).apply()
+                _uiState.update {
+                    it.copy(
+                        accessPolicyConfig = updated,
+                        snackbarMessage = if (forceReverifyAll)
+                            "Passcodes saved! All other devices must re-verify."
+                        else
+                            "Access policy saved!"
+                    )
+                }
+            } else {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save policy: ${res.exceptionOrNull()?.message}") }
+            }
         }
     }
 
