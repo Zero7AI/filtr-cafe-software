@@ -17,26 +17,10 @@ android {
     applicationId = "filtr.coffee"
     minSdk = 24
     targetSdk = 36
-    versionCode = 5
-    versionName = "1.4"
+    versionCode = 6
+    versionName = "1.5"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-  }
-
-  flavorDimensions += "role"
-  productFlavors {
-    create("billing") {
-      dimension = "role"
-      applicationId = "filtr.coffee"
-      resValue("string", "app_name", "FILTR Billing")
-      buildConfigField("boolean", "IS_STAFF_APP", "false")
-    }
-    create("staff") {
-      dimension = "role"
-      applicationId = "filtr.coffee.staff"
-      resValue("string", "app_name", "FILTR Staff")
-      buildConfigField("boolean", "IS_STAFF_APP", "true")
-    }
   }
 
   signingConfigs {

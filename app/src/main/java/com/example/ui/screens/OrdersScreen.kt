@@ -492,6 +492,7 @@ fun OrdersScreen(
                 items(items = filteredOrders, key = { it.order.orderId }) { orderWithItems ->
                     OrderCard(
                         orderWithItems = orderWithItems,
+                        isStaffMode = isStaffMode,
                         onToggleMade = { onToggleMade(orderWithItems) },
                         onTogglePaid = { onTogglePaid(orderWithItems) },
                         onOpenPaymentDialog = { selectedOrderForPaymentDialog = orderWithItems },
@@ -641,6 +642,7 @@ fun OrdersScreen(
 @Composable
 fun OrderCard(
     orderWithItems: OrderWithItems,
+    isStaffMode: Boolean = false,
     onToggleMade: () -> Unit,
     onTogglePaid: () -> Unit,
     onOpenPaymentDialog: () -> Unit = {},
@@ -708,25 +710,27 @@ fun OrderCard(
                         }
                     }
 
-                    Text(
-                        text = "₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
-                        fontWeight = FontWeight.Black,
-                        fontSize = 18.sp,
-                        color = if (!order.isPaid) Color(0xFFDC2626) else Color(0xFF09090B)
-                    )
+                    if (!isStaffMode) {
+                        Text(
+                            text = "₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
+                            fontWeight = FontWeight.Black,
+                            fontSize = 18.sp,
+                            color = if (!order.isPaid) Color(0xFFDC2626) else Color(0xFF09090B)
+                        )
 
-                    IconButton(
-                        onClick = onEditOrder,
-                        modifier = Modifier.testTag("edit_order_button_${order.orderId}")
-                    ) {
-                        Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit Order", tint = Color(0xFF09090B))
-                    }
+                        IconButton(
+                            onClick = onEditOrder,
+                            modifier = Modifier.testTag("edit_order_button_${order.orderId}")
+                        ) {
+                            Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit Order", tint = Color(0xFF09090B))
+                        }
 
-                    IconButton(
-                        onClick = onDeleteOrder,
-                        modifier = Modifier.testTag("delete_order_button_${order.orderId}")
-                    ) {
-                        Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFF71717A))
+                        IconButton(
+                            onClick = onDeleteOrder,
+                            modifier = Modifier.testTag("delete_order_button_${order.orderId}")
+                        ) {
+                            Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFF71717A))
+                        }
                     }
                 }
             }

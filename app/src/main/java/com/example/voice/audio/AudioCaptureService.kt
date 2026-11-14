@@ -129,11 +129,12 @@ class AudioCaptureService : Service(), VoiceActivityDetector.VadListener {
     fun stopAudioCapture() {
         isRecording.set(false)
         try {
+            recordingThread?.interrupt()
+            recordingThread?.join(1000)
+            recordingThread = null
             audioRecord?.stop()
             audioRecord?.release()
             audioRecord = null
-            recordingThread?.join(500)
-            recordingThread = null
         } catch (e: Exception) {
             // Ignore on shutdown
         }

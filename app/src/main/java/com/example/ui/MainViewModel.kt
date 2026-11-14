@@ -200,6 +200,7 @@ data class BillingUiState(
     // Device Access Control & Registry
     val deviceAccessStatus: String = "ACTIVE", // "ACTIVE", "UNVERIFIED", "PENDING", "REVOKED"
     val operatorName: String = "",
+    val currentRole: String = "STAFF", // "ADMIN" or "STAFF"
     val accessGateError: String = "",
     val isVerifyingAccess: Boolean = false,
     val showActiveDevicesDialog: Boolean = false,
@@ -217,7 +218,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
-    val isStaffApp: Boolean = application.packageName == "filtr.coffee.staff" || BuildConfig.IS_STAFF_APP
     val currentDeviceId: String = try {
         android.provider.Settings.Secure.getString(application.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
             ?.takeIf { it.isNotBlank() } ?: "dev_${android.os.Build.MODEL.hashCode()}"
@@ -316,7 +316,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             customItemOrder = loadCustomItemOrder(),
             customCategories = loadCustomCategories(),
             deviceAccessStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED",
-            operatorName = prefs.getString("device_operator_name", "") ?: ""
+            operatorName = prefs.getString("device_operator_name", "") ?: "",
+            currentRole = prefs.getString("authenticated_role", "STAFF") ?: "STAFF"
         )
     )
     val uiState: StateFlow<BillingUiState> = _uiState.asStateFlow()
@@ -1249,6 +1250,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteOrder(orderId: String) {
+        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             val url = _uiState.value.googleSheetsWebhookUrl
             repository.deleteOrder(orderId, url)
@@ -1655,6 +1657,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addUpiAccount(vpa: String, payeeName: String, isDefault: Boolean) {
+        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             repository.addUpiAccount(vpa, payeeName, isDefault)
             _uiState.update { it.copy(snackbarMessage = "UPI ID added successfully!") }
@@ -1662,6 +1665,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteUpiAccount(account: com.example.data.entity.UpiAccountEntity) {
+        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             repository.deleteUpiAccount(account)
             _uiState.update { it.copy(snackbarMessage = "UPI ID removed.") }
@@ -1669,6 +1673,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setDefaultUpiAccount(accountId: Int) {
+        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             repository.setDefaultUpiAccount(accountId)
             _uiState.update { it.copy(snackbarMessage = "Default UPI ID updated.") }
@@ -1726,10 +1731,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestDeleteOrder(orderId: String) {
+        if (_uiState.value.currentRole != "ADMIN") return
         _uiState.update { it.copy(orderToDeleteConfirmation = orderId) }
     }
 
     fun confirmDeleteOrder(orderId: String) {
+        if (_uiState.value.currentRole != "ADMIN") return
         if (_uiState.value.isDeletingOrder) return
         _uiState.update { it.copy(isDeletingOrder = true) }
         viewModelScope.launch {
@@ -1846,6 +1853,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveGoogleSheetsWebhookUrl(url: String) {
+        if (_uiState.value.currentRole != "ADMIN") return
         val trimmedUrl = url.trim()
         prefs.edit().putString("sheets_webhook_url", trimmedUrl).apply()
         _uiState.update {
@@ -1859,6 +1867,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             syncPendingOrdersToSheets()
         }
     }
+
+    fun updateWebhookUrl(url: String) = saveGoogleSheetsWebhookUrl(url)
 
     // Receipt View Modal
     fun viewOrderReceipt(orderWithItems: OrderWithItems?) {
@@ -2529,7 +2539,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 currentVersionName = currentVersion,
                 currentVersionCode = currentVersionCode,
                 token = token,
-                isStaffApp = isStaffApp
+                isStaffApp = (_uiState.value.currentRole == "STAFF")
             )
 
             _uiState.update { it.copy(isCheckingForUpdate = false) }
@@ -2734,7 +2744,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         try {
             val supabase = SupabaseService.getInstance()
             val policy = supabase.fetchAccessPolicyConfig()
-            val appRole = if (isStaffApp) "STAFF" else "ADMIN"
+            val currentRole = prefs.getString("authenticated_role", "STAFF") ?: "STAFF"
+            val appRole = currentRole
             val localStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED"
             val localOperator = prefs.getString("device_operator_name", "") ?: ""
             val localEpoch = prefs.getInt("device_passcode_epoch", 1)
@@ -2771,7 +2782,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update {
                 it.copy(
                     deviceAccessStatus = effectiveStatus,
-                    accessPolicyConfig = policy
+                    accessPolicyConfig = policy,
+                    currentRole = currentRole
                 )
             }
         } catch (e: Exception) {
@@ -2786,23 +2798,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val supabase = SupabaseService.getInstance()
                 val policy = supabase.fetchAccessPolicyConfig()
-                val expected = if (isStaffApp) policy.staffPasscode else policy.adminPasscode
+                val cleanCode = passcode.trim()
 
-                if (!passcode.trim().equals(expected.trim(), ignoreCase = false)) {
-                    _uiState.update {
-                        it.copy(
-                            isVerifyingAccess = false,
-                            accessGateError = "Incorrect passcode. Please check with the Store Owner."
-                        )
+                val (authenticatedRole, targetStatus) = when {
+                    cleanCode.equals(policy.adminPasscode.trim(), ignoreCase = false) -> {
+                        val status = if (policy.requireOwnerApprovalForAdmin) "PENDING" else "ACTIVE"
+                        Pair("ADMIN", status)
                     }
-                    return@launch
+                    cleanCode.equals(policy.staffPasscode.trim(), ignoreCase = false) -> {
+                        Pair("STAFF", "ACTIVE")
+                    }
+                    else -> {
+                        _uiState.update {
+                            it.copy(
+                                isVerifyingAccess = false,
+                                accessGateError = "Incorrect passcode. Please check with the Store Owner."
+                            )
+                        }
+                        return@launch
+                    }
                 }
 
-                val targetStatus = if (!isStaffApp && policy.requireOwnerApprovalForAdmin) "PENDING" else "ACTIVE"
-                val appRole = if (isStaffApp) "STAFF" else "ADMIN"
                 val remoteReg = supabase.syncDeviceHeartbeat(
                     deviceId = currentDeviceId,
-                    appRole = appRole,
+                    appRole = authenticatedRole,
                     operatorName = operatorName.trim(),
                     deviceModel = currentDeviceModel,
                     androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
@@ -2816,6 +2835,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 prefs.edit()
                     .putString("device_access_status", finalStatus)
                     .putString("device_operator_name", operatorName.trim())
+                    .putString("authenticated_role", authenticatedRole)
                     .putInt("device_passcode_epoch", policy.passcodeEpoch)
                     .apply()
 
@@ -2824,6 +2844,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         isVerifyingAccess = false,
                         deviceAccessStatus = finalStatus,
                         operatorName = operatorName.trim(),
+                        currentRole = authenticatedRole,
                         accessGateError = "",
                         accessPolicyConfig = policy
                     )
@@ -2839,6 +2860,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun elevateToAdmin(passcode: String): Boolean {
+        val policy = _uiState.value.accessPolicyConfig
+        if (!passcode.trim().equals(policy.adminPasscode.trim(), ignoreCase = false)) {
+            return false
+        }
+        prefs.edit().putString("authenticated_role", "ADMIN").apply()
+        _uiState.update { it.copy(currentRole = "ADMIN", snackbarMessage = "Elevated to Admin Mode") }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                SupabaseService.getInstance().syncDeviceHeartbeat(
+                    deviceId = currentDeviceId,
+                    appRole = "ADMIN",
+                    operatorName = _uiState.value.operatorName,
+                    deviceModel = currentDeviceModel,
+                    androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                    appVersionName = BuildConfig.VERSION_NAME,
+                    appVersionCode = BuildConfig.VERSION_CODE,
+                    localStatus = _uiState.value.deviceAccessStatus,
+                    passcodeEpoch = _uiState.value.accessPolicyConfig.passcodeEpoch
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync admin elevation heartbeat: ${e.message}")
+            }
+        }
+        return true
+    }
+
+    fun lockToStaffRole() {
+        prefs.edit().putString("authenticated_role", "STAFF").apply()
+        _uiState.update { it.copy(currentRole = "STAFF", snackbarMessage = "Locked to Staff Mode") }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                SupabaseService.getInstance().syncDeviceHeartbeat(
+                    deviceId = currentDeviceId,
+                    appRole = "STAFF",
+                    operatorName = _uiState.value.operatorName,
+                    deviceModel = currentDeviceModel,
+                    androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                    appVersionName = BuildConfig.VERSION_NAME,
+                    appVersionCode = BuildConfig.VERSION_CODE,
+                    localStatus = _uiState.value.deviceAccessStatus,
+                    passcodeEpoch = _uiState.value.accessPolicyConfig.passcodeEpoch
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync staff lock heartbeat: ${e.message}")
+            }
+        }
+    }
+
+    fun logOutDevice() {
+        prefs.edit()
+            .putString("device_access_status", "UNVERIFIED")
+            .putString("authenticated_role", "STAFF")
+            .apply()
+        _uiState.update {
+            it.copy(
+                deviceAccessStatus = "UNVERIFIED",
+                currentRole = "STAFF",
+                snackbarMessage = "Device signed out"
+            )
+        }
+    }
+
     fun refreshDeviceAccessStatus() {
         viewModelScope.launch {
             _uiState.update { it.copy(isVerifyingAccess = true, accessGateError = "") }
@@ -2850,6 +2934,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openActiveDevicesDialog() {
+        if (_uiState.value.currentRole != "ADMIN") return
         _uiState.update { it.copy(showActiveDevicesDialog = true) }
         refreshRegisteredDevices()
     }
@@ -2875,6 +2960,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateRemoteDeviceStatus(registryKey: String, newStatus: String) {
+        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingDevices = true) }
             val res = SupabaseService.getInstance().setDeviceAccessStatus(registryKey, newStatus)
@@ -2893,6 +2979,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         requireApproval: Boolean,
         forceReverifyAll: Boolean
     ) {
+        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             val current = _uiState.value.accessPolicyConfig
             val nextEpoch = if (forceReverifyAll) current.passcodeEpoch + 1 else current.passcodeEpoch

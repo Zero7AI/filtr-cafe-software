@@ -34,6 +34,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.CheckCircle
@@ -41,6 +42,8 @@ import androidx.compose.material.icons.filled.Coffee
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Inventory
 import androidx.compose.material.icons.filled.ListAlt
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.People
@@ -95,6 +98,7 @@ import com.example.ui.MainViewModel
 import com.example.ui.components.AccountsUpiDialog
 import com.example.ui.components.ActiveDevicesDialog
 import com.example.ui.components.AddEditMenuItemDialog
+import com.example.ui.components.AdminUnlockDialog
 import com.example.ui.components.AppUpdateDialog
 import com.example.ui.components.DeviceAccessGateDialog
 import com.example.ui.components.FiltrTopBar
@@ -190,7 +194,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val isStaffMode = context.packageName == "filtr.coffee.staff" || BuildConfig.IS_STAFF_APP
+                val isStaffMode = uiState.currentRole == "STAFF"
+                var showAdminUnlockDialog by remember { mutableStateOf(false) }
                 val snackbarHostState = remember { SnackbarHostState() }
                 val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
                 val scope = rememberCoroutineScope()
@@ -303,6 +308,40 @@ class MainActivity : ComponentActivity() {
                                             selectedTextColor = Color.White,
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Switch to Admin Mode", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.AdminPanelSettings, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = false,
+                                        onClick = {
+                                            showAdminUnlockDialog = true
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            unselectedIconColor = Color(0xFFF59E0B),
+                                            unselectedTextColor = Color(0xFFF59E0B)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Log Out / Switch Operator", fontWeight = FontWeight.Medium) },
+                                        icon = { Icon(imageVector = Icons.Default.Logout, contentDescription = null, tint = Color(0xFFEF4444)) },
+                                        selected = false,
+                                        onClick = {
+                                            viewModel.logOutDevice()
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            unselectedIconColor = Color(0xFFEF4444),
+                                            unselectedTextColor = Color(0xFFEF4444)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
                                         modifier = Modifier.padding(vertical = 4.dp)
@@ -653,6 +692,40 @@ class MainActivity : ComponentActivity() {
                                         ),
                                         shape = RoundedCornerShape(12.dp)
                                     )
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Lock to Staff Mode", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Lock, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = false,
+                                        onClick = {
+                                            viewModel.lockToStaffRole()
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            unselectedIconColor = Color(0xFFF59E0B),
+                                            unselectedTextColor = Color(0xFFF59E0B)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Log Out / Switch Operator", fontWeight = FontWeight.Medium) },
+                                        icon = { Icon(imageVector = Icons.Default.Logout, contentDescription = null, tint = Color(0xFFEF4444)) },
+                                        selected = false,
+                                        onClick = {
+                                            viewModel.logOutDevice()
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            unselectedIconColor = Color(0xFFEF4444),
+                                            unselectedTextColor = Color(0xFFEF4444)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
                                 }
                             }
                         }
@@ -754,6 +827,36 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.6f)
                                         ),
                                         modifier = Modifier.testTag("tab_orders")
+                                    )
+
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.CHECKLIST,
+                                        onClick = { viewModel.selectTab(FiltrTab.CHECKLIST) },
+                                        icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check List") },
+                                        label = { Text("Check List", fontWeight = FontWeight.Bold) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color(0xFF10B981),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_checklist")
+                                    )
+
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.DASHBOARD,
+                                        onClick = { viewModel.selectTab(FiltrTab.DASHBOARD) },
+                                        icon = { Icon(imageVector = Icons.Default.Analytics, contentDescription = "Dashboard") },
+                                        label = { Text("Dashboard", fontWeight = FontWeight.Bold) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_dashboard")
                                     )
                                 }
                             }
@@ -1161,15 +1264,28 @@ class MainActivity : ComponentActivity() {
 
                             if (!uiState.isForceUpdate && uiState.deviceAccessStatus != "ACTIVE") {
                                 DeviceAccessGateDialog(
-                                    isStaffApp = isStaffMode,
                                     accessStatus = uiState.deviceAccessStatus,
                                     savedOperatorName = uiState.operatorName,
                                     deviceModel = viewModel.currentDeviceModel,
                                     errorMessage = uiState.accessGateError,
                                     isVerifying = uiState.isVerifyingAccess,
+                                    isStaffApp = isStaffMode,
                                     onVerify = { name, passcode -> viewModel.verifyDeviceAccess(name, passcode) },
                                     onRefreshStatus = { viewModel.refreshDeviceAccessStatus() },
                                     onExitApp = { (context as? android.app.Activity)?.finishAffinity() }
+                                )
+                            }
+
+                            if (showAdminUnlockDialog) {
+                                AdminUnlockDialog(
+                                    onDismiss = { showAdminUnlockDialog = false },
+                                    onUnlock = { passcode ->
+                                        val success = viewModel.elevateToAdmin(passcode)
+                                        if (success) {
+                                            showAdminUnlockDialog = false
+                                        }
+                                        success
+                                    }
                                 )
                             }
 

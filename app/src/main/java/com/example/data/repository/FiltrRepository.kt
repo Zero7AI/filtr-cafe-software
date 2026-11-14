@@ -34,6 +34,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -57,6 +59,8 @@ class FiltrRepository(
     companion object {
         private const val TAG = "FiltrRepository"
     }
+
+    private val orderIdMutex = Mutex()
 
     val allMenuItems: Flow<List<MenuItemEntity>> = menuDao.getAllMenuItems()
     val availableMenuItems: Flow<List<MenuItemEntity>> = menuDao.getAvailableMenuItems()
@@ -208,7 +212,7 @@ class FiltrRepository(
                                         localOrder.order.isMade != remoteOrder.order.isMade ||
                                         localOrder.order.paymentMode != remoteOrder.order.paymentMode
 
-                                if (statusDiffers) {
+                                if (localOrder.order.syncStatus != "PENDING" && statusDiffers) {
                                     orderDao.updateOrder(
                                         localOrder.order.copy(
                                             isPaid = remoteOrder.order.isPaid,
@@ -742,7 +746,7 @@ class FiltrRepository(
     // ==================== ORDER ID GENERATION ====================
 
     // Generate sequential nomenclature order ID e.g. FLT-20260804-1017, FLT-20260804-1018
-    suspend fun generateOrderId(webhookUrl: String = ""): String {
+    suspend fun generateOrderId(webhookUrl: String = ""): String = orderIdMutex.withLock {
         val datePart = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
         val calendar = java.util.Calendar.getInstance().apply {
             set(java.util.Calendar.HOUR_OF_DAY, 0)
@@ -793,7 +797,7 @@ class FiltrRepository(
                         }
                     }
 
-                    return candidateId
+                    return@withLock candidateId
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Supabase sequence generation failed, falling back: ${e.message}")
@@ -823,7 +827,7 @@ class FiltrRepository(
                         }
                     }
 
-                    return candidateId
+                    return@withLock candidateId
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Firestore sequence generation failed, falling back: ${e.message}")
@@ -863,7 +867,7 @@ class FiltrRepository(
             candidateId = "FLT-$datePart-$nextSequence"
         }
 
-        return candidateId
+        return@withLock candidateId
     }
 
     // ==================== ORDER CREATION & LIFECYCLE ====================
@@ -910,20 +914,32 @@ class FiltrRepository(
         // Get the order back with generated item IDs
         val savedOrder = orderDao.getOrderById(orderId) ?: OrderWithItems(orderEntity, itemEntities)
 
-        // Push to Firestore in background (non-blocking)
+        // Push to remote in background (non-blocking)
         if (supabaseService.isInitialized) {
             try {
-                supabaseService.saveOrder(savedOrder)
-                orderDao.updateSyncStatus(orderId, "SYNCED")
+                val res = supabaseService.saveOrder(savedOrder)
+                if (res.isSuccess) {
+                    orderDao.updateSyncStatus(orderId, "SYNCED")
+                } else {
+                    orderDao.updateSyncStatus(orderId, "FAILED")
+                    Log.w(TAG, "Failed to sync new order to Supabase: ${res.exceptionOrNull()?.message}")
+                }
             } catch (e: Exception) {
+                orderDao.updateSyncStatus(orderId, "FAILED")
                 Log.w(TAG, "Failed to sync new order to Supabase: ${e.message}")
             }
         }
         if (firestoreService.isInitialized) {
             try {
-                firestoreService.saveOrder(savedOrder)
-                orderDao.updateSyncStatus(orderId, "SYNCED")
+                val res = firestoreService.saveOrder(savedOrder)
+                if (res.isSuccess) {
+                    orderDao.updateSyncStatus(orderId, "SYNCED")
+                } else {
+                    orderDao.updateSyncStatus(orderId, "FAILED")
+                    Log.w(TAG, "Failed to sync new order to Firestore: ${res.exceptionOrNull()?.message}")
+                }
             } catch (e: Exception) {
+                orderDao.updateSyncStatus(orderId, "FAILED")
                 Log.w(TAG, "Failed to sync new order to Firestore: ${e.message}")
             }
         }

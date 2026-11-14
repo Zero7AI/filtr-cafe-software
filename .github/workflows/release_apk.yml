@@ -27,23 +27,21 @@ jobs:
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Build Debug APKs (Billing & Staff)
-        run: ./gradlew assembleBillingDebug assembleStaffDebug --no-daemon
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon
 
-      - name: Rename APKs
+      - name: Rename APK
         run: |
-          cp app/build/outputs/apk/billing/debug/app-billing-debug.apk filtr-billing-${{ github.ref_name }}.apk
-          cp app/build/outputs/apk/staff/debug/app-staff-debug.apk filtr-staff-${{ github.ref_name }}.apk
+          cp app/build/outputs/apk/debug/app-debug.apk filtr-billing-${{ github.ref_name }}.apk
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "FILTR Billing & Staff ${{ github.ref_name }}"
+          name: "FILTR Billing ${{ github.ref_name }}"
           draft: false
           prerelease: false
           generate_release_notes: true
           files: |
             filtr-billing-${{ github.ref_name }}.apk
-            filtr-staff-${{ github.ref_name }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

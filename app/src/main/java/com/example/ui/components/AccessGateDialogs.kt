@@ -75,12 +75,12 @@ import java.util.Locale
 
 @Composable
 fun DeviceAccessGateDialog(
-    isStaffApp: Boolean,
     accessStatus: String, // "UNVERIFIED", "PENDING", "REVOKED"
     savedOperatorName: String,
     deviceModel: String,
     errorMessage: String,
     isVerifying: Boolean,
+    isStaffApp: Boolean = false,
     onVerify: (operatorName: String, passcode: String) -> Unit,
     onRefreshStatus: () -> Unit,
     onExitApp: () -> Unit
@@ -133,8 +133,7 @@ fun DeviceAccessGateDialog(
                 text = when {
                     isRevoked -> "Access Revoked ⚠️"
                     isPending -> "Approval Pending"
-                    isStaffApp -> "FILTR Staff Activation"
-                    else -> "FILTR Admin Verification"
+                    else -> "FILTR Device Access"
                 },
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,
@@ -152,7 +151,7 @@ fun DeviceAccessGateDialog(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "Device: $deviceModel (${if (isStaffApp) "Staff App" else "Admin Billing"})",
+                        text = "Device: $deviceModel",
                         fontSize = 11.sp,
                         color = ShadcnMutedText,
                         fontWeight = FontWeight.Medium,
@@ -163,7 +162,7 @@ fun DeviceAccessGateDialog(
                 when {
                     isRevoked -> {
                         Text(
-                            text = "This device's access has been revoked by the Store Owner. Please contact the owner or switch to the authorized Staff app.",
+                            text = "This device's access has been revoked by the Store Owner. Please contact the owner or re-verify with valid credentials.",
                             fontSize = 13.sp,
                             color = Color(0xFFDC2626)
                         )
@@ -177,10 +176,7 @@ fun DeviceAccessGateDialog(
                     }
                     else -> {
                         Text(
-                            text = if (isStaffApp)
-                                "Enter your name and store staff passcode once to link this phone."
-                            else
-                                "Enter your name and Admin passcode to register and unlock this device.",
+                            text = "Enter your Operator Name and Passcode (Staff PIN or Admin Passcode) to activate this device.",
                             fontSize = 12.sp,
                             color = ShadcnMutedText
                         )
@@ -188,8 +184,8 @@ fun DeviceAccessGateDialog(
                         OutlinedTextField(
                             value = operatorName,
                             onValueChange = { operatorName = it },
-                            label = { Text("Your Name / Counter Label") },
-                            placeholder = { Text(if (isStaffApp) "e.g. Counter 1" else "e.g. Somesh") },
+                            label = { Text("Operator Name / Counter Label") },
+                            placeholder = { Text("e.g. Counter 1 or Somesh") },
                             leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
@@ -198,7 +194,7 @@ fun DeviceAccessGateDialog(
                         OutlinedTextField(
                             value = passcode,
                             onValueChange = { passcode = it },
-                            label = { Text(if (isStaffApp) "Store Staff Passcode" else "Admin Passcode") },
+                            label = { Text("Passcode (Staff PIN or Admin Code)") },
                             leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
                             trailingIcon = {
                                 IconButton(onClick = { showPasscode = !showPasscode }) {
@@ -260,6 +256,110 @@ fun DeviceAccessGateDialog(
         dismissButton = {
             TextButton(onClick = onExitApp) {
                 Text("Exit App", color = Color.Gray)
+            }
+        },
+        containerColor = ShadcnWhite,
+        shape = RoundedCornerShape(18.dp)
+    )
+}
+
+@Composable
+fun AdminUnlockDialog(
+    onDismiss: () -> Unit,
+    onUnlock: (adminPasscode: String) -> Boolean
+) {
+    var passcode by remember { mutableStateOf("") }
+    var showPasscode by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFFF4F4F5)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.AdminPanelSettings,
+                    contentDescription = null,
+                    tint = ShadcnBlack,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+        },
+        title = {
+            Text(
+                text = "Switch to Admin Mode",
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp,
+                color = ShadcnBlack
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Enter the Admin Passcode to unlock administrative features (Full Drawer, Billing Settings, Menu & Stock Controls, Device Approvals).",
+                    fontSize = 12.sp,
+                    color = ShadcnMutedText
+                )
+
+                OutlinedTextField(
+                    value = passcode,
+                    onValueChange = {
+                        passcode = it
+                        errorMessage = ""
+                    },
+                    label = { Text("Admin Passcode") },
+                    leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
+                    trailingIcon = {
+                        IconButton(onClick = { showPasscode = !showPasscode }) {
+                            Icon(
+                                imageVector = if (showPasscode) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = "Toggle passcode visibility"
+                            )
+                        }
+                    },
+                    visualTransformation = if (showPasscode) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                if (errorMessage.isNotBlank()) {
+                    Text(
+                        text = errorMessage,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFFDC2626)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (onUnlock(passcode.trim())) {
+                        onDismiss()
+                    } else {
+                        errorMessage = "Incorrect Admin Passcode"
+                    }
+                },
+                enabled = passcode.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(containerColor = ShadcnBlack, contentColor = ShadcnWhite),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text("Unlock Admin", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = Color.Gray)
             }
         },
         containerColor = ShadcnWhite,
@@ -390,7 +490,7 @@ fun ActiveDevicesDialog(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(devices, key = { it.registryKey }) { dev ->
-                                val isCurrent = dev.deviceId == currentDeviceId && dev.appRole == "ADMIN"
+                                val isCurrent = dev.deviceId == currentDeviceId
                                 DeviceRowCard(
                                     device = dev,
                                     isCurrentDevice = isCurrent,

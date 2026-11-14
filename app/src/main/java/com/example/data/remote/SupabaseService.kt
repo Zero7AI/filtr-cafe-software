@@ -1519,9 +1519,12 @@ class SupabaseService private constructor() {
     private fun parseDeviceRegistration(key: String, rawValue: String): DeviceRegistration? {
         return try {
             val json = JSONObject(rawValue)
+            val devId = json.optString("device_id", "").ifBlank {
+                key.removePrefix("device_reg_").substringAfterLast("_")
+            }
             DeviceRegistration(
                 registryKey = key,
-                deviceId = json.optString("device_id", ""),
+                deviceId = devId,
                 appRole = json.optString("app_role", "STAFF"),
                 operatorName = json.optString("operator_name", "Unknown Device"),
                 deviceModel = json.optString("device_model", "Android"),
@@ -1570,9 +1573,10 @@ class SupabaseService private constructor() {
         passcodeEpoch: Int
     ): DeviceRegistration? = withContext(Dispatchers.IO) {
         if (!_isInitialized) initialize()
-        val key = "device_reg_${appRole.lowercase()}_$deviceId"
+        val key = "device_reg_$deviceId"
         return@withContext try {
             val existingRaw = fetchSyncMetadata(key)
+                ?: fetchSyncMetadata("device_reg_${appRole.lowercase()}_$deviceId")
             val existing = if (!existingRaw.isNullOrBlank()) parseDeviceRegistration(key, existingRaw) else null
 
             // Remote REVOKED always overrides local session; PENDING stays PENDING unless locally approved or remote ACTIVE
@@ -1619,14 +1623,20 @@ class SupabaseService private constructor() {
             response?.close()
             if (bodyStr.isNullOrBlank()) return@withContext emptyList()
             val arr = JSONArray(bodyStr)
-            val devices = mutableListOf<DeviceRegistration>()
+            val deviceMap = mutableMapOf<String, DeviceRegistration>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 val key = obj.optString("key", "")
                 val value = obj.optString("value", "")
-                parseDeviceRegistration(key, value)?.let { devices.add(it) }
+                parseDeviceRegistration(key, value)?.let { reg ->
+                    val dedupId = reg.deviceId.ifBlank { key }
+                    val current = deviceMap[dedupId]
+                    if (current == null || reg.lastSeenMs > current.lastSeenMs) {
+                        deviceMap[dedupId] = reg
+                    }
+                }
             }
-            devices.sortedByDescending { it.lastSeenMs }
+            deviceMap.values.sortedByDescending { it.lastSeenMs }
         } catch (e: Exception) {
             Log.w(TAG, "fetchAllRegisteredDevices failed: ${e.message}")
             emptyList()

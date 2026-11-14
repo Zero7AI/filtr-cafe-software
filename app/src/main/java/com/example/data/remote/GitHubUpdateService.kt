@@ -170,14 +170,14 @@ class GitHubUpdateService private constructor() {
             val releaseNotes = releaseJson.optString("body", "No release notes provided.").trim()
             val publishedAt = releaseJson.optString("published_at", "")
 
-            // Find APK asset matching this flavor (filtr-staff vs filtr-billing)
+            // Find single unified APK asset (matching "filtr-billing-*.apk" or "filtr-*.apk")
             val assetsArray = releaseJson.optJSONArray("assets")
             var apkDownloadUrl = ""
             var apkFileName = ""
             var apkSizeBytes = 0L
-            var fallbackBillingUrl = ""
-            var fallbackBillingName = ""
-            var fallbackBillingSize = 0L
+            var fallbackApkUrl = ""
+            var fallbackApkName = ""
+            var fallbackApkSize = 0L
             var fallbackBrowserUrl = ""
 
             if (assetsArray != null) {
@@ -194,34 +194,40 @@ class GitHubUpdateService private constructor() {
                         browserUrl
                     }
 
-                    val isStaffAsset = name.contains("staff", ignoreCase = true)
-                    val isBillingAsset = name.contains("billing", ignoreCase = true)
+                    val isBillingAsset = name.contains("filtr-billing", ignoreCase = true)
+                    val isFiltrAsset = name.startsWith("filtr-", ignoreCase = true)
 
-                    if ((isStaffApp && isStaffAsset) || (!isStaffApp && isBillingAsset)) {
+                    // Best match: "filtr-billing-*.apk"
+                    if (isBillingAsset) {
                         apkFileName = name
                         apkSizeBytes = size
                         apkDownloadUrl = downloadTarget
                         fallbackBrowserUrl = browserUrl
                         break
-                    } else if (!isStaffApp && fallbackBillingUrl.isBlank()) {
-                        fallbackBillingName = name
-                        fallbackBillingSize = size
-                        fallbackBillingUrl = downloadTarget
+                    } else if (isFiltrAsset && apkDownloadUrl.isBlank()) {
+                        // Good match: "filtr-*.apk"
+                        apkFileName = name
+                        apkSizeBytes = size
+                        apkDownloadUrl = downloadTarget
+                        fallbackBrowserUrl = browserUrl
+                    } else if (fallbackApkUrl.isBlank()) {
+                        fallbackApkName = name
+                        fallbackApkSize = size
+                        fallbackApkUrl = downloadTarget
                         if (fallbackBrowserUrl.isBlank()) fallbackBrowserUrl = browserUrl
                     }
                 }
             }
 
-            if (apkDownloadUrl.isBlank() && !isStaffApp) {
-                apkDownloadUrl = fallbackBillingUrl
-                apkFileName = fallbackBillingName
-                apkSizeBytes = fallbackBillingSize
+            if (apkDownloadUrl.isBlank() && fallbackApkUrl.isNotBlank()) {
+                apkDownloadUrl = fallbackApkUrl
+                apkFileName = fallbackApkName
+                apkSizeBytes = fallbackApkSize
             }
 
             if (apkDownloadUrl.isBlank()) {
-                val expectedType = if (isStaffApp) "Staff APK (filtr-staff-*.apk)" else ".apk"
                 return@withContext Result.failure(
-                    Exception("Release $tagName exists on GitHub, but no matching $expectedType asset was uploaded to it.")
+                    Exception("Release $tagName exists on GitHub, but no matching unified APK (filtr-billing-*.apk or filtr-*.apk) was uploaded to it.")
                 )
             }
 
@@ -259,17 +265,12 @@ class GitHubUpdateService private constructor() {
         cleanOwner: String,
         cleanRepo: String,
         policy: SupabaseService.AppUpdatePolicy,
-        isStaffApp: Boolean
+        isStaffApp: Boolean = false
     ): AppUpdateInfo {
-        val prefix = if (isStaffApp) "filtr-staff" else "filtr-billing"
-        val fileName = "${prefix}-v${policy.minVersionName}.apk"
+        val fileName = "filtr-billing-v${policy.minVersionName}.apk"
         val fallbackUrl = when {
-            isStaffApp && policy.apkDownloadUrl.contains("filtr-billing", ignoreCase = true) ->
-                policy.apkDownloadUrl.replace("filtr-billing", "filtr-staff", ignoreCase = true)
-            !isStaffApp && policy.apkDownloadUrl.isNotBlank() ->
-                policy.apkDownloadUrl
-            else ->
-                "https://github.com/$cleanOwner/$cleanRepo/releases/download/v${policy.minVersionName}/$fileName"
+            policy.apkDownloadUrl.isNotBlank() -> policy.apkDownloadUrl
+            else -> "https://github.com/$cleanOwner/$cleanRepo/releases/download/v${policy.minVersionName}/$fileName"
         }
         lastResolvedFallbackUrl = fallbackUrl
         return AppUpdateInfo(
@@ -278,7 +279,7 @@ class GitHubUpdateService private constructor() {
             releaseNotes = policy.message,
             apkDownloadUrl = fallbackUrl,
             apkFileName = fileName,
-            apkSizeBytes = if (isStaffApp) 0L else policy.apkSizeBytes,
+            apkSizeBytes = policy.apkSizeBytes,
             isUpdateAvailable = true,
             isForceUpdate = true,
             forceUpdateMessage = policy.message,
