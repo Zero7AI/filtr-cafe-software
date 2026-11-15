@@ -287,13 +287,19 @@ class SupabaseService private constructor() {
     }
 
     fun listenToOrders(): Flow<List<OrderWithItems>> = flow {
+        var cycle = 0
         while (true) {
             if (isInitialized) {
                 try {
-                    // Sync active recent orders (last 7 days, up to 300 orders) sorted newest-first to ensure live cross-device sync
-                    val syncWindowMs = System.currentTimeMillis() - (7L * 24 * 60 * 60 * 1000)
+                    cycle++
+                    // Fast active sync: poll recent orders (last 48h, up to 120 orders) every 1.5s for near-instant multi-device sync.
+                    // Every 15 cycles (~22s), expand to full 7-day window to reconcile older historical records.
+                    val isFullReconcile = cycle % 15 == 0
+                    val days = if (isFullReconcile) 7L else 2L
+                    val limit = if (isFullReconcile) 300 else 120
+                    val syncWindowMs = System.currentTimeMillis() - (days * 24 * 60 * 60 * 1000)
                     val req = Request.Builder()
-                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=300")
+                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=$limit")
                         .addHeader("apikey", SERVICE_ROLE_KEY)
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
@@ -312,7 +318,7 @@ class SupabaseService private constructor() {
                     Log.e(TAG, "listenToOrders error: ${e.message}")
                 }
             }
-            delay(4_000) // 4 seconds for responsive multi-device sync
+            delay(1_500) // 1.5 seconds for instant multi-device order delivery
         }
     }.flowOn(Dispatchers.IO)
 

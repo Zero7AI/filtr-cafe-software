@@ -717,14 +717,16 @@ fun OrderCard(
                             fontSize = 18.sp,
                             color = if (!order.isPaid) Color(0xFFDC2626) else Color(0xFF09090B)
                         )
+                    }
 
-                        IconButton(
-                            onClick = onEditOrder,
-                            modifier = Modifier.testTag("edit_order_button_${order.orderId}")
-                        ) {
-                            Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit Order", tint = Color(0xFF09090B))
-                        }
+                    IconButton(
+                        onClick = onEditOrder,
+                        modifier = Modifier.testTag("edit_order_button_${order.orderId}")
+                    ) {
+                        Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit Order", tint = Color(0xFF09090B))
+                    }
 
+                    if (!isStaffMode) {
                         IconButton(
                             onClick = onDeleteOrder,
                             modifier = Modifier.testTag("delete_order_button_${order.orderId}")
