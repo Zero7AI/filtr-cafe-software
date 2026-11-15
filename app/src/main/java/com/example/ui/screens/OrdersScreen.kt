@@ -710,14 +710,12 @@ fun OrderCard(
                         }
                     }
 
-                    if (!isStaffMode) {
-                        Text(
-                            text = "₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
-                            fontWeight = FontWeight.Black,
-                            fontSize = 18.sp,
-                            color = if (!order.isPaid) Color(0xFFDC2626) else Color(0xFF09090B)
-                        )
-                    }
+                    Text(
+                        text = "₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
+                        fontWeight = FontWeight.Black,
+                        fontSize = 18.sp,
+                        color = if (!order.isPaid) Color(0xFFDC2626) else Color(0xFF09090B)
+                    )
 
                     IconButton(
                         onClick = onEditOrder,

@@ -501,12 +501,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Automatic periodic Cloud & Google Sheets Sync Loop (Attempts sync of any pending unsynced orders every 2 minutes)
+        // Automatic periodic Cloud & Google Sheets Sync Loop (Runs every 60 seconds)
         viewModelScope.launch(Dispatchers.IO) {
-            var loopCount = 0
             while (true) {
-                kotlinx.coroutines.delay(120 * 1000L) // 2 minute background safety sync
-                loopCount++
+                kotlinx.coroutines.delay(60 * 1000L) // 1 minute background check across all devices
                 try {
                     repository.syncPendingOrdersToSupabase()
                 } catch (e: Exception) {
@@ -525,12 +523,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
-                // Check for mandatory updates and device access status every 4 minutes in background
-                if (loopCount % 2 == 0) {
-                    syncDeviceAccessHeartbeat()
-                    withContext(Dispatchers.Main) {
-                        checkForAppUpdates(isManualCheck = false)
-                    }
+                // Check for updates and sync heartbeat every minute on every installed device
+                syncDeviceAccessHeartbeat()
+                withContext(Dispatchers.Main) {
+                    checkForAppUpdates(isManualCheck = false)
                 }
             }
         }
@@ -2554,7 +2550,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             forceUpdateMessage = updateInfo.forceUpdateMessage
                         )
                     }
+                    try {
+                        com.example.util.AppUpdateNotificationHelper.showUpdateNotification(getApplication(), updateInfo)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to post system update notification: ${e.message}")
+                    }
                 } else {
+                    try {
+                        com.example.util.AppUpdateNotificationHelper.cancelUpdateNotification(getApplication())
+                    } catch (_: Exception) {}
                     _uiState.update { 
                         it.copy(
                             appUpdateStatus = AppUpdateStatus.Idle,

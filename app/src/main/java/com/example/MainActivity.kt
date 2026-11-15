@@ -2,6 +2,7 @@ package com.example
 
 import android.os.Bundle
 import android.os.Build
+import android.content.Intent
 import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.ComponentActivity
@@ -142,8 +143,13 @@ class MainActivity : ComponentActivity() {
         printerService = com.example.data.remote.ThermalPrinterService(this)
         printerService.register()
 
-        // Initialize inventory alert notification channel
+        // Initialize notification channels
         InventoryNotificationHelper.initChannel(this)
+        com.example.util.AppUpdateNotificationHelper.initChannel(this)
+
+        if (intent?.getBooleanExtra("EXTRA_OPEN_UPDATE_DIALOG", false) == true) {
+            viewModel.showMandatoryUpdateDialog()
+        }
 
         setContent {
             FiltrTheme {
@@ -1466,6 +1472,14 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         viewModel.onActivityResumed()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra("EXTRA_OPEN_UPDATE_DIALOG", false)) {
+            viewModel.showMandatoryUpdateDialog()
+        }
     }
 
     override fun onDestroy() {
