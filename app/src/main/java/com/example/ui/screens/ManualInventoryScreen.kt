@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import java.util.Locale
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -10,6 +11,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -17,8 +19,10 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -26,17 +30,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.entity.InventoryItemEntity
 import com.example.ui.BillingUiState
 import com.example.ui.theme.CoffeeBrownPrimary
 import com.example.ui.theme.CoffeeOnPrimary
+import com.example.util.InventoryReportGenerator
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -47,16 +58,18 @@ fun ManualInventoryScreen(
     onAddNewInventoryItem: (name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var searchQuery by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("ALL") }
     var staffClosingNotes by remember { mutableStateOf("") }
     var showAddDialog by remember { mutableStateOf(false) }
+    var showSavedListDialog by remember { mutableStateOf(false) }
     var isSaving by remember { mutableStateOf(false) }
 
     // Map of itemId to counted stock
     val stockCounts = remember { mutableStateMapOf<Int, Double>() }
 
-    // Initialize or update stock counts from inventoryItems if not already set by user
+    // Initialize stock counts from inventoryItems
     LaunchedEffect(inventoryItems) {
         inventoryItems.forEach { item ->
             if (!stockCounts.containsKey(item.id)) {
@@ -99,7 +112,7 @@ fun ManualInventoryScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = if (isCompactScreen) 4.dp else 8.dp)
-                .padding(bottom = if (isCompactScreen) 130.dp else 145.dp)
+                .padding(bottom = if (isCompactScreen) 160.dp else 175.dp)
                 .pointerInput(categories, selectedCategory) {
                     detectHorizontalDragGestures(
                         onDragStart = { totalDragX = 0f },
@@ -120,28 +133,66 @@ fun ManualInventoryScreen(
                     )
                 }
         ) {
-            // Header with Title and Add Inventory Button in Top Right
+            // Header: Left (Saved List) | Center (Title) | Right (Add Item)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = if (isCompactScreen) 10.dp else 14.dp, vertical = 4.dp),
+                    .padding(horizontal = if (isCompactScreen) 8.dp else 12.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
-                    Text(
-                        text = "📦 Inventories Manual",
-                        fontWeight = FontWeight.Black,
-                        fontSize = if (isCompactScreen) 17.sp else 19.sp,
-                        color = Color(0xFF09090B)
+                // LEFT BUTTON: View Saved List & Share
+                OutlinedButton(
+                    onClick = { showSavedListDialog = true },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color(0xFF09090B)
+                    ),
+                    border = BorderStroke(1.5.dp, Color(0xFF09090B)),
+                    contentPadding = PaddingValues(horizontal = if (isCompactScreen) 8.dp else 10.dp, vertical = 6.dp),
+                    modifier = Modifier.testTag("view_saved_inventory_list_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.FormatListBulleted,
+                        contentDescription = "Saved Inventories",
+                        tint = Color(0xFF09090B),
+                        modifier = Modifier.size(15.dp)
                     )
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "Count closing stock & log notes before closing",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color(0xFF71717A)
+                        text = if (isCompactScreen) "Saved" else "Saved List",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        color = Color(0xFF09090B)
                     )
                 }
 
+                // CENTER: Screen Title (responsive with weight so buttons never get squished)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 4.dp)
+                ) {
+                    Text(
+                        text = "📦 Inventories Manual",
+                        fontWeight = FontWeight.Black,
+                        fontSize = if (isCompactScreen) 14.sp else 16.sp,
+                        color = Color(0xFF09090B),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "Physical Stock & Closing Remarks",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontSize = 9.sp,
+                        color = Color(0xFF71717A),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                // RIGHT BUTTON: Add Inventory Item
                 Button(
                     onClick = { showAddDialog = true },
                     colors = ButtonDefaults.buttonColors(
@@ -149,18 +200,18 @@ fun ManualInventoryScreen(
                         contentColor = Color.White
                     ),
                     shape = RoundedCornerShape(12.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = if (isCompactScreen) 8.dp else 10.dp, vertical = 6.dp),
                     modifier = Modifier.testTag("add_inventory_button")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Add,
                         contentDescription = "Add Inventory",
                         tint = Color.White,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(15.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
                     Text(
-                        text = "Add Inventory",
+                        text = if (isCompactScreen) "Add" else "Add Item",
                         fontWeight = FontWeight.Bold,
                         fontSize = 12.sp
                     )
@@ -169,7 +220,7 @@ fun ManualInventoryScreen(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Search Bar (identical styling to New Order)
+            // Search Bar
             Column(modifier = Modifier.padding(horizontal = if (isCompactScreen) 10.dp else 12.dp)) {
                 OutlinedTextField(
                     value = searchQuery,
@@ -200,7 +251,7 @@ fun ManualInventoryScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Category Chips (identical styling to New Order)
+                // Category Chips
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     contentPadding = PaddingValues(horizontal = 4.dp)
@@ -224,7 +275,7 @@ fun ManualInventoryScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             // Inventory Items Grid
             if (filteredItems.isEmpty()) {
@@ -288,7 +339,7 @@ fun ManualInventoryScreen(
             }
         }
 
-        // Sticky Bottom Closing Notes & Submit Bar (matching New Order sticky bar style)
+        // Sticky Bottom Closing Notes & Submit Bar (Properly formatted and fully visible on all devices)
         Surface(
             color = Color(0xFF09090B),
             shape = RoundedCornerShape(16.dp),
@@ -297,52 +348,86 @@ fun ManualInventoryScreen(
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .padding(if (isCompactScreen) 8.dp else 12.dp)
+                .imePadding()
                 .testTag("manual_inventory_bottom_bar")
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(if (isCompactScreen) 10.dp else 14.dp)
+                    .padding(if (isCompactScreen) 10.dp else 12.dp)
             ) {
-                // Staff Closing Notes Input Field
-                OutlinedTextField(
-                    value = staffClosingNotes,
-                    onValueChange = { staffClosingNotes = it },
-                    placeholder = {
-                        Text(
-                            "📝 Staff Remarks / Store Closing Notes (e.g. Milk low, 2 syrups expiring soon)",
-                            color = Color.Gray,
-                            fontSize = 11.sp
-                        )
-                    },
-                    singleLine = true,
-                    textStyle = androidx.compose.ui.text.TextStyle(
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium
-                    ),
+                // Responsive Multi-line Staff Remarks Card (Never clips text on any device density)
+                Surface(
+                    color = Color(0xFF18181B),
                     shape = RoundedCornerShape(10.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedContainerColor = Color(0xFF18181B),
-                        unfocusedContainerColor = Color(0xFF18181B),
-                        focusedBorderColor = Color.White.copy(alpha = 0.5f),
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.25f)
-                    ),
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f)),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(50.dp)
                         .padding(bottom = 8.dp)
-                        .testTag("staff_closing_notes_input")
-                )
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("📝", fontSize = 12.sp)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Staff Closing Remarks / Notes",
+                                color = Color(0xFFF59E0B),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        BasicTextField(
+                            value = staffClosingNotes,
+                            onValueChange = { staffClosingNotes = it },
+                            textStyle = TextStyle(
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                lineHeight = 18.sp
+                            ),
+                            cursorBrush = SolidColor(Color.White),
+                            minLines = 2,
+                            maxLines = 4,
+                            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 36.dp, max = 80.dp)
+                                .testTag("staff_closing_notes_input"),
+                            decorationBox = { innerTextField ->
+                                Box(
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    if (staffClosingNotes.isEmpty()) {
+                                        Text(
+                                            text = "Type closing remarks (e.g. 4 milk packets left, need more for morning; vanilla syrup low)...",
+                                            color = Color(0xFFA1A1AA),
+                                            fontSize = 12.sp,
+                                            lineHeight = 17.sp
+                                        )
+                                    }
+                                    innerTextField()
+                                }
+                            }
+                        )
+                    }
+                }
 
+                // Bottom Action Buttons & Summary
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(
+                        modifier = Modifier
+                            .clickable { showSavedListDialog = true }
+                            .padding(2.dp)
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Surface(
                                 color = Color.White,
@@ -352,59 +437,103 @@ fun ManualInventoryScreen(
                                     text = "${inventoryItems.size}",
                                     color = Color(0xFF09090B),
                                     fontWeight = FontWeight.Black,
-                                    fontSize = 12.sp,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                                 )
                             }
-                            Spacer(modifier = Modifier.width(8.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Total Inventory Items",
+                                text = "Items Counted",
                                 style = MaterialTheme.typography.bodySmall,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
                                 color = Color.White.copy(alpha = 0.8f)
                             )
                         }
                         Text(
-                            text = "Daily Closing Audit",
+                            text = "Daily Closing Audit 📋",
                             fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
+                            fontSize = 13.sp,
                             color = Color(0xFFF59E0B)
                         )
                     }
 
-                    Button(
-                        onClick = {
-                            isSaving = true
-                            onSaveClosingInventory(stockCounts.toMap(), staffClosingNotes)
-                            isSaving = false
-                        },
-                        enabled = !isSaving,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.White,
-                            contentColor = Color(0xFF09090B),
-                            disabledContainerColor = Color.White.copy(alpha = 0.6f),
-                            disabledContentColor = Color(0xFF09090B).copy(alpha = 0.6f)
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.testTag("save_closing_inventory_button")
-                    ) {
-                        if (isSaving) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                color = Color(0xFF09090B),
-                                strokeWidth = 2.dp
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(text = "Saving...", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        } else {
-                            Icon(
-                                imageVector = Icons.Default.Save,
-                                contentDescription = null,
-                                tint = Color(0xFF09090B),
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(text = "Save Closing Stock", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // Quick WhatsApp Share Button
+                        Button(
+                            onClick = {
+                                try {
+                                    val pdfFile = InventoryReportGenerator.generateInventoryPdf(
+                                        context = context,
+                                        items = inventoryItems,
+                                        stockCounts = stockCounts.toMap(),
+                                        staffNotes = staffClosingNotes,
+                                        operatorName = state.operatorName.ifBlank { "Staff" }
+                                    )
+                                    val caption = InventoryReportGenerator.generateInventoryText(
+                                        items = inventoryItems,
+                                        stockCounts = stockCounts.toMap(),
+                                        staffNotes = staffClosingNotes,
+                                        operatorName = state.operatorName.ifBlank { "Staff" }
+                                    )
+                                    InventoryReportGenerator.shareViaWhatsApp(
+                                        context = context,
+                                        file = pdfFile,
+                                        mimeType = "application/pdf",
+                                        caption = caption
+                                    )
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF25D366), // WhatsApp Green
+                                contentColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.testTag("whatsapp_share_quick_button")
+                        ) {
+                            Text("💬", fontSize = 14.sp)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(text = "WhatsApp", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+
+                        // Save Closing Stock Button
+                        Button(
+                            onClick = {
+                                isSaving = true
+                                onSaveClosingInventory(stockCounts.toMap(), staffClosingNotes)
+                                isSaving = false
+                            },
+                            enabled = !isSaving,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.White,
+                                contentColor = Color(0xFF09090B),
+                                disabledContainerColor = Color.White.copy(alpha = 0.6f),
+                                disabledContentColor = Color(0xFF09090B).copy(alpha = 0.6f)
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            modifier = Modifier.testTag("save_closing_inventory_button")
+                        ) {
+                            if (isSaving) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    color = Color(0xFF09090B),
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(text = "Saving...", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Save,
+                                    contentDescription = null,
+                                    tint = Color(0xFF09090B),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(text = "Save Stock", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
                         }
                     }
                 }
@@ -465,6 +594,17 @@ fun ManualInventoryScreen(
                     onAddNewInventoryItem(name, category, unit, defaultPrice, packSize)
                     showAddDialog = false
                 }
+            )
+        }
+
+        // Saved Inventories List Dialog with WhatsApp PDF and Image sharing
+        if (showSavedListDialog) {
+            SavedInventoriesListDialog(
+                inventoryItems = inventoryItems,
+                stockCounts = stockCounts.toMap(),
+                staffNotes = staffClosingNotes,
+                operatorName = state.operatorName.ifBlank { "Staff" },
+                onDismiss = { showSavedListDialog = false }
             )
         }
     }
@@ -538,7 +678,7 @@ fun ManualInventoryItemCard(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Stepper in -, + format (matching MenuItemCard in New Order)
+            // Stepper in -, + format
             if (count > 0.0) {
                 Row(
                     modifier = Modifier
@@ -609,6 +749,280 @@ fun ManualInventoryItemCard(
     }
 }
 
+/**
+ * Clean List Format Dialog showing currently saved inventories, with WhatsApp PDF and Image sharing options.
+ */
+@Composable
+fun SavedInventoriesListDialog(
+    inventoryItems: List<InventoryItemEntity>,
+    stockCounts: Map<Int, Double>,
+    staffNotes: String,
+    operatorName: String,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    var listSearchQuery by remember { mutableStateOf("") }
+
+    val activeItems = remember(inventoryItems) { inventoryItems.filter { it.isActive } }
+    val filteredList = remember(activeItems, listSearchQuery) {
+        if (listSearchQuery.isBlank()) activeItems
+        else activeItems.filter {
+            it.name.contains(listSearchQuery, ignoreCase = true) ||
+            it.category.contains(listSearchQuery, ignoreCase = true)
+        }
+    }
+
+    val grouped = remember(filteredList) {
+        filteredList.groupBy { it.category.trim().uppercase().ifBlank { "GENERAL" } }.toSortedMap()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "📋 Saved Inventories List",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 17.sp,
+                        color = Color(0xFF09090B)
+                    )
+                    Text(
+                        text = "${activeItems.size} items registered in system",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF71717A)
+                    )
+                }
+
+                Surface(
+                    color = Color(0xFF09090B),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = "${activeItems.size} Total",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 440.dp)
+            ) {
+                // Search filter within the list
+                OutlinedTextField(
+                    value = listSearchQuery,
+                    onValueChange = { listSearchQuery = it },
+                    placeholder = { Text("Filter items in list...", fontSize = 12.sp) },
+                    leadingIcon = { Icon(imageVector = Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    textStyle = TextStyle(fontSize = 13.sp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color(0xFFFAFAFA),
+                        unfocusedContainerColor = Color(0xFFFAFAFA)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                )
+
+                // Staff closing note preview if present
+                if (staffNotes.isNotBlank()) {
+                    Surface(
+                        color = Color(0xFFFEF3C7),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, Color(0xFFFDE68A)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("📝", fontSize = 12.sp)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Closing Notes: $staffNotes",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF78350F),
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+
+                // Grouped List of Items
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    grouped.forEach { (category, itemsInCat) ->
+                        item {
+                            Surface(
+                                color = Color(0xFFF4F4F5),
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 4.dp, bottom = 2.dp)
+                            ) {
+                                Text(
+                                    text = category,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFB45309),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+
+                        items(itemsInCat, key = { it.id }) { item ->
+                            val count = stockCounts[item.id] ?: item.currentStock.coerceAtLeast(0.0)
+                            val countStr = if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.1f", count)} ${item.unit}"
+
+                            Surface(
+                                color = Color.White,
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, Color(0xFFE4E4E7)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = item.name,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                            color = Color(0xFF09090B)
+                                        )
+                                        Text(
+                                            text = if (item.standardQuantity > 0) "Pack size: ${item.standardQuantity} ${item.unit}" else item.unit,
+                                            fontSize = 10.sp,
+                                            color = Color(0xFF71717A)
+                                        )
+                                    }
+
+                                    Surface(
+                                        color = if (count > 0.0) Color(0xFF09090B) else Color(0xFFFEE2E2),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Text(
+                                            text = countStr,
+                                            color = if (count > 0.0) Color.White else Color(0xFFDC2626),
+                                            fontWeight = FontWeight.Black,
+                                            fontSize = 12.sp,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Share PDF via WhatsApp
+                Button(
+                    onClick = {
+                        try {
+                            val pdfFile = InventoryReportGenerator.generateInventoryPdf(
+                                context = context,
+                                items = activeItems,
+                                stockCounts = stockCounts,
+                                staffNotes = staffNotes,
+                                operatorName = operatorName
+                            )
+                            val caption = InventoryReportGenerator.generateInventoryText(
+                                items = activeItems,
+                                stockCounts = stockCounts,
+                                staffNotes = staffNotes,
+                                operatorName = operatorName
+                            )
+                            InventoryReportGenerator.shareViaWhatsApp(
+                                context = context,
+                                file = pdfFile,
+                                mimeType = "application/pdf",
+                                caption = caption
+                            )
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "PDF share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                ) {
+                    Text("📄", fontSize = 12.sp)
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text("Share PDF", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                }
+
+                // Share Image via WhatsApp
+                Button(
+                    onClick = {
+                        try {
+                            val imageFile = InventoryReportGenerator.generateInventoryImage(
+                                context = context,
+                                items = activeItems,
+                                stockCounts = stockCounts,
+                                staffNotes = staffNotes,
+                                operatorName = operatorName
+                            )
+                            val caption = InventoryReportGenerator.generateInventoryText(
+                                items = activeItems,
+                                stockCounts = stockCounts,
+                                staffNotes = staffNotes,
+                                operatorName = operatorName
+                            )
+                            InventoryReportGenerator.shareViaWhatsApp(
+                                context = context,
+                                file = imageFile,
+                                mimeType = "image/png",
+                                caption = caption
+                            )
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "Image share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366)),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                ) {
+                    Text("💬", fontSize = 12.sp)
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text("Share Image", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close", color = Color.Gray, fontWeight = FontWeight.Bold)
+            }
+        },
+        shape = RoundedCornerShape(16.dp)
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddInventoryDialog(
@@ -621,8 +1035,6 @@ fun AddInventoryDialog(
     var unit by remember { mutableStateOf("kg") }
     var packSize by remember { mutableStateOf("1.0") }
     var initialStock by remember { mutableStateOf("0.0") }
-
-    val commonUnits = listOf("kg", "L", "pcs", "pack", "g", "ml", "box")
 
     AlertDialog(
         onDismissRequest = onDismiss,
