@@ -17,10 +17,12 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
 import androidx.compose.material.icons.filled.*
@@ -56,6 +58,7 @@ fun ManualInventoryScreen(
     inventoryItems: List<InventoryItemEntity>,
     onSaveClosingInventory: (stockMap: Map<Int, Double>, staffNotes: String) -> Unit,
     onAddNewInventoryItem: (name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double) -> Unit,
+    onUpdateInventoryItem: (updatedItem: InventoryItemEntity) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -64,6 +67,7 @@ fun ManualInventoryScreen(
     var staffClosingNotes by remember { mutableStateOf("") }
     var showAddDialog by remember { mutableStateOf(false) }
     var showSavedListDialog by remember { mutableStateOf(false) }
+    var itemToEdit by remember { mutableStateOf<InventoryItemEntity?>(null) }
     var isSaving by remember { mutableStateOf(false) }
 
     // Map of itemId to counted stock
@@ -332,6 +336,9 @@ fun ManualInventoryScreen(
                             onTapCount = {
                                 itemForCustomInput = item
                                 customInputValue = if (currentCount % 1.0 == 0.0) currentCount.toInt().toString() else currentCount.toString()
+                            },
+                            onEditItem = {
+                                itemToEdit = item
                             }
                         )
                     }
@@ -604,7 +611,28 @@ fun ManualInventoryScreen(
                 stockCounts = stockCounts.toMap(),
                 staffNotes = staffClosingNotes,
                 operatorName = state.operatorName.ifBlank { "Staff" },
-                onDismiss = { showSavedListDialog = false }
+                onDismiss = { showSavedListDialog = false },
+                onEditItem = { item ->
+                    showSavedListDialog = false
+                    itemToEdit = item
+                }
+            )
+        }
+
+        // Edit Existing Inventory Item Dialog
+        itemToEdit?.let { item ->
+            val currentCount = stockCounts[item.id] ?: item.currentStock.coerceAtLeast(0.0)
+            EditInventoryDialog(
+                item = item,
+                categories = dynamicCategories,
+                currentStockCount = currentCount,
+                onDismiss = { itemToEdit = null },
+                onSave = { updatedItem, newCount ->
+                    onUpdateInventoryItem(updatedItem)
+                    stockCounts[updatedItem.id] = newCount
+                    itemToEdit = null
+                    Toast.makeText(context, "Updated ${updatedItem.name} (${updatedItem.unit})", Toast.LENGTH_SHORT).show()
+                }
             )
         }
     }
@@ -616,9 +644,11 @@ fun ManualInventoryItemCard(
     count: Double,
     onIncrement: () -> Unit,
     onDecrement: () -> Unit,
-    onTapCount: () -> Unit
+    onTapCount: () -> Unit,
+    onEditItem: () -> Unit
 ) {
     val formattedCount = if (count % 1.0 == 0.0) count.toInt().toString() else String.format(Locale.US, "%.1f", count)
+    val isPackUnit = item.unit.lowercase() in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
 
     Card(
         shape = RoundedCornerShape(16.dp),
@@ -651,17 +681,39 @@ fun ManualInventoryItemCard(
                         fontWeight = FontWeight.Bold,
                         color = Color(0xFF71717A)
                     )
-                    Surface(
-                        color = Color(0xFFE4E4E7),
-                        shape = RoundedCornerShape(6.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Text(
-                            text = item.unit.ifBlank { "unit" },
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFF18181B),
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
+                        Surface(
+                            color = Color(0xFFE4E4E7),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = item.unit.ifBlank { "unit" },
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF18181B),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                        // Quick Edit Icon
+                        Surface(
+                            color = Color(0xFFF4F4F5),
+                            shape = CircleShape,
+                            modifier = Modifier
+                                .size(24.dp)
+                                .clickable { onEditItem() }
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Edit,
+                                    contentDescription = "Edit ${item.name}",
+                                    tint = Color(0xFF71717A),
+                                    modifier = Modifier.size(13.dp)
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -674,9 +726,21 @@ fun ManualInventoryItemCard(
                     color = Color(0xFF09090B),
                     maxLines = 2
                 )
+
+                // Subtitle for pack items: e.g. 1 packet = 210g
+                if (isPackUnit && item.standardQuantity > 1.0) {
+                    val packGrams = if (item.standardQuantity % 1.0 == 0.0) "${item.standardQuantity.toInt()}" else String.format(Locale.US, "%.1f", item.standardQuantity)
+                    Text(
+                        text = "1 ${item.unit} = ${packGrams}g",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFFD97706),
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             // Stepper in -, + format
             if (count > 0.0) {
@@ -700,15 +764,28 @@ fun ManualInventoryItemCard(
                         )
                     }
 
-                    Text(
-                        text = "$formattedCount ${item.unit}",
-                        color = Color.White,
-                        fontWeight = FontWeight.Black,
-                        fontSize = 13.sp,
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
                             .clickable { onTapCount() }
-                            .padding(horizontal = 4.dp)
-                    )
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "$formattedCount ${item.unit}",
+                            color = Color.White,
+                            fontWeight = FontWeight.Black,
+                            fontSize = 13.sp
+                        )
+                        if (isPackUnit && item.standardQuantity > 1.0) {
+                            val totalGrams = (count * item.standardQuantity).toInt()
+                            Text(
+                                text = "≈ ${totalGrams}g",
+                                color = Color(0xFFFDE68A),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
 
                     IconButton(
                         onClick = onIncrement,
@@ -739,10 +816,14 @@ fun ManualInventoryItemCard(
                         imageVector = Icons.Default.Add,
                         contentDescription = null,
                         tint = Color.White,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(14.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text(text = "COUNT", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = if (isPackUnit) "COUNT PACKETS" else "COUNT",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
         }
@@ -758,7 +839,8 @@ fun SavedInventoriesListDialog(
     stockCounts: Map<Int, Double>,
     staffNotes: String,
     operatorName: String,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onEditItem: (InventoryItemEntity) -> Unit
 ) {
     val context = LocalContext.current
     var listSearchQuery by remember { mutableStateOf("") }
@@ -888,7 +970,21 @@ fun SavedInventoriesListDialog(
 
                         items(itemsInCat, key = { it.id }) { item ->
                             val count = stockCounts[item.id] ?: item.currentStock.coerceAtLeast(0.0)
-                            val countStr = if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.1f", count)} ${item.unit}"
+                            val isPack = item.unit.lowercase() in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
+                            val countStr = if (isPack && item.standardQuantity > 1.0 && count > 0.0) {
+                                val totalGrams = (count * item.standardQuantity).toInt()
+                                if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit} (≈${totalGrams}g)" else "${String.format(Locale.US, "%.1f", count)} ${item.unit} (≈${totalGrams}g)"
+                            } else {
+                                if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.1f", count)} ${item.unit}"
+                            }
+
+                            val packInfo = if (isPack && item.standardQuantity > 1.0) {
+                                "1 ${item.unit} = ${item.standardQuantity.toInt()}g"
+                            } else if (item.standardQuantity > 0) {
+                                "Pack size: ${item.standardQuantity} ${item.unit}"
+                            } else {
+                                item.unit
+                            }
 
                             Surface(
                                 color = Color.White,
@@ -911,23 +1007,40 @@ fun SavedInventoriesListDialog(
                                             color = Color(0xFF09090B)
                                         )
                                         Text(
-                                            text = if (item.standardQuantity > 0) "Pack size: ${item.standardQuantity} ${item.unit}" else item.unit,
+                                            text = packInfo,
                                             fontSize = 10.sp,
                                             color = Color(0xFF71717A)
                                         )
                                     }
 
-                                    Surface(
-                                        color = if (count > 0.0) Color(0xFF09090B) else Color(0xFFFEE2E2),
-                                        shape = RoundedCornerShape(6.dp)
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
-                                        Text(
-                                            text = countStr,
-                                            color = if (count > 0.0) Color.White else Color(0xFFDC2626),
-                                            fontWeight = FontWeight.Black,
-                                            fontSize = 12.sp,
-                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                        )
+                                        Surface(
+                                            color = if (count > 0.0) Color(0xFF09090B) else Color(0xFFFEE2E2),
+                                            shape = RoundedCornerShape(6.dp)
+                                        ) {
+                                            Text(
+                                                text = countStr,
+                                                color = if (count > 0.0) Color.White else Color(0xFFDC2626),
+                                                fontWeight = FontWeight.Black,
+                                                fontSize = 11.sp,
+                                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                                            )
+                                        }
+
+                                        IconButton(
+                                            onClick = { onEditItem(item) },
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Edit,
+                                                contentDescription = "Edit ${item.name}",
+                                                tint = Color(0xFF71717A),
+                                                modifier = Modifier.size(15.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -1120,6 +1233,222 @@ fun AddInventoryDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("Cancel", color = Color.Gray)
+            }
+        },
+        shape = RoundedCornerShape(16.dp)
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun EditInventoryDialog(
+    item: InventoryItemEntity,
+    categories: List<String>,
+    currentStockCount: Double,
+    onDismiss: () -> Unit,
+    onSave: (updatedItem: InventoryItemEntity, newCount: Double) -> Unit
+) {
+    var name by remember { mutableStateOf(item.name) }
+    var category by remember { mutableStateOf(item.category.ifBlank { "Dairy" }) }
+    var unit by remember { mutableStateOf(item.unit) }
+    var packSize by remember { mutableStateOf(if (item.standardQuantity % 1.0 == 0.0) item.standardQuantity.toInt().toString() else item.standardQuantity.toString()) }
+    var defaultPrice by remember { mutableStateOf(if (item.defaultPrice % 1.0 == 0.0) item.defaultPrice.toInt().toString() else item.defaultPrice.toString()) }
+    var stockCountInput by remember { mutableStateOf(if (currentStockCount % 1.0 == 0.0) currentStockCount.toInt().toString() else currentStockCount.toString()) }
+
+    val commonUnits = listOf("packet", "pack", "can", "tin", "kg", "L", "g", "ml", "pcs", "box")
+    val defaultCategories = listOf("Dairy", "Coffee", "Syrups", "Bakery", "Packaging", "Beverages", "General")
+    val allCategories = (listOf(category) + categories + defaultCategories).filter { it.isNotBlank() }.distinct()
+
+    val isPackUnit = unit.lowercase() in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("✏️", fontSize = 18.sp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text("Edit Inventory Item", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFF09090B))
+                    Text("Adjust unit, pack size or manual count", style = MaterialTheme.typography.labelSmall, color = Color.Gray, fontSize = 10.sp)
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                // Item Name
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Item Name", fontSize = 12.sp) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color(0xFFFAFAFA)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                )
+
+                // Category Selection Chips
+                Text("Category", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Color(0xFF71717A))
+                Spacer(modifier = Modifier.height(4.dp))
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(bottom = 8.dp)
+                ) {
+                    items(allCategories) { cat ->
+                        val isSelected = category.equals(cat, ignoreCase = true)
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = { category = cat },
+                            label = { Text(cat, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFF09090B),
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                    }
+                }
+
+                // Tracking Unit Chips
+                Text("Tracking Unit", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Color(0xFF71717A))
+                Spacer(modifier = Modifier.height(4.dp))
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(bottom = 6.dp)
+                ) {
+                    items(commonUnits) { u ->
+                        val isSelected = unit.equals(u, ignoreCase = true)
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = { unit = u },
+                            label = { Text(u, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFFD97706),
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                    }
+                }
+
+                // If pack unit selected (e.g. packet/pack/can/tin), show helpful packet mode banner
+                if (isPackUnit) {
+                    Surface(
+                        color = Color(0xFFFEF3C7),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, Color(0xFFFDE68A)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("📦", fontSize = 12.sp)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    "Packet Mode Active",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFB45309)
+                                )
+                            }
+                            Text(
+                                "Staff will count in packets (1, 2, 3...). Enter the net content in grams per packet below (e.g. 210g for Condensed Milk).",
+                                fontSize = 10.sp,
+                                color = Color(0xFF78350F),
+                                lineHeight = 13.sp,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Standard Pack Size
+                OutlinedTextField(
+                    value = packSize,
+                    onValueChange = { packSize = it },
+                    label = { Text(if (isPackUnit) "Net Content per Packet (e.g. 210 for 210g)" else "Standard Pack Size", fontSize = 12.sp) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color(0xFFFAFAFA)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                )
+
+                // Cost / Price per Pack
+                OutlinedTextField(
+                    value = defaultPrice,
+                    onValueChange = { defaultPrice = it },
+                    label = { Text("Default Cost / Price per ${unit.ifBlank { "packet" }} (₹)", fontSize = 12.sp) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color(0xFFFAFAFA)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                )
+
+                // Current Physical Stock Count
+                OutlinedTextField(
+                    value = stockCountInput,
+                    onValueChange = { stockCountInput = it },
+                    label = { Text("Current Count / Stock (${unit.ifBlank { "packet" }})", fontSize = 12.sp) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color(0xFFFAFAFA)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 4.dp)
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (name.isNotBlank()) {
+                        val parsedPrice = defaultPrice.toDoubleOrNull() ?: 0.0
+                        val parsedPackSize = (packSize.toDoubleOrNull() ?: 1.0).coerceAtLeast(0.01)
+                        val parsedStock = (stockCountInput.toDoubleOrNull() ?: currentStockCount).coerceAtLeast(0.0)
+                        val updatedItem = item.copy(
+                            name = name.trim(),
+                            category = category.trim().ifBlank { "General" },
+                            unit = unit.trim().ifBlank { "packet" },
+                            defaultPrice = parsedPrice,
+                            standardQuantity = parsedPackSize
+                        )
+                        onSave(updatedItem, parsedStock)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF09090B)),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(imageVector = Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Save Changes", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = Color.Gray, fontWeight = FontWeight.Bold)
             }
         },
         shape = RoundedCornerShape(16.dp)

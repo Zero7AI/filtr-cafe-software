@@ -163,12 +163,25 @@ object InventoryReportGenerator {
                 }
 
                 val count = stockCounts[item.id] ?: item.currentStock.coerceAtLeast(0.0)
-                val countStr = if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.2f", count)} ${item.unit}"
-                val packInfo = if (item.standardQuantity > 0) "${item.standardQuantity} ${item.unit}" else item.unit
+                val isPack = item.unit.lowercase() in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
+                val packInfo = if (isPack && item.standardQuantity > 1.0) {
+                    "${item.standardQuantity.toInt()}g / ${item.unit}"
+                } else if (item.standardQuantity > 0) {
+                    "${item.standardQuantity} ${item.unit}"
+                } else {
+                    item.unit
+                }
+                val countStr = if (isPack && item.standardQuantity > 1.0 && count > 0.0) {
+                    val totalGrams = (count * item.standardQuantity).toInt()
+                    val cnt = if (count % 1.0 == 0.0) "${count.toInt()}" else String.format(Locale.US, "%.1f", count)
+                    "$cnt ${item.unit} (${totalGrams}g)"
+                } else {
+                    if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.2f", count)} ${item.unit}"
+                }
 
-                canvas.drawText(item.name.take(36), margin + 8f, y, textPaint)
-                canvas.drawText(packInfo, margin + 280f, y, subtitlePaint)
-                canvas.drawText(countStr, margin + 400f, y, boldTextPaint)
+                canvas.drawText(item.name.take(34), margin + 8f, y, textPaint)
+                canvas.drawText(packInfo, margin + 260f, y, subtitlePaint)
+                canvas.drawText(countStr, margin + 380f, y, boldTextPaint)
                 y += 15f
             }
             y += 8f
@@ -306,10 +319,17 @@ object InventoryReportGenerator {
 
             for (item in catItems) {
                 val count = stockCounts[item.id] ?: item.currentStock.coerceAtLeast(0.0)
-                val countStr = if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.2f", count)} ${item.unit}"
+                val isPack = item.unit.lowercase() in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
+                val countStr = if (isPack && item.standardQuantity > 1.0 && count > 0.0) {
+                    val totalGrams = (count * item.standardQuantity).toInt()
+                    val cnt = if (count % 1.0 == 0.0) "${count.toInt()}" else String.format(Locale.US, "%.1f", count)
+                    "$cnt ${item.unit} (${totalGrams}g)"
+                } else {
+                    if (count % 1.0 == 0.0) "${count.toInt()} ${item.unit}" else "${String.format(Locale.US, "%.1f", count)} ${item.unit}"
+                }
 
-                canvas.drawText(item.name.take(30), margin + 12f, y + 16f, textPaint)
-                canvas.drawText(countStr, margin + contentWidth - 140f, y + 16f, boldTextPaint)
+                canvas.drawText(item.name.take(28), margin + 12f, y + 16f, textPaint)
+                canvas.drawText(countStr, margin + contentWidth - 170f, y + 16f, boldTextPaint)
                 y += 32f
                 canvas.drawLine(margin + 8f, y, margin + contentWidth - 8f, y, linePaint)
                 y += 6f
@@ -355,8 +375,16 @@ object InventoryReportGenerator {
             sb.append("\n🔹 *${category}*\n")
             for (item in catItems) {
                 val count = stockCounts[item.id] ?: item.currentStock.coerceAtLeast(0.0)
-                val countStr = if (count % 1.0 == 0.0) "${count.toInt()}" else String.format(Locale.US, "%.1f", count)
-                sb.append("• ${item.name}: *${countStr} ${item.unit}*\n")
+                val isPack = item.unit.lowercase() in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
+                val countStr = if (isPack && item.standardQuantity > 1.0 && count > 0.0) {
+                    val totalGrams = (count * item.standardQuantity).toInt()
+                    val cnt = if (count % 1.0 == 0.0) "${count.toInt()}" else String.format(Locale.US, "%.1f", count)
+                    "${cnt} ${item.unit} (≈${totalGrams}g)"
+                } else {
+                    val cnt = if (count % 1.0 == 0.0) "${count.toInt()}" else String.format(Locale.US, "%.1f", count)
+                    "${cnt} ${item.unit}"
+                }
+                sb.append("• ${item.name}: *${countStr}*\n")
             }
         }
         sb.append("\n────────────────────\n")

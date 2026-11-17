@@ -2270,6 +2270,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun updateInventoryItem(item: InventoryItemEntity) {
+        viewModelScope.launch {
+            repository.updateInventoryItem(item)
+            _uiState.update { it.copy(snackbarMessage = "\"${item.name}\" updated successfully") }
+        }
+    }
+
     fun deleteInventoryItem(item: InventoryItemEntity) {
         viewModelScope.launch {
             repository.deleteInventoryItem(item)

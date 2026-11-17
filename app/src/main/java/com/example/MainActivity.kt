@@ -1131,6 +1131,9 @@ class MainActivity : ComponentActivity() {
                                         },
                                         onAddNewInventoryItem = { name, category, unit, price, packSize ->
                                             viewModel.saveInventoryItem(name, category, unit, price, packSize)
+                                        },
+                                        onUpdateInventoryItem = { item ->
+                                            viewModel.updateInventoryItem(item)
                                         }
                                     )
                                 }

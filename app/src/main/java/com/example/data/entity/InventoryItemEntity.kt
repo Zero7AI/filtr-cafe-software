@@ -23,13 +23,16 @@ fun calculatePacksAndCost(
 ): Pair<Double, Double> {
     val u1 = consumedUnit.trim().lowercase()
     val u2 = item.unit.trim().lowercase()
+    val isPackUnit = u2 in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle", "pcs")
 
     val normalizedQtyInItemUnit = when {
         u1 == u2 -> quantity
         u1 == "g" && (u2 == "kg" || u2 == "kilogram" || u2 == "kgs") -> quantity / 1000.0
         (u1 == "kg" || u1 == "kgs") && u2 == "g" -> quantity * 1000.0
+        (u1 == "kg" || u1 == "kgs") && isPackUnit && item.standardQuantity > 10.0 -> quantity * 1000.0
         u1 == "ml" && (u2 == "l" || u2 == "liter" || u2 == "liters" || u2 == "litre" || u2 == "litres") -> quantity / 1000.0
         (u1 == "l" || u1 == "liter" || u1 == "litres") && u2 == "ml" -> quantity * 1000.0
+        (u1 == "l" || u1 == "liter" || u1 == "litres") && isPackUnit && item.standardQuantity > 10.0 -> quantity * 1000.0
         else -> quantity
     }
 
