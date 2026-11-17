@@ -64,7 +64,8 @@ enum class FiltrTab {
     RECEIPT_DESIGN,
     PROFIT_LOSS,
     VOICE_ORDER,
-    CHECKLIST
+    CHECKLIST,
+    MANUAL_INVENTORY
 }
 
 data class ChecklistItemUiModel(
@@ -1144,13 +1145,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         orderWithItems: OrderWithItems,
         updatedItems: List<OrderItemEntity>,
         customerName: String,
-        contactNumber: String
+        contactNumber: String,
+        notes: String = orderWithItems.order.notes
     ) {
         viewModelScope.launch {
             val url = _uiState.value.googleSheetsWebhookUrl
             val updatedOrderEntity = orderWithItems.order.copy(
                 customerName = customerName.trim().ifBlank { "Walk-in Customer" },
-                contactNumber = contactNumber.trim()
+                contactNumber = contactNumber.trim(),
+                notes = notes.trim()
             )
             val updatedOrder = OrderWithItems(updatedOrderEntity, orderWithItems.items)
             repository.updateOrderWithItems(updatedOrder, updatedItems, url)
@@ -2271,6 +2274,81 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.deleteInventoryItem(item)
             _uiState.update { it.copy(snackbarMessage = "\"${item.name}\" removed from inventory master") }
+        }
+    }
+
+    fun saveClosingInventoryAudit(
+        stockMap: Map<Int, Double>,
+        staffNotes: String,
+        onComplete: (Boolean) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            try {
+                // Update Room DB current stock for items
+                for ((itemId, stock) in stockMap) {
+                    repository.updateStock(itemId, stock)
+                }
+
+                // Format a daily closing log
+                val sdf = SimpleDateFormat("yyyyMMdd", Locale.US)
+                val timeSdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                val todayStr = sdf.format(Date())
+                val nowStr = timeSdf.format(Date())
+                val deviceName = _uiState.value.operatorName.ifBlank { currentDeviceModel.ifBlank { "Staff Terminal" } }
+
+                val auditObj = JSONObject().apply {
+                    put("date", todayStr)
+                    put("timestamp", nowStr)
+                    put("device", deviceName)
+                    put("role", _uiState.value.currentRole)
+                    put("notes", staffNotes.trim())
+                    val itemsArr = JSONArray()
+                    val allItems = inventoryItems.value
+                    for ((itemId, stock) in stockMap) {
+                        val itm = allItems.find { it.id == itemId }
+                        if (itm != null) {
+                            itemsArr.put(JSONObject().apply {
+                                put("id", itemId)
+                                put("name", itm.name)
+                                put("category", itm.category)
+                                put("unit", itm.unit)
+                                put("closingStock", stock)
+                            })
+                        }
+                    }
+                    put("items", itemsArr)
+                }
+
+                val auditJson = auditObj.toString()
+
+                // Save locally to SharedPreferences for quick recall
+                prefs.edit()
+                    .putString("last_closing_inventory_notes", staffNotes.trim())
+                    .putString("last_closing_inventory_date", todayStr)
+                    .putString("closing_inventory_$todayStr", auditJson)
+                    .apply()
+
+                // Sync to Supabase sync_metadata so admin can see staff closing notes from anywhere
+                try {
+                    SupabaseService.getInstance().saveSyncMetadata(
+                        "closing_inventory_$todayStr",
+                        auditJson
+                    )
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Remote closing audit sync failed: ${e.message}")
+                }
+
+                _uiState.update {
+                    it.copy(snackbarMessage = "Closing inventory & staff notes saved successfully!")
+                }
+                onComplete(true)
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Save closing inventory failed", e)
+                _uiState.update {
+                    it.copy(snackbarMessage = "Failed to save closing inventory: ${e.message}")
+                }
+                onComplete(false)
+            }
         }
     }
 

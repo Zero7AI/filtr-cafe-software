@@ -265,6 +265,16 @@ fun OrderReceiptDialog(
                         }
                     }
 
+                    if (order.notes.isNotBlank()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(text = "Notes:", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = Color(0xFF92400E))
+                            Text(text = order.notes, style = MaterialTheme.typography.bodySmall, color = Color(0xFF78350F))
+                        }
+                    }
+
                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color(0xFFE4E4E7))
 
                     Column(

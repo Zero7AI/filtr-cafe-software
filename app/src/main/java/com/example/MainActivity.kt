@@ -114,6 +114,7 @@ import com.example.ui.screens.ChecklistScreen
 import com.example.ui.screens.CustomersScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.InventoriesScreen
+import com.example.ui.screens.ManualInventoryScreen
 import com.example.ui.screens.InventoryOrderScreen
 import com.example.ui.screens.InventoryUsageScreen
 import com.example.ui.screens.MenuMasterScreen
@@ -319,6 +320,25 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.padding(vertical = 4.dp)
                                     )
 
+                                    NavigationDrawerItem(
+                                        label = { Text("Inventories Manual", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = uiState.currentTab == FiltrTab.MANUAL_INVENTORY,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.MANUAL_INVENTORY)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
                                     HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
 
                                     NavigationDrawerItem(
@@ -468,6 +488,25 @@ class MainActivity : ComponentActivity() {
                                             selectedContainerColor = Color(0xFF10B981).copy(alpha = 0.25f),
                                             selectedIconColor = Color(0xFF10B981),
                                             selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Inventories Manual", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = uiState.currentTab == FiltrTab.MANUAL_INVENTORY,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.MANUAL_INVENTORY)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
@@ -889,8 +928,8 @@ class MainActivity : ComponentActivity() {
                                             viewModel.toggleOrderItemCompletedStatus(orderId, itemId, currentCompletedQty, targetUnitIndex, totalQty)
                                         },
                                         onUpdateOrderItems = { order, items -> viewModel.updateOrderItems(order, items) },
-                                        onUpdateOrderWithCustomerDetails = { order, items, name, contact ->
-                                            viewModel.updateOrderWithCustomerDetails(order, items, name, contact)
+                                        onUpdateOrderWithCustomerDetails = { order, items, name, contact, notes ->
+                                            viewModel.updateOrderWithCustomerDetails(order, items, name, contact, notes)
                                         },
                                         onSyncOrder = { viewModel.syncOrderToSheets(it) },
                                         onDeleteOrder = { viewModel.requestDeleteOrder(it) },
@@ -1080,6 +1119,19 @@ class MainActivity : ComponentActivity() {
                                         onDismissAddDialog = { viewModel.dismissAddChecklistTaskDialog() },
                                         onAddTask = { title, section, notes -> viewModel.addChecklistTask(title, section, notes) },
                                         onDeleteTask = { viewModel.deleteChecklistTask(it) }
+                                    )
+                                }
+                                FiltrTab.MANUAL_INVENTORY -> {
+                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                    ManualInventoryScreen(
+                                        state = uiState,
+                                        inventoryItems = inventoryItemsList,
+                                        onSaveClosingInventory = { stockMap, staffNotes ->
+                                            viewModel.saveClosingInventoryAudit(stockMap, staffNotes)
+                                        },
+                                        onAddNewInventoryItem = { name, category, unit, price, packSize ->
+                                            viewModel.saveInventoryItem(name, category, unit, price, packSize)
+                                        }
                                     )
                                 }
                             }

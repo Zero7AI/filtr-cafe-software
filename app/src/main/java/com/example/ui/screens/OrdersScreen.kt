@@ -93,7 +93,7 @@ fun OrdersScreen(
     onToggleDelivered: (OrderWithItems) -> Unit,
     onToggleItemCompleted: (orderId: String, itemId: Int, currentCompletedQty: Int, targetUnitIndex: Int, totalQty: Int) -> Unit = { _, _, _, _, _ -> },
     onUpdateOrderItems: (OrderWithItems, List<OrderItemEntity>) -> Unit = { _, _ -> },
-    onUpdateOrderWithCustomerDetails: (OrderWithItems, List<OrderItemEntity>, String, String) -> Unit = { order, items, _, _ -> onUpdateOrderItems(order, items) },
+    onUpdateOrderWithCustomerDetails: (OrderWithItems, List<OrderItemEntity>, String, String, String) -> Unit = { order, items, _, _, _ -> onUpdateOrderItems(order, items) },
     onSyncOrder: (OrderWithItems) -> Unit,
     onDeleteOrder: (String) -> Unit,
     onViewReceipt: (OrderWithItems) -> Unit,
@@ -517,8 +517,8 @@ fun OrdersScreen(
                     onUpdateOrderItems(targetOrder, updatedItems)
                     selectedOrderForEditDialog = null
                 },
-                onSaveWithCustomerDetails = { updatedItems, name, contact ->
-                    onUpdateOrderWithCustomerDetails(targetOrder, updatedItems, name, contact)
+                onSaveWithCustomerDetails = { updatedItems, name, contact, notes ->
+                    onUpdateOrderWithCustomerDetails(targetOrder, updatedItems, name, contact, notes)
                     selectedOrderForEditDialog = null
                 }
             )
@@ -756,6 +756,36 @@ fun OrderCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xFF71717A)
                     )
+                }
+            }
+
+            if (order.notes.isNotBlank()) {
+                Surface(
+                    color = Color(0xFFFEF3C7),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, Color(0xFFFDE68A)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .testTag("order_notes_badge_${order.orderId}")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "📝 Note: ",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF92400E)
+                        )
+                        Text(
+                            text = order.notes,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFF78350F)
+                        )
+                    }
                 }
             }
 
@@ -998,7 +1028,7 @@ fun EditOrderDialog(
     menuItems: List<MenuItemEntity>,
     onDismiss: () -> Unit,
     onSave: (List<OrderItemEntity>) -> Unit,
-    onSaveWithCustomerDetails: (List<OrderItemEntity>, String, String) -> Unit = { items, _, _ -> onSave(items) }
+    onSaveWithCustomerDetails: (List<OrderItemEntity>, String, String, String) -> Unit = { items, _, _, _ -> onSave(items) }
 ) {
     var editableItems by remember(orderWithItems) {
         mutableStateOf(orderWithItems.items.map { it.copy() })
@@ -1008,6 +1038,9 @@ fun EditOrderDialog(
     }
     var editContactNumber by remember(orderWithItems) {
         mutableStateOf(orderWithItems.order.contactNumber)
+    }
+    var editNotes by remember(orderWithItems) {
+        mutableStateOf(orderWithItems.order.notes)
     }
     var searchQuery by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("ALL") }
@@ -1069,6 +1102,17 @@ fun EditOrderDialog(
                         modifier = Modifier.weight(1f).height(52.dp)
                     )
                 }
+
+                OutlinedTextField(
+                    value = editNotes,
+                    onValueChange = { editNotes = it },
+                    label = { Text("Order Notes / Special Requests", fontSize = 10.sp) },
+                    placeholder = { Text("e.g. Less sugar, extra hot", fontSize = 11.sp) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(8.dp),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+                    modifier = Modifier.fillMaxWidth().height(52.dp).padding(bottom = 8.dp)
+                )
 
                 Text(
                     text = "CURRENT ITEMS IN ORDER",
@@ -1310,7 +1354,7 @@ fun EditOrderDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    onSaveWithCustomerDetails(editableItems, editCustomerName, editContactNumber)
+                    onSaveWithCustomerDetails(editableItems, editCustomerName, editContactNumber, editNotes)
                 },
                 enabled = editableItems.isNotEmpty(),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))

@@ -44,6 +44,11 @@ import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.ShoppingCart
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -121,6 +126,7 @@ fun BillingScreen(
 
     val currentCategoryIndex = categories.indexOf(state.selectedCategory).coerceAtLeast(0)
     var totalDragX by remember { mutableFloatStateOf(0f) }
+    var showCartPreviewDialog by remember { mutableStateOf(false) }
 
     Box(modifier = modifier.fillMaxSize().background(Color(0xFFFAFAFA))) {
         Column(
@@ -548,7 +554,13 @@ fun BillingScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { showCartPreviewDialog = true }
+                                .padding(vertical = 2.dp, horizontal = 4.dp)
+                                .testTag("cart_preview_trigger")
+                        ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Surface(
                                     color = Color.White,
@@ -562,12 +574,19 @@ fun BillingScreen(
                                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                                     )
                                 }
-                                Spacer(modifier = Modifier.width(8.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     text = "Items In Order",
                                     style = MaterialTheme.typography.bodySmall,
                                     fontSize = 12.sp,
                                     color = Color.White.copy(alpha = 0.8f)
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Icon(
+                                    imageVector = Icons.Default.KeyboardArrowUp,
+                                    contentDescription = "View Cart",
+                                    tint = Color.White.copy(alpha = 0.7f),
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
                             Text(
@@ -616,7 +635,196 @@ fun BillingScreen(
                 }
             }
         }
+
+        if (showCartPreviewDialog) {
+            CartPreviewDialog(
+                cartItems = state.cartItems,
+                totalAmount = totalAmount,
+                onAdd = onAddToCart,
+                onRemove = onRemoveFromCart,
+                onDismiss = { showCartPreviewDialog = false }
+            )
+        }
     }
+}
+
+@Composable
+fun CartPreviewDialog(
+    cartItems: Map<MenuItemEntity, Int>,
+    totalAmount: Double,
+    onAdd: (MenuItemEntity) -> Unit,
+    onRemove: (MenuItemEntity) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val totalCount = cartItems.values.sum()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "🛒 Punched Order",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 17.sp,
+                    color = Color(0xFF09090B)
+                )
+                Surface(
+                    color = Color(0xFF09090B),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = "$totalCount items",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 380.dp)
+            ) {
+                if (cartItems.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("No items added yet", color = Color.Gray, fontSize = 13.sp)
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(cartItems.entries.toList(), key = { it.key.id }) { (item, qty) ->
+                            Surface(
+                                color = Color(0xFFF4F4F5),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFFE4E4E7)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = item.name,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                            color = Color(0xFF09090B)
+                                        )
+                                        Text(
+                                            text = "₹${String.format(Locale.US, "%.2f", item.price)} each • ${item.category}",
+                                            fontSize = 11.sp,
+                                            color = Color(0xFF71717A)
+                                        )
+                                    }
+
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(16.dp))
+                                            .background(Color(0xFF09090B))
+                                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                                    ) {
+                                        IconButton(
+                                            onClick = { onRemove(item) },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Remove,
+                                                contentDescription = "Decrease",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+
+                                        Text(
+                                            text = "$qty",
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Black,
+                                            fontSize = 12.sp,
+                                            modifier = Modifier.padding(horizontal = 6.dp)
+                                        )
+
+                                        IconButton(
+                                            onClick = { onAdd(item) },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Add,
+                                                contentDescription = "Increase",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.width(8.dp))
+
+                                    Text(
+                                        text = "₹${String.format(Locale.US, "%.2f", item.price * qty)}",
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 14.sp,
+                                        color = Color(0xFF09090B)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    HorizontalDivider(color = Color(0xFFE4E4E7))
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Total Amount:",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = Color(0xFF09090B)
+                        )
+                        Text(
+                            text = "₹${String.format(Locale.US, "%.2f", totalAmount)}",
+                            fontWeight = FontWeight.Black,
+                            fontSize = 18.sp,
+                            color = Color(0xFF09090B)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF09090B)),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text("Close", fontWeight = FontWeight.Bold)
+            }
+        },
+        shape = RoundedCornerShape(16.dp)
+    )
 }
 
 @Composable

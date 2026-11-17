@@ -197,13 +197,28 @@ class SupabaseService private constructor() {
     }
 
     fun listenToOrders(intervalMs: Long = 5_000L): Flow<List<OrderWithItems>> = flow {
+        var cycle = 0
         while (true) {
             if (isInitialized) {
                 try {
-                    // Sync orders from last 3 days
-                    val syncWindowMs = System.currentTimeMillis() - (3L * 24 * 60 * 60 * 1000)
+                    cycle++
+                    // Optimized bandwidth query:
+                    // Frequent cycles (every intervalMs): only fetch today's active/recent orders (~3 KB).
+                    // Every 20 cycles (~100s): run full 24-hour reconciliation to guarantee consistency.
+                    val isFullReconcile = cycle % 20 == 0
+                    val syncWindowMs = if (isFullReconcile) {
+                        System.currentTimeMillis() - (24L * 60 * 60 * 1000)
+                    } else {
+                        // Start of today (midnight)
+                        java.util.Calendar.getInstance().apply {
+                            set(java.util.Calendar.HOUR_OF_DAY, 0)
+                            set(java.util.Calendar.MINUTE, 0)
+                            set(java.util.Calendar.SECOND, 0)
+                            set(java.util.Calendar.MILLISECOND, 0)
+                        }.timeInMillis
+                    }
                     val req = Request.Builder()
-                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc")
+                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=100")
                         .addHeader("apikey", SERVICE_ROLE_KEY)
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
