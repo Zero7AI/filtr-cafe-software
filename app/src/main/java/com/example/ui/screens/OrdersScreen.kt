@@ -724,13 +724,11 @@ fun OrderCard(
                         Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit Order", tint = Color(0xFF09090B))
                     }
 
-                    if (!isStaffMode) {
-                        IconButton(
-                            onClick = onDeleteOrder,
-                            modifier = Modifier.testTag("delete_order_button_${order.orderId}")
-                        ) {
-                            Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFF71717A))
-                        }
+                    IconButton(
+                        onClick = onDeleteOrder,
+                        modifier = Modifier.testTag("delete_order_button_${order.orderId}")
+                    ) {
+                        Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFF71717A))
                     }
                 }
             }

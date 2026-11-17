@@ -1246,7 +1246,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteOrder(orderId: String) {
-        if (_uiState.value.currentRole != "ADMIN") return
         viewModelScope.launch {
             val url = _uiState.value.googleSheetsWebhookUrl
             repository.deleteOrder(orderId, url)
@@ -1727,12 +1726,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestDeleteOrder(orderId: String) {
-        if (_uiState.value.currentRole != "ADMIN") return
         _uiState.update { it.copy(orderToDeleteConfirmation = orderId) }
     }
 
     fun confirmDeleteOrder(orderId: String) {
-        if (_uiState.value.currentRole != "ADMIN") return
         if (_uiState.value.isDeletingOrder) return
         _uiState.update { it.copy(isDeletingOrder = true) }
         viewModelScope.launch {

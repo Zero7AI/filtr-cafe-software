@@ -834,36 +834,6 @@ class MainActivity : ComponentActivity() {
                                         ),
                                         modifier = Modifier.testTag("tab_orders")
                                     )
-
-                                    NavigationBarItem(
-                                        selected = uiState.currentTab == FiltrTab.CHECKLIST,
-                                        onClick = { viewModel.selectTab(FiltrTab.CHECKLIST) },
-                                        icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check List") },
-                                        label = { Text("Check List", fontWeight = FontWeight.Bold) },
-                                        colors = NavigationBarItemDefaults.colors(
-                                            selectedIconColor = Color(0xFF09090B),
-                                            selectedTextColor = Color.White,
-                                            indicatorColor = Color(0xFF10B981),
-                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                        ),
-                                        modifier = Modifier.testTag("tab_checklist")
-                                    )
-
-                                    NavigationBarItem(
-                                        selected = uiState.currentTab == FiltrTab.DASHBOARD,
-                                        onClick = { viewModel.selectTab(FiltrTab.DASHBOARD) },
-                                        icon = { Icon(imageVector = Icons.Default.Analytics, contentDescription = "Dashboard") },
-                                        label = { Text("Dashboard", fontWeight = FontWeight.Bold) },
-                                        colors = NavigationBarItemDefaults.colors(
-                                            selectedIconColor = Color(0xFF09090B),
-                                            selectedTextColor = Color.White,
-                                            indicatorColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                        ),
-                                        modifier = Modifier.testTag("tab_dashboard")
-                                    )
                                 }
                             }
                         },
