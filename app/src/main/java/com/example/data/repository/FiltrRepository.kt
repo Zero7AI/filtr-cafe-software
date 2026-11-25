@@ -2,6 +2,7 @@ package com.example.data.repository
 
 import android.util.Log
 import androidx.room.withTransaction
+import com.example.data.dao.AttendanceDao
 import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
@@ -11,6 +12,7 @@ import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
 import com.example.data.database.FiltrDatabase
+import com.example.data.entity.AttendanceLogEntity
 import com.example.data.entity.ChecklistCompletionEntity
 import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.CustomerEntity
@@ -24,6 +26,9 @@ import com.example.data.entity.InventoryUsageEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryItemEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
+import com.example.domain.attendance.AttendanceCalculator
+import com.example.domain.attendance.GeofenceCheckResult
+import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.kitchen.KitchenInventoryCalculator
 import com.example.domain.kitchen.KitchenShiftType
 import com.example.data.entity.MenuItemEntity
@@ -61,6 +66,7 @@ class FiltrRepository(
     private val fixedCostDao: FixedCostDao? = null,
     private val checklistDao: ChecklistDao? = null,
     private val kitchenInventoryDao: KitchenInventoryDao? = null,
+    private val attendanceDao: AttendanceDao? = null,
     private val sheetsSyncService: GoogleSheetsSyncService = GoogleSheetsSyncService(),
     private val geminiVoiceService: GeminiVoiceOrderService = GeminiVoiceOrderService(),
     private val deepgramVoiceService: DeepgramVoiceService = DeepgramVoiceService.getInstance(),
@@ -79,6 +85,7 @@ class FiltrRepository(
     private val checklistSyncMutex = Mutex()
     private val kitchenInventorySyncMutex = Mutex()
     private val customerSyncMutex = Mutex()
+    private val attendanceSyncMutex = Mutex()
 
     @Volatile
     private var managedScope: CoroutineScope? = externalScope
@@ -123,6 +130,11 @@ class FiltrRepository(
     val allKitchenItems: Flow<List<KitchenInventoryItemEntity>> = kitchenInventoryDao?.getAllItems() ?: flowOf(emptyList())
     val allKitchenShifts: Flow<List<KitchenInventoryShiftEntity>> = kitchenInventoryDao?.getAllShifts() ?: flowOf(emptyList())
     val allKitchenEntries: Flow<List<KitchenInventoryEntryEntity>> = kitchenInventoryDao?.getAllEntries() ?: flowOf(emptyList())
+    val allAttendanceLogs: Flow<List<AttendanceLogEntity>> = attendanceDao?.getAllLogs() ?: flowOf(emptyList())
+
+    fun getAttendanceLogsForMonth(monthKey: String): Flow<List<AttendanceLogEntity>> {
+        return attendanceDao?.getLogsForMonth(monthKey) ?: flowOf(emptyList())
+    }
 
     fun getKitchenShiftsForDate(dateKey: String): Flow<List<KitchenInventoryShiftEntity>> {
         return kitchenInventoryDao?.getShiftsForDate(dateKey) ?: flowOf(emptyList())
@@ -2724,6 +2736,261 @@ class FiltrRepository(
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "reconcileKitchenInventoryFromCloud failed: ${e.message}")
+            }
+        }
+    }
+
+    // ==================== STAFF ATTENDANCE ====================
+
+    private fun validateAttendanceGeofence(
+        userLat: Double,
+        userLng: Double,
+        config: StoreGeofenceConfig
+    ): Result<GeofenceCheckResult> {
+        if (!config.isConfigured) {
+            return Result.failure(
+                IllegalStateException("Store GPS location is not configured. Ask manager to set store location.")
+            )
+        }
+        val check = AttendanceCalculator.evaluateGeofence(userLat, userLng, config)
+        if (!check.isInside) {
+            return Result.failure(
+                IllegalStateException(
+                    "Outside FILTR Coffee geofence (${check.distanceMeters.toInt()}m away, allowed ${config.radiusMeters.toInt()}m)"
+                )
+            )
+        }
+        return Result.success(check)
+    }
+
+    suspend fun recordStaffCheckIn(
+        dateKey: String,
+        monthKey: String,
+        staffName: String,
+        deviceId: String,
+        userLat: Double,
+        userLng: Double,
+        config: StoreGeofenceConfig,
+        nowMs: Long = System.currentTimeMillis()
+    ): Result<AttendanceLogEntity> {
+        val dao = attendanceDao ?: return Result.failure(IllegalStateException("AttendanceDao unavailable"))
+        return try {
+            val check = validateAttendanceGeofence(userLat, userLng, config).getOrElse {
+                return Result.failure(it)
+            }
+            val cleanStaff = staffName.trim().ifBlank { "Staff" }
+            val logId = AttendanceCalculator.buildLogId(dateKey, cleanStaff)
+            val existing = dao.getLogById(logId)
+            if (existing != null && existing.checkInTimestamp > 0L) {
+                return Result.failure(IllegalStateException("Already checked in today"))
+            }
+
+            val entry = AttendanceLogEntity(
+                id = logId,
+                dateKey = dateKey,
+                monthKey = monthKey,
+                staffName = cleanStaff,
+                deviceId = deviceId.trim(),
+                checkInTimestamp = nowMs,
+                checkInLat = userLat,
+                checkInLng = userLng,
+                checkInDistanceMeters = check.distanceMeters,
+                checkOutTimestamp = 0L,
+                checkOutLat = 0.0,
+                checkOutLng = 0.0,
+                checkOutDistanceMeters = 0.0,
+                workedMinutes = 0,
+                notes = "",
+                updatedAt = nowMs
+            )
+            dao.upsertLog(entry)
+            launchManagedSync {
+                attendanceSyncMutex.withLock {
+                    syncAttendanceMonthToCloud(monthKey)
+                }
+            }
+            Result.success(entry)
+        } catch (e: Exception) {
+            Log.e(TAG, "recordStaffCheckIn error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun recordStaffCheckOut(
+        dateKey: String,
+        staffName: String,
+        userLat: Double,
+        userLng: Double,
+        config: StoreGeofenceConfig,
+        nowMs: Long = System.currentTimeMillis()
+    ): Result<AttendanceLogEntity> {
+        val dao = attendanceDao ?: return Result.failure(IllegalStateException("AttendanceDao unavailable"))
+        return try {
+            val check = validateAttendanceGeofence(userLat, userLng, config).getOrElse {
+                return Result.failure(it)
+            }
+            val logId = AttendanceCalculator.buildLogId(dateKey, staffName)
+            val existing = dao.getLogById(logId)
+            if (existing == null || existing.checkInTimestamp <= 0L) {
+                return Result.failure(IllegalStateException("No check-in found for today"))
+            }
+            if (existing.checkOutTimestamp > 0L) {
+                return Result.failure(IllegalStateException("Already checked out today"))
+            }
+
+            val workedMinutes = AttendanceCalculator.calculateWorkedMinutes(existing.checkInTimestamp, nowMs)
+            val updated = existing.copy(
+                checkOutTimestamp = nowMs,
+                checkOutLat = userLat,
+                checkOutLng = userLng,
+                checkOutDistanceMeters = check.distanceMeters,
+                workedMinutes = workedMinutes,
+                updatedAt = nowMs
+            )
+            dao.upsertLog(updated)
+            launchManagedSync {
+                attendanceSyncMutex.withLock {
+                    syncAttendanceMonthToCloud(existing.monthKey)
+                }
+            }
+            Result.success(updated)
+        } catch (e: Exception) {
+            Log.e(TAG, "recordStaffCheckOut error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun saveAttendanceStoreConfig(config: StoreGeofenceConfig): Result<Unit> {
+        return try {
+            val payload = JSONObject().apply {
+                put("latitude", config.latitude)
+                put("longitude", config.longitude)
+                put("radiusMeters", config.radiusMeters)
+                put("storeLabel", config.storeLabel.trim().ifBlank { "FILTR Coffee" })
+                put("updatedAt", if (config.updatedAt > 0L) config.updatedAt else System.currentTimeMillis())
+            }
+            supabaseService.saveAttendanceStoreConfig(payload.toString()).map { Unit }
+        } catch (e: Exception) {
+            Log.w(TAG, "saveAttendanceStoreConfig failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun fetchAttendanceStoreConfig(): StoreGeofenceConfig? {
+        return try {
+            val raw = supabaseService.fetchAttendanceStoreConfig()
+            if (raw.isNullOrBlank() || !raw.startsWith("{")) return null
+            val obj = JSONObject(raw)
+            StoreGeofenceConfig(
+                latitude = obj.optDouble("latitude", 0.0),
+                longitude = obj.optDouble("longitude", 0.0),
+                radiusMeters = obj.optDouble("radiusMeters", 100.0),
+                storeLabel = obj.optNonNullString("storeLabel", "FILTR Coffee").ifBlank { "FILTR Coffee" },
+                updatedAt = obj.optLong("updatedAt", 0L)
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAttendanceStoreConfig failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun attendanceLogToJson(log: AttendanceLogEntity): JSONObject {
+        return JSONObject().apply {
+            put("id", log.id)
+            put("dateKey", log.dateKey)
+            put("monthKey", log.monthKey)
+            put("staffName", log.staffName)
+            put("deviceId", log.deviceId)
+            put("checkInTimestamp", log.checkInTimestamp)
+            put("checkInLat", log.checkInLat)
+            put("checkInLng", log.checkInLng)
+            put("checkInDistanceMeters", log.checkInDistanceMeters)
+            put("checkOutTimestamp", log.checkOutTimestamp)
+            put("checkOutLat", log.checkOutLat)
+            put("checkOutLng", log.checkOutLng)
+            put("checkOutDistanceMeters", log.checkOutDistanceMeters)
+            put("workedMinutes", log.workedMinutes)
+            put("notes", log.notes)
+            put("updatedAt", log.updatedAt)
+        }
+    }
+
+    private fun attendanceLogFromJson(o: JSONObject, fallbackMonthKey: String): AttendanceLogEntity? {
+        val id = o.optNonNullString("id", "")
+        if (id.isBlank()) return null
+        return AttendanceLogEntity(
+            id = id,
+            dateKey = o.optNonNullString("dateKey", ""),
+            monthKey = o.optNonNullString("monthKey", fallbackMonthKey).ifBlank { fallbackMonthKey },
+            staffName = o.optNonNullString("staffName", "Staff").ifBlank { "Staff" },
+            deviceId = o.optNonNullString("deviceId", ""),
+            checkInTimestamp = o.optLong("checkInTimestamp", 0L),
+            checkInLat = o.optDouble("checkInLat", 0.0),
+            checkInLng = o.optDouble("checkInLng", 0.0),
+            checkInDistanceMeters = o.optDouble("checkInDistanceMeters", 0.0),
+            checkOutTimestamp = o.optLong("checkOutTimestamp", 0L),
+            checkOutLat = o.optDouble("checkOutLat", 0.0),
+            checkOutLng = o.optDouble("checkOutLng", 0.0),
+            checkOutDistanceMeters = o.optDouble("checkOutDistanceMeters", 0.0),
+            workedMinutes = o.optInt("workedMinutes", 0),
+            notes = o.optNonNullString("notes", ""),
+            updatedAt = o.optLong("updatedAt", 0L)
+        )
+    }
+
+    private suspend fun syncAttendanceMonthToCloud(monthKey: String) {
+        val dao = attendanceDao ?: return
+        try {
+            val logs = dao.getLogsForMonthSync(monthKey)
+            val arr = JSONArray()
+            for (log in logs) {
+                arr.put(attendanceLogToJson(log))
+            }
+            supabaseService.saveAttendanceMonthLogs(monthKey, arr.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "syncAttendanceMonthToCloud($monthKey) failed: ${e.message}")
+        }
+    }
+
+    suspend fun reconcileAttendanceFromCloud(monthKey: String) {
+        val dao = attendanceDao ?: return
+        attendanceSyncMutex.withLock {
+            try {
+                val rawJson = supabaseService.fetchAttendanceMonthLogs(monthKey)
+                val localLogs = dao.getLogsForMonthSync(monthKey)
+                if (!rawJson.isNullOrBlank() && rawJson.startsWith("[")) {
+                    val arr = JSONArray(rawJson)
+                    val localById = localLogs.associateBy { it.id }
+                    val cloudIds = mutableSetOf<String>()
+                    val toUpsert = mutableListOf<AttendanceLogEntity>()
+                    var localHasNewer = false
+
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val cloudLog = attendanceLogFromJson(o, monthKey) ?: continue
+                        cloudIds.add(cloudLog.id)
+                        val local = localById[cloudLog.id]
+                        if (local == null || cloudLog.updatedAt > local.updatedAt) {
+                            toUpsert.add(cloudLog)
+                        } else if (local.updatedAt > cloudLog.updatedAt) {
+                            localHasNewer = true
+                        }
+                    }
+
+                    if (toUpsert.isNotEmpty()) {
+                        dao.upsertLogs(toUpsert)
+                    }
+                    if (localLogs.any { it.id !in cloudIds }) {
+                        localHasNewer = true
+                    }
+                    if (localHasNewer) {
+                        syncAttendanceMonthToCloud(monthKey)
+                    }
+                } else if (localLogs.isNotEmpty()) {
+                    syncAttendanceMonthToCloud(monthKey)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "reconcileAttendanceFromCloud($monthKey) failed: ${e.message}")
             }
         }
     }
