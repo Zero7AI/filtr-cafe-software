@@ -1608,6 +1608,14 @@ class SupabaseService private constructor() {
         saveSyncMetadata("attendance_staff_roster", json)
     }
 
+    suspend fun fetchKdsClaims(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("kds_claims_active")
+    }
+
+    suspend fun saveKdsClaims(json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("kds_claims_active", json)
+    }
+
     // ==================== DEEPGRAM REMOTE CONFIG ====================
 
     data class DeepgramConfig(

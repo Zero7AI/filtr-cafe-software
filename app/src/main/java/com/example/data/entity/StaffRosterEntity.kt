@@ -1,5 +1,6 @@
 package com.example.data.entity
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
@@ -13,5 +14,7 @@ data class StaffRosterEntity(
     val weeklyOffDayOfWeek: Int = 0, // 0 = None, else Calendar.SUNDAY (1)..Calendar.SATURDAY (7)
     val joinedDateKey: String = "", // yyyy-MM-dd
     val isActive: Boolean = true,
-    val updatedAt: Long = 0L
+    val updatedAt: Long = 0L,
+    @ColumnInfo(defaultValue = "")
+    val colorHex: String = ""
 )

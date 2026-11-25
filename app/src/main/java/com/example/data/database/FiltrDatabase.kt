@@ -10,6 +10,7 @@ import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
 import com.example.data.dao.InventoryDao
+import com.example.data.dao.KdsClaimDao
 import com.example.data.dao.KitchenInventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
@@ -23,6 +24,7 @@ import com.example.data.entity.InventoryItemEntity
 import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryUsageEntity
+import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryItemEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
@@ -49,9 +51,9 @@ import java.util.Locale
         ChecklistTaskEntity::class, ChecklistCompletionEntity::class,
         KitchenInventoryItemEntity::class, KitchenInventoryShiftEntity::class,
         KitchenInventoryEntryEntity::class, AttendanceLogEntity::class,
-        StaffRosterEntity::class
+        StaffRosterEntity::class, KdsItemClaimEntity::class
     ],
-    version = 16,
+    version = 17,
     exportSchema = false
 )
 abstract class FiltrDatabase : RoomDatabase() {
@@ -64,6 +66,7 @@ abstract class FiltrDatabase : RoomDatabase() {
     abstract fun checklistDao(): ChecklistDao
     abstract fun kitchenInventoryDao(): KitchenInventoryDao
     abstract fun attendanceDao(): AttendanceDao
+    abstract fun kdsClaimDao(): KdsClaimDao
 
     companion object {
         @Volatile
@@ -308,6 +311,25 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_16_17 = object : androidx.room.migration.Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `kds_item_claims` (
+                        `key` TEXT NOT NULL PRIMARY KEY,
+                        `orderId` TEXT NOT NULL,
+                        `itemId` INTEGER NOT NULL,
+                        `itemName` TEXT NOT NULL,
+                        `unitIndex` INTEGER NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `staffName` TEXT NOT NULL DEFAULT '',
+                        `colorHex` TEXT NOT NULL DEFAULT '',
+                        `updatedAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                """.trimIndent())
+                db.execSQL("ALTER TABLE `staff_roster` ADD COLUMN `colorHex` TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         internal fun getInstanceOrNull(): FiltrDatabase? = INSTANCE
 
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
@@ -325,7 +347,8 @@ abstract class FiltrDatabase : RoomDatabase() {
                     MIGRATION_12_13,
                     MIGRATION_13_14,
                     MIGRATION_14_15,
-                    MIGRATION_15_16
+                    MIGRATION_15_16,
+                    MIGRATION_16_17
                 )
                 .fallbackToDestructiveMigration(true) // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))

@@ -69,9 +69,13 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
+import com.example.domain.kds.KdsBaristaColorPalette
+import com.example.domain.kds.KdsQueueBuilder
+import com.example.domain.kds.KdsUnitStage
 import com.example.ui.BillingUiState
 import com.example.ui.theme.AmberAccentSecondary
 import com.example.ui.theme.CoffeeBrownPrimary
@@ -88,6 +92,7 @@ fun OrdersScreen(
     state: BillingUiState,
     ordersList: List<OrderWithItems>,
     menuItems: List<MenuItemEntity> = emptyList(),
+    kdsClaimsByKey: Map<String, KdsItemClaimEntity> = emptyMap(),
     isStaffMode: Boolean = false,
     onFilterChanged: (String) -> Unit,
     onToggleMade: (OrderWithItems) -> Unit,
@@ -545,6 +550,7 @@ fun OrdersScreen(
                 items(items = filteredOrders, key = { it.order.orderId }) { orderWithItems ->
                     OrderCard(
                         orderWithItems = orderWithItems,
+                        kdsClaimsByKey = kdsClaimsByKey,
                         isStaffMode = isStaffMode,
                         onToggleMade = { onToggleMade(orderWithItems) },
                         onTogglePaid = { onTogglePaid(orderWithItems) },
@@ -695,6 +701,7 @@ fun OrdersScreen(
 @Composable
 fun OrderCard(
     orderWithItems: OrderWithItems,
+    kdsClaimsByKey: Map<String, KdsItemClaimEntity> = emptyMap(),
     isStaffMode: Boolean = false,
     onToggleMade: () -> Unit,
     onTogglePaid: () -> Unit,
@@ -892,19 +899,48 @@ fun OrderCard(
                         val completedQty = item.completedQuantity
 
                         for (unitIndex in 1..qty) {
-                            val isUnitMade = unitIndex <= completedQty
+                            val claimKey = KdsQueueBuilder.buildClaimKey(order.orderId, item.id, unitIndex)
+                            val unitClaim = kdsClaimsByKey[claimKey]
+                            val (unitStage, baristaAttribution) = KdsQueueBuilder.resolveUnitDisplayState(
+                                order = order,
+                                item = item,
+                                unitIndex = unitIndex,
+                                claim = unitClaim
+                            )
+                            val isUnitMade = unitStage == KdsUnitStage.MADE
+                            val isUnitMaking = unitStage == KdsUnitStage.MAKING
+                            val claimColor = if (baristaAttribution.isNotBlank()) {
+                                Color(
+                                    KdsBaristaColorPalette.parseComposeColor(
+                                        KdsBaristaColorPalette.resolveColorHex(
+                                            baristaAttribution,
+                                            unitClaim?.colorHex.orEmpty()
+                                        )
+                                    )
+                                )
+                            } else {
+                                Color(0xFF16A34A)
+                            }
 
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(vertical = 3.dp)
                                     .background(
-                                        if (isUnitMade) Color(0xFFF0FDF4) else Color.White,
+                                        when {
+                                            isUnitMade -> Color(0xFFF0FDF4)
+                                            isUnitMaking -> claimColor.copy(alpha = 0.09f)
+                                            else -> Color.White
+                                        },
                                         RoundedCornerShape(8.dp)
                                     )
                                     .border(
                                         1.dp,
-                                        if (isUnitMade) Color(0xFFBBF7D0) else Color(0xFFE4E4E7),
+                                        when {
+                                            isUnitMade -> Color(0xFFBBF7D0)
+                                            isUnitMaking -> claimColor.copy(alpha = 0.55f)
+                                            else -> Color(0xFFE4E4E7)
+                                        },
                                         RoundedCornerShape(8.dp)
                                     )
                                     .padding(horizontal = 10.dp, vertical = 6.dp),
@@ -918,16 +954,30 @@ fun OrderCard(
                                     Icon(
                                         imageVector = if (isUnitMade) Icons.Default.CheckCircle else Icons.Default.Coffee,
                                         contentDescription = null,
-                                        tint = if (isUnitMade) Color(0xFF16A34A) else Color(0xFF71717A),
+                                        tint = when {
+                                            isUnitMade -> Color(0xFF16A34A)
+                                            isUnitMaking -> claimColor
+                                            else -> Color(0xFF71717A)
+                                        },
                                         modifier = Modifier.size(16.dp)
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = if (qty > 1) "${item.itemName} (Unit $unitIndex/$qty)" else item.itemName,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (isUnitMade) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isUnitMade) Color(0xFF15803D) else Color(0xFF09090B)
-                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = if (qty > 1) "${item.itemName} (Unit $unitIndex/$qty)" else item.itemName,
+                                            fontSize = 13.sp,
+                                            fontWeight = if (isUnitMade || isUnitMaking) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (isUnitMade) Color(0xFF15803D) else Color(0xFF09090B)
+                                        )
+                                        if (baristaAttribution.isNotBlank()) {
+                                            Text(
+                                                text = if (isUnitMade) "Made by $baristaAttribution ✓" else "Making: $baristaAttribution",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = claimColor
+                                            )
+                                        }
+                                    }
                                 }
 
                                 Button(
@@ -935,7 +985,11 @@ fun OrderCard(
                                         onToggleItemCompleted(order.orderId, item.id, completedQty, unitIndex, qty)
                                     },
                                     colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (isUnitMade) Color(0xFF16A34A) else Color(0xFF09090B),
+                                        containerColor = when {
+                                            isUnitMade -> Color(0xFF16A34A)
+                                            isUnitMaking -> claimColor
+                                            else -> Color(0xFF09090B)
+                                        },
                                         contentColor = Color.White
                                     ),
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
@@ -943,7 +997,11 @@ fun OrderCard(
                                     modifier = Modifier.height(28.dp)
                                 ) {
                                     Text(
-                                        text = if (isUnitMade) "Completed ✓" else "Mark Made",
+                                        text = when {
+                                            isUnitMade -> "Completed ✓"
+                                            isUnitMaking -> "Making • Finish"
+                                            else -> "Mark Made"
+                                        },
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold
                                     )

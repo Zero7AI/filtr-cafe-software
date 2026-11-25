@@ -7,6 +7,7 @@ import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
 import com.example.data.dao.InventoryDao
+import com.example.data.dao.KdsClaimDao
 import com.example.data.dao.KitchenInventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
@@ -23,12 +24,15 @@ import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.InventoryUsageEntity
+import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryItemEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.domain.attendance.AttendanceCalculator
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.StoreGeofenceConfig
+import com.example.domain.kds.KdsBaristaColorPalette
+import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kitchen.KitchenInventoryCalculator
 import com.example.domain.kitchen.KitchenShiftType
 import com.example.data.entity.MenuItemEntity
@@ -68,6 +72,7 @@ class FiltrRepository(
     private val checklistDao: ChecklistDao? = null,
     private val kitchenInventoryDao: KitchenInventoryDao? = null,
     private val attendanceDao: AttendanceDao? = null,
+    private val kdsClaimDao: KdsClaimDao? = null,
     private val sheetsSyncService: GoogleSheetsSyncService = GoogleSheetsSyncService(),
     private val geminiVoiceService: GeminiVoiceOrderService = GeminiVoiceOrderService(),
     private val deepgramVoiceService: DeepgramVoiceService = DeepgramVoiceService.getInstance(),
@@ -87,6 +92,7 @@ class FiltrRepository(
     private val kitchenInventorySyncMutex = Mutex()
     private val customerSyncMutex = Mutex()
     private val attendanceSyncMutex = Mutex()
+    private val kdsSyncMutex = Mutex()
 
     @Volatile
     private var managedScope: CoroutineScope? = externalScope
@@ -134,6 +140,7 @@ class FiltrRepository(
     val allAttendanceLogs: Flow<List<AttendanceLogEntity>> = attendanceDao?.getAllLogs() ?: flowOf(emptyList())
     val allStaffRoster: Flow<List<StaffRosterEntity>> = attendanceDao?.getAllRosterMembers() ?: flowOf(emptyList())
     val activeStaffRoster: Flow<List<StaffRosterEntity>> = attendanceDao?.getActiveRosterMembers() ?: flowOf(emptyList())
+    val allKdsClaims: Flow<List<KdsItemClaimEntity>> = kdsClaimDao?.getAllClaims() ?: flowOf(emptyList())
 
     fun getAttendanceLogsForMonth(monthKey: String): Flow<List<AttendanceLogEntity>> {
         return attendanceDao?.getLogsForMonth(monthKey) ?: flowOf(emptyList())
@@ -1167,7 +1174,12 @@ class FiltrRepository(
         }
     }
 
-    suspend fun updateOrderItemCompletedQuantity(orderId: String, itemId: Int, completedQty: Int): OrderWithItems? {
+    suspend fun updateOrderItemCompletedQuantity(
+        orderId: String,
+        itemId: Int,
+        completedQty: Int,
+        performedByStaff: String = ""
+    ): OrderWithItems? {
         val now = System.currentTimeMillis()
         val completedTs = if (completedQty > 0) now else 0L
         orderDao.updateOrderItemCompletedQuantity(itemId, completedQty, completedTimestamp = completedTs)
@@ -1184,6 +1196,59 @@ class FiltrRepository(
 
             val targetItem = orderWithItems.items.find { it.id == itemId }
             val itemName = targetItem?.itemName ?: ""
+
+            // Keep KDS unit claims in sync when toggled from OrdersScreen
+            val claimDao = kdsClaimDao
+            if (claimDao != null && targetItem != null) {
+                val cleanStaff = performedByStaff.trim()
+                var claimUpdated = false
+                for (unitIndex in 1..targetItem.quantity) {
+                    val claimKey = KdsQueueBuilder.buildClaimKey(orderId, itemId, unitIndex)
+                    val existing = claimDao.getClaim(claimKey)
+                    if (unitIndex <= completedQty) {
+                        if (existing?.status != "MADE") {
+                            val effectiveStaff = existing?.staffName?.takeIf { it.isNotBlank() } ?: cleanStaff
+                            val effectiveColor = if (effectiveStaff.isNotBlank()) {
+                                existing?.colorHex?.takeIf { it.isNotBlank() }
+                                    ?: KdsBaristaColorPalette.resolveColorHex(effectiveStaff)
+                            } else {
+                                ""
+                            }
+                            claimDao.upsertClaim(
+                                KdsItemClaimEntity(
+                                    key = claimKey,
+                                    orderId = orderId,
+                                    itemId = itemId,
+                                    itemName = targetItem.itemName,
+                                    unitIndex = unitIndex,
+                                    status = "MADE",
+                                    staffName = effectiveStaff,
+                                    colorHex = effectiveColor,
+                                    updatedAt = now
+                                )
+                            )
+                            claimUpdated = true
+                        }
+                    } else if (existing?.status == "MADE") {
+                        claimDao.upsertClaim(
+                            existing.copy(
+                                status = "PENDING",
+                                staffName = "",
+                                colorHex = "",
+                                updatedAt = now
+                            )
+                        )
+                        claimUpdated = true
+                    }
+                }
+                if (claimUpdated) {
+                    launchManagedSync {
+                        kdsSyncMutex.withLock {
+                            syncKdsClaimsToCloud()
+                        }
+                    }
+                }
+            }
 
             // Sync item completion to Supabase
             if (supabaseService.isInitialized && itemName.isNotBlank()) {
@@ -3042,6 +3107,7 @@ class FiltrRepository(
             put("joinedDateKey", member.joinedDateKey)
             put("isActive", member.isActive)
             put("updatedAt", member.updatedAt)
+            put("colorHex", member.colorHex)
         }
     }
 
@@ -3057,7 +3123,8 @@ class FiltrRepository(
             weeklyOffDayOfWeek = o.optInt("weeklyOffDayOfWeek", 0),
             joinedDateKey = o.optNonNullString("joinedDateKey", ""),
             isActive = o.optBoolean("isActive", true),
-            updatedAt = o.optLong("updatedAt", 0L)
+            updatedAt = o.optLong("updatedAt", 0L),
+            colorHex = o.optNonNullString("colorHex", "")
         )
     }
 
@@ -3120,6 +3187,288 @@ class FiltrRepository(
             }
         } catch (e: Exception) {
             Log.w(TAG, "reconcileStaffRosterFromCloud failed: ${e.message}")
+        }
+    }
+
+    // ==================== KDS LIVE CLAIM & QUEUE SYNC ====================
+
+    sealed interface KdsTapOutcome {
+        data class Claimed(val claim: KdsItemClaimEntity) : KdsTapOutcome
+        data class Completed(val claim: KdsItemClaimEntity, val updatedOrder: OrderWithItems?) : KdsTapOutcome
+        data class BlockedByOtherBarista(val claimedByStaff: String) : KdsTapOutcome
+        data object Ignored : KdsTapOutcome
+    }
+
+    suspend fun handleKdsItemTap(
+        orderId: String,
+        itemId: Int,
+        unitIndex: Int,
+        baristaName: String,
+        baristaColorHex: String = "",
+        isAdminOverride: Boolean = false
+    ): KdsTapOutcome {
+        val dao = kdsClaimDao ?: return KdsTapOutcome.Ignored
+        val orderWithItems = orderDao.getOrderById(orderId) ?: return KdsTapOutcome.Ignored
+        if (orderWithItems.order.isMade || orderWithItems.order.isDelivered) return KdsTapOutcome.Ignored
+        val targetItem = orderWithItems.items.find { it.id == itemId } ?: return KdsTapOutcome.Ignored
+        if (unitIndex !in 1..targetItem.quantity || unitIndex <= targetItem.completedQuantity) {
+            return KdsTapOutcome.Ignored
+        }
+
+        val claimKey = KdsQueueBuilder.buildClaimKey(orderId, itemId, unitIndex)
+        val existingClaim = dao.getClaim(claimKey)
+        if (existingClaim?.status == "MADE") {
+            return KdsTapOutcome.Ignored
+        }
+
+        val cleanBarista = baristaName.trim().ifBlank { "Barista" }
+        val resolvedColor = KdsBaristaColorPalette.resolveColorHex(cleanBarista, baristaColorHex)
+        val now = System.currentTimeMillis()
+
+        // Tap 1: PENDING -> MAKING
+        if (existingClaim == null || existingClaim.status != "MAKING") {
+            val claim = KdsItemClaimEntity(
+                key = claimKey,
+                orderId = orderId,
+                itemId = itemId,
+                itemName = targetItem.itemName,
+                unitIndex = unitIndex,
+                status = "MAKING",
+                staffName = cleanBarista,
+                colorHex = resolvedColor,
+                updatedAt = now
+            )
+            dao.upsertClaim(claim)
+            launchManagedSync {
+                kdsSyncMutex.withLock {
+                    syncKdsClaimsToCloud()
+                }
+            }
+            return KdsTapOutcome.Claimed(claim)
+        }
+
+        // Guard if another barista is actively making this unit unless Admin overrides
+        if (!isAdminOverride && existingClaim.staffName.isNotBlank() &&
+            !existingClaim.staffName.equals(cleanBarista, ignoreCase = true)
+        ) {
+            return KdsTapOutcome.BlockedByOtherBarista(existingClaim.staffName)
+        }
+
+        // Tap 2: MAKING -> MADE
+        val effectiveBarista = existingClaim.staffName.ifBlank { cleanBarista }
+        val effectiveColor = existingClaim.colorHex.ifBlank {
+            KdsBaristaColorPalette.resolveColorHex(effectiveBarista, baristaColorHex)
+        }
+        val completedClaim = existingClaim.copy(
+            status = "MADE",
+            staffName = effectiveBarista,
+            colorHex = effectiveColor,
+            updatedAt = now
+        )
+        dao.upsertClaim(completedClaim)
+
+        // Compute contiguous completed prefix from unit 1 so out-of-order multi-cup completion
+        // never prematurely marks earlier units as done.
+        val orderClaims = dao.getClaimsForOrder(orderId)
+        val itemClaimsByUnit = orderClaims
+            .filter { it.itemId == itemId }
+            .associateBy { it.unitIndex }
+
+        var contiguousDone = 0
+        for (u in 1..targetItem.quantity) {
+            val unitClaim = itemClaimsByUnit[u]
+            val unitIsDone = u <= targetItem.completedQuantity || unitClaim?.status == "MADE"
+            if (unitIsDone) {
+                contiguousDone = u
+            } else {
+                break
+            }
+        }
+
+        if (contiguousDone != targetItem.completedQuantity) {
+            orderDao.updateOrderItemCompletedQuantity(itemId, contiguousDone, completedTimestamp = now)
+        }
+
+        val refreshedOrder = orderDao.getOrderById(orderId)
+        var allOrderUnitsDone = false
+        if (refreshedOrder != null && refreshedOrder.items.isNotEmpty()) {
+            allOrderUnitsDone = refreshedOrder.items.all { orderItem ->
+                val claimsForThisItem = orderClaims.filter { it.itemId == orderItem.id }.associateBy { it.unitIndex }
+                (1..orderItem.quantity).all { u ->
+                    u <= orderItem.completedQuantity || claimsForThisItem[u]?.status == "MADE"
+                }
+            }
+            if (allOrderUnitsDone && !refreshedOrder.order.isMade) {
+                // Ensure every item reflects full completedQuantity when order completes
+                for (orderItem in refreshedOrder.items) {
+                    if (orderItem.completedQuantity < orderItem.quantity) {
+                        orderDao.updateOrderItemCompletedQuantity(orderItem.id, orderItem.quantity, completedTimestamp = now)
+                    }
+                }
+                orderDao.updateMadeStatus(orderId, true, completedTimestamp = now)
+            }
+        }
+
+        orderDao.updateSyncStatus(orderId, "PENDING")
+        sheetsPendingOrderIds.add(orderId)
+
+        val finalOrder = orderDao.getOrderById(orderId)
+        val qtyToSync = if (allOrderUnitsDone) targetItem.quantity else contiguousDone
+        if (supabaseService.isInitialized && targetItem.itemName.isNotBlank()) {
+            try {
+                val itemRes = supabaseService.updateOrderItemCompletion(orderId, targetItem.itemName, qtyToSync, now)
+                val fieldsOk = if (allOrderUnitsDone) {
+                    supabaseService.updateOrderFields(
+                        orderId,
+                        mapOf(
+                            "isMade" to true,
+                            "completedTimestamp" to now,
+                            "syncStatus" to "SYNCED"
+                        )
+                    ).isSuccess
+                } else {
+                    true
+                }
+                if (itemRes.isSuccess && fieldsOk) {
+                    orderDao.updateSyncStatus(orderId, "SYNCED")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync KDS completion to Supabase: ${e.message}")
+            }
+        }
+        if (firestoreService.isInitialized) {
+            try {
+                if (allOrderUnitsDone) {
+                    firestoreService.updateOrderFields(
+                        orderId,
+                        mapOf("isMade" to true, "completedTimestamp" to now)
+                    )
+                }
+                firestoreService.updateOrderItemCompletion(orderId, itemId, qtyToSync, now)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync KDS completion to Firestore: ${e.message}")
+            }
+        }
+
+        launchManagedSync {
+            kdsSyncMutex.withLock {
+                syncKdsClaimsToCloud()
+            }
+        }
+        return KdsTapOutcome.Completed(completedClaim, finalOrder)
+    }
+
+    suspend fun unclaimKdsItem(orderId: String, itemId: Int, unitIndex: Int): Boolean {
+        val dao = kdsClaimDao ?: return false
+        val claimKey = KdsQueueBuilder.buildClaimKey(orderId, itemId, unitIndex)
+        val existing = dao.getClaim(claimKey) ?: return false
+        if (existing.status != "MAKING") return false
+        dao.upsertClaim(
+            existing.copy(
+                status = "PENDING",
+                staffName = "",
+                colorHex = "",
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+        launchManagedSync {
+            kdsSyncMutex.withLock {
+                syncKdsClaimsToCloud()
+            }
+        }
+        return true
+    }
+
+    private fun kdsClaimToJson(claim: KdsItemClaimEntity): JSONObject {
+        return JSONObject().apply {
+            put("key", claim.key)
+            put("orderId", claim.orderId)
+            put("itemId", claim.itemId)
+            put("itemName", claim.itemName)
+            put("unitIndex", claim.unitIndex)
+            put("status", claim.status)
+            put("staffName", claim.staffName)
+            put("colorHex", claim.colorHex)
+            put("updatedAt", claim.updatedAt)
+        }
+    }
+
+    private fun kdsClaimFromJson(o: JSONObject): KdsItemClaimEntity? {
+        val key = o.optNonNullString("key", "").trim()
+        val orderId = o.optNonNullString("orderId", "").trim()
+        if (key.isBlank() || orderId.isBlank()) return null
+        return KdsItemClaimEntity(
+            key = key,
+            orderId = orderId,
+            itemId = o.optInt("itemId", 0),
+            itemName = o.optNonNullString("itemName", ""),
+            unitIndex = o.optInt("unitIndex", 1),
+            status = o.optNonNullString("status", "PENDING").ifBlank { "PENDING" },
+            staffName = o.optNonNullString("staffName", ""),
+            colorHex = o.optNonNullString("colorHex", ""),
+            updatedAt = o.optLong("updatedAt", 0L)
+        )
+    }
+
+    private suspend fun syncKdsClaimsToCloud() {
+        val dao = kdsClaimDao ?: return
+        try {
+            val now = System.currentTimeMillis()
+            dao.deleteOldMadeClaims(now - 48L * 60L * 60L * 1000L)
+            val cutoff = now - 24L * 60L * 60L * 1000L
+            val claimsToSync = dao.getAllClaimsSync().filter {
+                it.status == "MAKING" || it.updatedAt >= cutoff
+            }
+            val arr = JSONArray()
+            for (claim in claimsToSync) {
+                arr.put(kdsClaimToJson(claim))
+            }
+            supabaseService.saveKdsClaims(arr.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "syncKdsClaimsToCloud failed: ${e.message}")
+        }
+    }
+
+    suspend fun reconcileKdsClaimsFromCloud() {
+        val dao = kdsClaimDao ?: return
+        kdsSyncMutex.withLock {
+            try {
+                val rawJson = supabaseService.fetchKdsClaims()
+                val localClaims = dao.getAllClaimsSync()
+                if (!rawJson.isNullOrBlank() && rawJson.startsWith("[")) {
+                    val arr = JSONArray(rawJson)
+                    val localByKey = localClaims.associateBy { it.key }
+                    val cloudKeys = mutableSetOf<String>()
+                    val toUpsert = mutableListOf<KdsItemClaimEntity>()
+                    var localHasNewer = false
+
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val cloudClaim = kdsClaimFromJson(o) ?: continue
+                        cloudKeys.add(cloudClaim.key)
+                        val local = localByKey[cloudClaim.key]
+                        if (local == null || cloudClaim.updatedAt > local.updatedAt) {
+                            toUpsert.add(cloudClaim)
+                        } else if (local.updatedAt > cloudClaim.updatedAt) {
+                            localHasNewer = true
+                        }
+                    }
+
+                    if (toUpsert.isNotEmpty()) {
+                        dao.upsertClaims(toUpsert)
+                    }
+                    if (localClaims.any { it.key !in cloudKeys && (it.status == "MAKING" || it.updatedAt >= System.currentTimeMillis() - 24L * 60L * 60L * 1000L) }) {
+                        localHasNewer = true
+                    }
+                    if (localHasNewer) {
+                        syncKdsClaimsToCloud()
+                    }
+                } else if (localClaims.isNotEmpty()) {
+                    syncKdsClaimsToCloud()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "reconcileKdsClaimsFromCloud failed: ${e.message}")
+            }
         }
     }
 }

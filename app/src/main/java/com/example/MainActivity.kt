@@ -45,6 +45,7 @@ import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Inventory
 import androidx.compose.material.icons.filled.Kitchen
+import androidx.compose.material.icons.filled.LocalCafe
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
@@ -118,8 +119,8 @@ import com.example.ui.screens.ChecklistScreen
 import com.example.ui.screens.CustomersScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.InventoriesScreen
+import com.example.ui.screens.KdsScreen
 import com.example.ui.screens.KitchenInventoryScreen
-import com.example.ui.screens.ManualInventoryScreen
 import com.example.ui.screens.InventoryOrderScreen
 import com.example.ui.screens.InventoryUsageScreen
 import com.example.ui.screens.MenuMasterScreen
@@ -305,6 +306,25 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     NavigationDrawerItem(
+                                        label = { Text("KDS Queue (FIFO)", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.LocalCafe, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = uiState.currentTab == FiltrTab.KDS,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.KDS)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.25f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
                                         label = { Text("Daily Check List", fontWeight = FontWeight.Bold) },
                                         icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.CHECKLIST,
@@ -354,25 +374,6 @@ class MainActivity : ComponentActivity() {
                                             selectedContainerColor = Color(0xFF34D399).copy(alpha = 0.2f),
                                             selectedIconColor = Color(0xFF34D399),
                                             selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Inventories Manual", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null, tint = Color(0xFFF59E0B)) },
-                                        selected = uiState.currentTab == FiltrTab.MANUAL_INVENTORY,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.MANUAL_INVENTORY)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
@@ -510,6 +511,25 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     NavigationDrawerItem(
+                                        label = { Text("KDS Queue (FIFO)", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.LocalCafe, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = uiState.currentTab == FiltrTab.KDS,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.KDS)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.25f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
                                         label = { Text("Daily Check List", fontWeight = FontWeight.Bold) },
                                         icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.CHECKLIST,
@@ -559,25 +579,6 @@ class MainActivity : ComponentActivity() {
                                             selectedContainerColor = Color(0xFF34D399).copy(alpha = 0.2f),
                                             selectedIconColor = Color(0xFF34D399),
                                             selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Inventories Manual", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null, tint = Color(0xFFF59E0B)) },
-                                        selected = uiState.currentTab == FiltrTab.MANUAL_INVENTORY,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.MANUAL_INVENTORY)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
@@ -900,35 +901,20 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.testTag("tab_orders")
                                     )
 
-                                     NavigationBarItem(
-                                         selected = uiState.currentTab == FiltrTab.CHECKLIST,
-                                         onClick = { viewModel.selectTab(FiltrTab.CHECKLIST) },
-                                         icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check List") },
-                                         label = { Text("Check List", fontWeight = FontWeight.Bold, maxLines = 1) },
-                                         colors = NavigationBarItemDefaults.colors(
-                                             selectedIconColor = Color(0xFF09090B),
-                                             selectedTextColor = Color.White,
-                                             indicatorColor = Color(0xFF10B981),
-                                             unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                             unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                         ),
-                                         modifier = Modifier.testTag("tab_checklist")
-                                     )
-
-                                     NavigationBarItem(
-                                         selected = uiState.currentTab == FiltrTab.KITCHEN_INVENTORY,
-                                         onClick = { viewModel.selectTab(FiltrTab.KITCHEN_INVENTORY) },
-                                         icon = { Icon(imageVector = Icons.Default.Kitchen, contentDescription = "Kitchen") },
-                                         label = { Text("Kitchen", fontWeight = FontWeight.Bold, maxLines = 1) },
-                                         colors = NavigationBarItemDefaults.colors(
-                                             selectedIconColor = Color(0xFF09090B),
-                                             selectedTextColor = Color.White,
-                                             indicatorColor = Color(0xFF38BDF8),
-                                             unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                             unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                         ),
-                                         modifier = Modifier.testTag("tab_kitchen_inventory")
-                                     )
+                                    NavigationBarItem(
+                                        selected = uiState.currentTab == FiltrTab.KDS,
+                                        onClick = { viewModel.selectTab(FiltrTab.KDS) },
+                                        icon = { Icon(imageVector = Icons.Default.LocalCafe, contentDescription = "KDS") },
+                                        label = { Text("KDS", fontWeight = FontWeight.Bold, maxLines = 1) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Color(0xFF09090B),
+                                            selectedTextColor = Color.White,
+                                            indicatorColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                        ),
+                                        modifier = Modifier.testTag("tab_kds")
+                                    )
                                 } else {
                                     NavigationBarItem(
                                         selected = uiState.currentTab == FiltrTab.VOICE_ORDER,
@@ -1007,10 +993,12 @@ class MainActivity : ComponentActivity() {
                                 FiltrTab.ORDERS -> {
                                     val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
                                     val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
+                                    val kdsClaimsByKey by viewModel.kdsClaimsByKey.collectAsStateWithLifecycle()
                                     OrdersScreen(
                                         state = uiState,
                                         ordersList = ordersList,
                                         menuItems = allMenuItems,
+                                        kdsClaimsByKey = kdsClaimsByKey,
                                         isStaffMode = isStaffMode,
                                         onFilterChanged = { viewModel.setStatusFilter(it) },
                                         onToggleMade = { viewModel.toggleOrderMadeStatus(it) },
@@ -1369,26 +1357,23 @@ class MainActivity : ComponentActivity() {
                                         }
                                     )
                                 }
-                                FiltrTab.MANUAL_INVENTORY -> {
-                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                    ManualInventoryScreen(
-                                        state = uiState,
-                                        inventoryItems = inventoryItemsList,
-                                        onSaveClosingInventory = { stockMap, staffNotes, onComplete ->
-                                            viewModel.saveClosingInventoryAudit(stockMap, staffNotes, onComplete)
-                                        },
-                                        onAddNewInventoryItem = { name, category, unit, price, packSize, initialStock ->
-                                            viewModel.saveInventoryItem(name, category, unit, price, packSize, initialStock)
-                                        },
-                                        onUpdateInventoryItem = { item, newCount ->
-                                            viewModel.updateInventoryItemWithStock(item, newCount)
-                                        },
-                                        onDraftCountChanged = { itemId, newCount ->
-                                            viewModel.updateManualInventoryDraftCount(itemId, newCount)
-                                        },
-                                        onDraftNotesChanged = { notes ->
-                                            viewModel.updateManualInventoryDraftNotes(notes)
-                                        }
+                                FiltrTab.KDS -> {
+                                    val queueItems by viewModel.kdsFifoQueue.collectAsStateWithLifecycle()
+                                    val availableBaristas by viewModel.availableAttendanceStaffNames.collectAsStateWithLifecycle()
+                                    val staffRoster by viewModel.staffRoster.collectAsStateWithLifecycle()
+                                    val activeBaristaName by viewModel.selectedKdsBaristaName.collectAsStateWithLifecycle()
+                                    val paidOnlyFilter by viewModel.kdsPaidOnlyFilter.collectAsStateWithLifecycle()
+                                    KdsScreen(
+                                        queueItems = queueItems,
+                                        availableBaristas = availableBaristas,
+                                        staffRoster = staffRoster,
+                                        activeBaristaName = activeBaristaName,
+                                        paidOnlyFilter = paidOnlyFilter,
+                                        isStaffMode = isStaffMode,
+                                        onSelectBarista = { viewModel.selectKdsBarista(it) },
+                                        onTogglePaidOnlyFilter = { viewModel.setKdsPaidOnlyFilter(it) },
+                                        onTapQueueItem = { viewModel.onKdsItemTap(it) },
+                                        onUnclaimQueueItem = { viewModel.onKdsItemUnclaim(it) }
                                     )
                                 }
                             }

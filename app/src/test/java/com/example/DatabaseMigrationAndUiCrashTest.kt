@@ -13,21 +13,29 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.database.FiltrDatabase
 import com.example.data.entity.AttendanceLogEntity
+import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
+import com.example.data.entity.OrderEntity
+import com.example.data.entity.OrderItemEntity
+import com.example.data.entity.OrderWithItems
 import com.example.data.entity.StaffRosterEntity
 import com.example.domain.attendance.AttendanceCalculator
 import com.example.domain.attendance.DayAttendanceStatus
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
+import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kitchen.KitchenInventorySeedCatalog
 import com.example.domain.kitchen.KitchenSection
 import com.example.domain.kitchen.KitchenShiftType
+import com.example.ui.BillingUiState
 import com.example.ui.KitchenInventoryDashboardSummary
 import com.example.ui.KitchenInventoryViewRoute
 import com.example.ui.screens.AttendanceScreen
+import com.example.ui.screens.KdsScreen
 import com.example.ui.screens.KitchenInventoryScreen
+import com.example.ui.screens.OrdersScreen
 import com.example.ui.theme.FiltrTheme
 import com.example.util.KitchenLocationHelper
 import com.example.util.LocationSample
@@ -50,9 +58,9 @@ class DatabaseMigrationAndUiCrashTest {
     val composeTestRule = createComposeRule()
 
     @Test
-    fun `room migration 13 to 16 preserves existing data and opens all new tables cleanly`() = runTest {
+    fun `room migration 13 to 17 preserves existing data and opens all new tables cleanly`() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val dbName = "migration_verify_13_to_16.db"
+        val dbName = "migration_verify_13_to_17.db"
         context.deleteDatabase(dbName)
 
         // Create authentic v13 SQLite database with pre-existing cafe data
@@ -82,12 +90,13 @@ class DatabaseMigrationAndUiCrashTest {
         }
         helper.writableDatabase.close()
 
-        // Strictly validate Room migration 13 -> 16 WITHOUT fallbackToDestructiveMigration
+        // Strictly validate Room migration 13 -> 17 WITHOUT fallbackToDestructiveMigration
         val migratedDb = Room.databaseBuilder(context, FiltrDatabase::class.java, dbName)
             .addMigrations(
                 FiltrDatabase.MIGRATION_13_14,
                 FiltrDatabase.MIGRATION_14_15,
-                FiltrDatabase.MIGRATION_15_16
+                FiltrDatabase.MIGRATION_15_16,
+                FiltrDatabase.MIGRATION_16_17
             )
             .allowMainThreadQueries()
             .build()
@@ -130,6 +139,22 @@ class DatabaseMigrationAndUiCrashTest {
             )
             assertEquals(1, migratedDb.attendanceDao().getAllRosterMembersSync().size)
             assertEquals(1, migratedDb.attendanceDao().getAllLogsSync().size)
+
+            // Populate & read v17 kds_item_claims table
+            migratedDb.kdsClaimDao().upsertClaim(
+                KdsItemClaimEntity(
+                    key = "FLT-20261124-0001_1_1",
+                    orderId = "FLT-20261124-0001",
+                    itemId = 1,
+                    itemName = "Vietnamese Iced Coffee",
+                    unitIndex = 1,
+                    status = "MAKING",
+                    staffName = "Rohan",
+                    colorHex = "#16A34A",
+                    updatedAt = 2000L
+                )
+            )
+            assertEquals(1, migratedDb.kdsClaimDao().getAllClaimsSync().size)
         } finally {
             migratedDb.close()
             context.deleteDatabase(dbName)
@@ -322,5 +347,172 @@ class DatabaseMigrationAndUiCrashTest {
         composeTestRule.onNodeWithText("Roster & GPS").performClick()
         composeTestRule.onNodeWithText("Add Staff").performClick()
         composeTestRule.onNodeWithText("Add / Edit Staff Member").assertExists()
+    }
+
+    @Test
+    fun `kds screen renders fifo queue switches barista and advances two tap claim safely`() {
+        val order = OrderWithItems(
+            order = OrderEntity(
+                orderId = "FLT-20261126-1040",
+                customerName = "Aarav",
+                contactNumber = "",
+                totalAmount = 140.0,
+                timestamp = 1_700_000_000_000L,
+                isMade = false,
+                isPaid = true,
+                isDelivered = false,
+                syncStatus = "SYNCED",
+                notes = "Extra shot",
+                paymentMode = "UPI"
+            ),
+            items = listOf(
+                OrderItemEntity(
+                    id = 11,
+                    orderId = "FLT-20261126-1040",
+                    menuItemId = 1,
+                    itemName = "Iced Americano",
+                    itemPrice = 140.0,
+                    quantity = 1,
+                    subtotal = 140.0,
+                    completedQuantity = 0
+                )
+            )
+        )
+        val somesh = StaffRosterEntity(id = "somesh", name = "Somesh", colorHex = "#16A34A")
+        val kanha = StaffRosterEntity(id = "kanha", name = "Kanha", colorHex = "#DC2626")
+        val rosterMap = mapOf(
+            AttendanceCalculator.normalizeStaffKey("Somesh") to somesh,
+            AttendanceCalculator.normalizeStaffKey("Kanha") to kanha
+        )
+
+        var activeBarista by mutableStateOf("Somesh")
+        var claimsMap by mutableStateOf<Map<String, KdsItemClaimEntity>>(emptyMap())
+
+        composeTestRule.setContent {
+            FiltrTheme {
+                val queue = KdsQueueBuilder.buildFifoPendingQueue(
+                    orders = listOf(order),
+                    claimsByKey = claimsMap,
+                    rosterByNormalizedName = rosterMap
+                )
+                KdsScreen(
+                    queueItems = queue,
+                    availableBaristas = listOf("Somesh", "Kanha"),
+                    staffRoster = listOf(somesh, kanha),
+                    activeBaristaName = activeBarista,
+                    paidOnlyFilter = false,
+                    isStaffMode = true,
+                    onSelectBarista = { activeBarista = it },
+                    onTogglePaidOnlyFilter = {},
+                    onTapQueueItem = { unit ->
+                        val existing = claimsMap[unit.claimKey]
+                        claimsMap = if (existing == null) {
+                            mapOf(
+                                unit.claimKey to KdsItemClaimEntity(
+                                    key = unit.claimKey,
+                                    orderId = unit.orderId,
+                                    itemId = unit.itemId,
+                                    itemName = unit.itemName,
+                                    unitIndex = unit.unitIndex,
+                                    status = "MAKING",
+                                    staffName = activeBarista,
+                                    colorHex = "#DC2626",
+                                    updatedAt = 2_000L
+                                )
+                            )
+                        } else {
+                            mapOf(
+                                unit.claimKey to existing.copy(status = "MADE", updatedAt = 3_000L)
+                            )
+                        }
+                    },
+                    onUnclaimQueueItem = {}
+                )
+            }
+        }
+
+        // Switch active barista to Kanha, Tap 1 claims card, Tap 2 completes queue
+        composeTestRule.onNodeWithText("Kanha").performClick()
+        composeTestRule.onNodeWithText("Iced Americano").performClick()
+        composeTestRule.onNodeWithText("Kanha • Tap Done").assertExists()
+        composeTestRule.onNodeWithText("Iced Americano").performClick()
+        composeTestRule.onNodeWithText("All orders are prepared!").assertExists()
+    }
+
+    @Test
+    fun `orders screen displays live making and made barista attribution badges safely`() {
+        val now = System.currentTimeMillis()
+        val order = OrderWithItems(
+            order = OrderEntity(
+                orderId = "FLT-20261126-1055",
+                customerName = "Walk-in",
+                contactNumber = "",
+                totalAmount = 240.0,
+                timestamp = now,
+                isMade = false,
+                isPaid = true,
+                isDelivered = false,
+                syncStatus = "SYNCED",
+                notes = "",
+                paymentMode = "CASH"
+            ),
+            items = listOf(
+                OrderItemEntity(
+                    id = 21,
+                    orderId = "FLT-20261126-1055",
+                    menuItemId = 1,
+                    itemName = "Cold Brew",
+                    itemPrice = 120.0,
+                    quantity = 2,
+                    subtotal = 240.0,
+                    completedQuantity = 1
+                )
+            )
+        )
+        val claims = mapOf(
+            KdsQueueBuilder.buildClaimKey("FLT-20261126-1055", 21, 1) to KdsItemClaimEntity(
+                key = KdsQueueBuilder.buildClaimKey("FLT-20261126-1055", 21, 1),
+                orderId = "FLT-20261126-1055",
+                itemId = 21,
+                itemName = "Cold Brew",
+                unitIndex = 1,
+                status = "MADE",
+                staffName = "Somesh",
+                colorHex = "#16A34A",
+                updatedAt = now
+            ),
+            KdsQueueBuilder.buildClaimKey("FLT-20261126-1055", 21, 2) to KdsItemClaimEntity(
+                key = KdsQueueBuilder.buildClaimKey("FLT-20261126-1055", 21, 2),
+                orderId = "FLT-20261126-1055",
+                itemId = 21,
+                itemName = "Cold Brew",
+                unitIndex = 2,
+                status = "MAKING",
+                staffName = "Kanha",
+                colorHex = "#DC2626",
+                updatedAt = now
+            )
+        )
+
+        composeTestRule.setContent {
+            FiltrTheme {
+                OrdersScreen(
+                    state = BillingUiState(statusFilter = "PENDING", ordersDateFilter = "ALL"),
+                    ordersList = listOf(order),
+                    kdsClaimsByKey = claims,
+                    isStaffMode = false,
+                    onFilterChanged = {},
+                    onToggleMade = {},
+                    onTogglePaid = {},
+                    onToggleDelivered = {},
+                    onSyncOrder = {},
+                    onDeleteOrder = {},
+                    onViewReceipt = {}
+                )
+            }
+        }
+
+        composeTestRule.onNodeWithText("Made by Somesh ✓").assertExists()
+        composeTestRule.onNodeWithText("Making: Kanha").assertExists()
     }
 }

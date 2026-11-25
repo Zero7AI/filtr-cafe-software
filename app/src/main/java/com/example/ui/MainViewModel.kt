@@ -11,6 +11,7 @@ import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.InventoryUsageEntity
+import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.CustomerEntity
 import com.example.data.entity.FixedCostEntity
 import com.example.data.entity.MenuItemEntity
@@ -46,6 +47,9 @@ import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
+import com.example.domain.kds.KdsBaristaColorPalette
+import com.example.domain.kds.KdsQueueBuilder
+import com.example.domain.kds.KdsQueueUnitItem
 import com.example.domain.kitchen.KitchenCountingMode
 import com.example.domain.kitchen.KitchenInventoryCalculator
 import com.example.domain.kitchen.KitchenSection
@@ -75,10 +79,10 @@ import kotlinx.coroutines.launch
 val STAFF_ALLOWED_TABS: Set<FiltrTab> = setOf(
     FiltrTab.BILLING,
     FiltrTab.ORDERS,
+    FiltrTab.KDS,
     FiltrTab.CHECKLIST,
     FiltrTab.KITCHEN_INVENTORY,
-    FiltrTab.ATTENDANCE,
-    FiltrTab.MANUAL_INVENTORY
+    FiltrTab.ATTENDANCE
 )
 
 data class InventoryOrderItemInput(
@@ -91,6 +95,7 @@ data class InventoryOrderItemInput(
 enum class FiltrTab {
     BILLING,
     ORDERS,
+    KDS,
     MENU,
     DASHBOARD,
     INVENTORY_ORDER,
@@ -103,8 +108,7 @@ enum class FiltrTab {
     VOICE_ORDER,
     CHECKLIST,
     KITCHEN_INVENTORY,
-    ATTENDANCE,
-    MANUAL_INVENTORY
+    ATTENDANCE
 }
 
 data class ChecklistItemUiModel(
@@ -254,7 +258,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = FiltrRepository(
         database.menuDao(), database.orderDao(), database.upiAccountDao(),
         database.inventoryDao(), database.customerDao(), database.fixedCostDao(),
-        database.checklistDao(), database.kitchenInventoryDao(), database.attendanceDao()
+        database.checklistDao(), database.kitchenInventoryDao(), database.attendanceDao(),
+        database.kdsClaimDao()
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
@@ -716,6 +721,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value.operatorName.trim().ifBlank { "Staff" }
     )
 
+    private val _selectedKdsBaristaName = MutableStateFlow("")
+    val selectedKdsBaristaName: StateFlow<String> = combine(
+        _selectedKdsBaristaName,
+        _uiState.map { it.operatorName.trim().ifBlank { "Barista" } }.distinctUntilChanged(),
+        availableAttendanceStaffNames
+    ) { selected, operatorName, available ->
+        val cleanSelected = selected.trim()
+        if (cleanSelected.isNotBlank()) {
+            available.firstOrNull { it.equals(cleanSelected, ignoreCase = true) } ?: cleanSelected
+        } else {
+            available.firstOrNull { it.equals(operatorName, ignoreCase = true) } ?: operatorName
+        }
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        _uiState.value.operatorName.trim().ifBlank { "Barista" }
+    )
+
+    private val _kdsPaidOnlyFilter = MutableStateFlow(false)
+    val kdsPaidOnlyFilter: StateFlow<Boolean> = _kdsPaidOnlyFilter.asStateFlow()
+
+    val kdsClaimsByKey: StateFlow<Map<String, KdsItemClaimEntity>> = repository.allKdsClaims
+        .map { claims -> claims.associateBy { it.key } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+
+    val kdsFifoQueue: StateFlow<List<KdsQueueUnitItem>> = combine(
+        repository.allOrders,
+        kdsClaimsByKey,
+        staffRoster,
+        _kdsPaidOnlyFilter
+    ) { orders, claimsMap, roster, paidOnly ->
+        val rosterMap = roster.associateBy { AttendanceCalculator.normalizeStaffKey(it.name) }
+        KdsQueueBuilder.buildFifoPendingQueue(
+            orders = orders,
+            claimsByKey = claimsMap,
+            rosterByNormalizedName = rosterMap,
+            paidOnlyFilter = paidOnly
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val _selectedManagerAttendanceStaff = MutableStateFlow("")
     val selectedManagerAttendanceStaff: StateFlow<String> = combine(
         _selectedManagerAttendanceStaff,
@@ -947,6 +992,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     reconcileAttendanceStoreConfigFromCloud()
                     repository.reconcileAttendanceFromCloud(todayDateKey.substring(0, 7))
                     repository.reconcileStaffRosterFromCloud()
+                    repository.reconcileKdsClaimsFromCloud()
                 } else {
                     Log.w("MainViewModel", "Supabase init failed — falling back to Firestore")
                     initFirestoreFallback()
@@ -996,6 +1042,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     reconcileAttendanceStoreConfigFromCloud()
                     repository.reconcileAttendanceFromCloud(_activeDateKey.value.substring(0, 7))
                     repository.reconcileStaffRosterFromCloud()
+                    repository.reconcileKdsClaimsFromCloud()
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
@@ -1636,7 +1683,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     targetUnitIndex
                 }
                 val safeQty = newCompletedQty.coerceIn(0, totalQty)
-                val updatedOrder = repository.updateOrderItemCompletedQuantity(orderId, itemId, safeQty)
+                val updatedOrder = repository.updateOrderItemCompletedQuantity(
+                    orderId = orderId,
+                    itemId = itemId,
+                    completedQty = safeQty,
+                    performedByStaff = selectedKdsBaristaName.value
+                )
 
                 val url = _uiState.value.googleSheetsWebhookUrl
                 if (url.isNotBlank() && updatedOrder != null) {
@@ -4748,6 +4800,82 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectManagerAttendanceStaff(staffName: String) {
         _selectedManagerAttendanceStaff.value = staffName
+    }
+
+    // ==================== KDS QUEUE ACTIONS ====================
+
+    fun selectKdsBarista(baristaName: String) {
+        val clean = baristaName.trim()
+        if (clean.isNotBlank()) {
+            _selectedKdsBaristaName.value = clean
+        }
+    }
+
+    fun setKdsPaidOnlyFilter(paidOnly: Boolean) {
+        _kdsPaidOnlyFilter.value = paidOnly
+    }
+
+    fun onKdsItemTap(unit: KdsQueueUnitItem) {
+        if (!ensureAppAllowed()) return
+        val activeBarista = selectedKdsBaristaName.value.trim().ifBlank {
+            _uiState.value.operatorName.trim().ifBlank { "Barista" }
+        }
+        val rosterColor = staffRoster.value
+            .firstOrNull { AttendanceCalculator.normalizeStaffKey(it.name) == AttendanceCalculator.normalizeStaffKey(activeBarista) }
+            ?.colorHex.orEmpty()
+        val baristaColor = KdsBaristaColorPalette.resolveColorHex(activeBarista, rosterColor)
+        val isAdminOverride = _uiState.value.currentRole == "ADMIN"
+
+        viewModelScope.launch {
+            try {
+                when (
+                    val outcome = repository.handleKdsItemTap(
+                        orderId = unit.orderId,
+                        itemId = unit.itemId,
+                        unitIndex = unit.unitIndex,
+                        baristaName = activeBarista,
+                        baristaColorHex = baristaColor,
+                        isAdminOverride = isAdminOverride
+                    )
+                ) {
+                    is FiltrRepository.KdsTapOutcome.Claimed -> {
+                        // Immediate visual color highlight in KdsScreen; no noisy toast needed
+                    }
+                    is FiltrRepository.KdsTapOutcome.Completed -> {
+                        val url = _uiState.value.googleSheetsWebhookUrl
+                        if (url.isNotBlank() && outcome.updatedOrder != null) {
+                            repository.syncOrderToGoogleSheets(url, outcome.updatedOrder)
+                        }
+                    }
+                    is FiltrRepository.KdsTapOutcome.BlockedByOtherBarista -> {
+                        _uiState.update {
+                            it.copy(
+                                snackbarMessage = "Assigned to ${outcome.claimedByStaff} (Long-press card to unclaim)"
+                            )
+                        }
+                    }
+                    FiltrRepository.KdsTapOutcome.Ignored -> Unit
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "KDS update failed: ${e.message}") }
+            }
+        }
+    }
+
+    fun onKdsItemUnclaim(unit: KdsQueueUnitItem) {
+        if (!ensureAppAllowed()) return
+        viewModelScope.launch {
+            try {
+                val unclaimed = repository.unclaimKdsItem(unit.orderId, unit.itemId, unit.unitIndex)
+                if (unclaimed) {
+                    _uiState.update {
+                        it.copy(snackbarMessage = "Released ${unit.itemName} (#${unit.shortOrderNumber}) back to queue")
+                    }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to release item: ${e.message}") }
+            }
+        }
     }
 
     companion object {
