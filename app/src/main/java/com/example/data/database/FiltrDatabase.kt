@@ -29,6 +29,7 @@ import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
+import com.example.data.entity.StaffRosterEntity
 import com.example.data.entity.UpiAccountEntity
 import com.example.domain.kitchen.KitchenInventorySeedCatalog
 import kotlinx.coroutines.CoroutineScope
@@ -47,9 +48,10 @@ import java.util.Locale
         InventoryUsageEntity::class, CustomerEntity::class, FixedCostEntity::class,
         ChecklistTaskEntity::class, ChecklistCompletionEntity::class,
         KitchenInventoryItemEntity::class, KitchenInventoryShiftEntity::class,
-        KitchenInventoryEntryEntity::class, AttendanceLogEntity::class
+        KitchenInventoryEntryEntity::class, AttendanceLogEntity::class,
+        StaffRosterEntity::class
     ],
-    version = 15,
+    version = 16,
     exportSchema = false
 )
 abstract class FiltrDatabase : RoomDatabase() {
@@ -289,6 +291,23 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_15_16 = object : androidx.room.migration.Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `staff_roster` (
+                        `id` TEXT NOT NULL PRIMARY KEY,
+                        `name` TEXT NOT NULL,
+                        `roleTitle` TEXT NOT NULL DEFAULT 'Barista',
+                        `shiftLabel` TEXT NOT NULL DEFAULT 'Full Day',
+                        `weeklyOffDayOfWeek` INTEGER NOT NULL DEFAULT 0,
+                        `joinedDateKey` TEXT NOT NULL DEFAULT '',
+                        `isActive` INTEGER NOT NULL DEFAULT 1,
+                        `updatedAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                """.trimIndent())
+            }
+        }
+
         internal fun getInstanceOrNull(): FiltrDatabase? = INSTANCE
 
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
@@ -305,7 +324,8 @@ abstract class FiltrDatabase : RoomDatabase() {
                     MIGRATION_11_12,
                     MIGRATION_12_13,
                     MIGRATION_13_14,
-                    MIGRATION_14_15
+                    MIGRATION_14_15,
+                    MIGRATION_15_16
                 )
                 .fallbackToDestructiveMigration(true) // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))

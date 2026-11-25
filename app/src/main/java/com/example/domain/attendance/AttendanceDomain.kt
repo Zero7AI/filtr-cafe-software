@@ -1,6 +1,7 @@
 package com.example.domain.attendance
 
 import com.example.data.entity.AttendanceLogEntity
+import com.example.data.entity.StaffRosterEntity
 import java.util.Calendar
 import java.util.GregorianCalendar
 import java.util.Locale
@@ -32,6 +33,8 @@ enum class DayAttendanceStatus {
     PRESENT,
     ON_DUTY,
     ABSENT,
+    WEEKLY_OFF,
+    NOT_JOINED,
     UPCOMING
 }
 
@@ -52,6 +55,15 @@ data class MonthlyAttendanceSummary(
     val totalWorkedMinutes: Int,
     val attendancePercent: Int
 )
+
+data class TeamRollCallRow(
+    val member: StaffRosterEntity,
+    val todayLog: AttendanceLogEntity?,
+    val todayStatus: DayAttendanceStatus,
+    val monthlySummary: MonthlyAttendanceSummary
+)
+
+fun formatDayOfWeekShort(dayOfWeek: Int): String = AttendanceCalculator.formatDayOfWeekShort(dayOfWeek)
 
 object AttendanceCalculator {
 
@@ -125,12 +137,24 @@ object AttendanceCalculator {
         }
     }
 
+    fun formatDayOfWeekShort(dayOfWeek: Int): String = when (dayOfWeek) {
+        Calendar.SUNDAY -> "Sun"
+        Calendar.MONDAY -> "Mon"
+        Calendar.TUESDAY -> "Tue"
+        Calendar.WEDNESDAY -> "Wed"
+        Calendar.THURSDAY -> "Thu"
+        Calendar.FRIDAY -> "Fri"
+        Calendar.SATURDAY -> "Sat"
+        else -> "None"
+    }
+
     fun buildMonthlySummary(
         monthKey: String,
         staffName: String,
         logs: List<AttendanceLogEntity>,
         trackingStartDateKey: String?,
-        todayDateKey: String
+        todayDateKey: String,
+        weeklyOffDayOfWeek: Int = 0
     ): MonthlyAttendanceSummary {
         val parts = monthKey.split("-")
         val year = parts.getOrNull(0)?.toIntOrNull()
@@ -178,6 +202,7 @@ object AttendanceCalculator {
         val calendarDays = (1..daysInMonth).map { day ->
             val dateKey = String.format(Locale.US, "%04d-%02d-%02d", year, month, day)
             val log = logsByDate[dateKey]
+            val dayCal = GregorianCalendar(year, month - 1, day)
 
             val status = when {
                 dateKey > todayDateKey -> DayAttendanceStatus.UPCOMING
@@ -196,11 +221,13 @@ object AttendanceCalculator {
                     presentDays++
                     DayAttendanceStatus.ON_DUTY
                 }
-                dateKey >= effectiveStartDateKey -> {
+                dateKey < effectiveStartDateKey -> DayAttendanceStatus.NOT_JOINED
+                weeklyOffDayOfWeek in Calendar.SUNDAY..Calendar.SATURDAY &&
+                    dayCal.get(Calendar.DAY_OF_WEEK) == weeklyOffDayOfWeek -> DayAttendanceStatus.WEEKLY_OFF
+                else -> {
                     absentDays++
                     DayAttendanceStatus.ABSENT
                 }
-                else -> DayAttendanceStatus.UPCOMING
             }
 
             AttendanceCalendarDay(

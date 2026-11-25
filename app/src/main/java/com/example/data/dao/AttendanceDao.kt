@@ -5,6 +5,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.example.data.entity.AttendanceLogEntity
+import com.example.data.entity.StaffRosterEntity
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -30,4 +31,24 @@ interface AttendanceDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertLogs(logs: List<AttendanceLogEntity>)
+
+    // ==================== STAFF ROSTER ====================
+
+    @Query("SELECT * FROM staff_roster ORDER BY isActive DESC, name ASC")
+    fun getAllRosterMembers(): Flow<List<StaffRosterEntity>>
+
+    @Query("SELECT * FROM staff_roster WHERE isActive = 1 ORDER BY name ASC")
+    fun getActiveRosterMembers(): Flow<List<StaffRosterEntity>>
+
+    @Query("SELECT * FROM staff_roster ORDER BY isActive DESC, name ASC")
+    suspend fun getAllRosterMembersSync(): List<StaffRosterEntity>
+
+    @Query("SELECT * FROM staff_roster WHERE id = :id LIMIT 1")
+    suspend fun getRosterMemberById(id: String): StaffRosterEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertRosterMember(member: StaffRosterEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertRosterMembers(members: List<StaffRosterEntity>)
 }
