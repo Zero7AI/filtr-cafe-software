@@ -11,56 +11,169 @@ class LocalOrderEngine {
 
     private var lastOrderModality: VoiceModalityProfile? = null
 
-    private val wordToNum: Map<String, Int> = mapOf(
-        "a" to 1, "an" to 1, "one" to 1, "single" to 1,
-        "two" to 2, "couple" to 2, "pair" to 2, "double" to 2,
-        "three" to 3, "triple" to 3,
-        "four" to 4, "five" to 5, "six" to 6,
-        "seven" to 7, "eight" to 8, "nine" to 9, "ten" to 10,
-        // Hindi / Hinglish numerals
-        "ek" to 1, "ik" to 1, "aik" to 1, "एक" to 1,
-        "do" to 2, "dono" to 2, "दो" to 2,
-        "teen" to 3, "tin" to 3, "तीन" to 3,
-        "chaar" to 4, "char" to 4, "चार" to 4,
-        "paanch" to 5, "panch" to 5, "punch" to 5, "पांच" to 5,
-        "chhe" to 6, "che" to 6, "छह" to 6,
-        "saat" to 7, "sat" to 7, "सात" to 7,
-        "aath" to 8, "ath" to 8, "आठ" to 8,
-        "nau" to 9, "नौ" to 9,
-        "das" to 10, "दस" to 10
-    )
-
-    private val removalKeywords = listOf(
-        "remove", "hata do", "hatao", "hata dena", "hata de", "nikal do", "nikal dena", "nikalo",
-        "cancel", "minus", "delete", "kam kar do", "kam kardo", "mat daalna", "mat dalo", "mat do",
-        "nahi chahiye", "nahi mangta", "cancel karo", "cancel kardo", "last wala hata do", "drop"
-    )
-
-    private val explicitAdditiveKeywords = listOf(
-        "add", "more", "another", "plus", "also", "aur", "ek aur", "do aur", "extra"
-    )
-
-    private val resetKeywords = listOf(
-        "clear", "reset", "naya order", "cancel all", "sab hata do", "pura hata do",
-        "sab cancel", "cancel order", "sab nikal do", "start over", "khatam karo", "restart"
-    )
-
-    private val confirmKeywords = listOf(
-        "confirm", "done", "bas itna hi", "itna hi", "bill bana do", "bill banao",
-        "order done", "place order", "checkout", "ho gaya", "theek hai", "thik hai",
-        "bas", "pack kar do", "pack kardo", "order confirm"
-    )
-
-    fun resetSession() {
-        lastOrderModality = null
-    }
-
     private data class ExtractedItemMatch(
         val item: CatalogItem,
         val start: Int,
         val end: Int,
         val matchedAlias: String
     )
+
+    private data class StandaloneQtyResult(val quantity: Int, val isAdditive: Boolean)
+
+    private data class QtyCandidate(val value: Int, val isArticle: Boolean)
+
+    private data class DetectedNote(val category: String, val text: String)
+
+    companion object {
+        private val WORD_TO_NUM: Map<String, Int> = mapOf(
+            "a" to 1, "an" to 1, "one" to 1, "single" to 1,
+            "two" to 2, "couple" to 2, "pair" to 2, "double" to 2,
+            "three" to 3, "triple" to 3,
+            "four" to 4, "five" to 5, "six" to 6,
+            "seven" to 7, "eight" to 8, "nine" to 9, "ten" to 10,
+            // Hindi / Hinglish numerals
+            "ek" to 1, "ik" to 1, "aik" to 1, "एक" to 1,
+            "do" to 2, "dono" to 2, "दो" to 2,
+            "teen" to 3, "tin" to 3, "तीन" to 3,
+            "chaar" to 4, "char" to 4, "चार" to 4,
+            "paanch" to 5, "panch" to 5, "punch" to 5, "पांच" to 5,
+            "chhe" to 6, "che" to 6, "छह" to 6,
+            "saat" to 7, "sat" to 7, "सात" to 7,
+            "aath" to 8, "ath" to 8, "आठ" to 8,
+            "nau" to 9, "नौ" to 9,
+            "das" to 10, "दस" to 10
+        )
+
+        private val ARTICLE_WORDS = setOf("a", "an")
+
+        private val UNIT_COUNTER_WORDS = setOf(
+            "piece", "pieces", "pcs", "pc", "cup", "cups",
+            "plate", "plates", "glass", "glasses", "bottle", "bottles", "nos", "no"
+        )
+
+        private val REMOVAL_KEYWORDS = listOf(
+            "remove", "hata do", "hatao", "hata dena", "hata de", "nikal do", "nikal dena", "nikalo",
+            "cancel", "minus", "delete", "kam kar do", "kam kardo", "mat daalna", "mat dalo", "mat do",
+            "nahi chahiye", "nahi mangta", "cancel karo", "cancel kardo", "last wala hata do", "drop"
+        )
+
+        private val EXPLICIT_ADDITIVE_KEYWORDS = listOf(
+            "add", "more", "another", "plus", "also", "aur", "ek aur", "do aur", "extra"
+        )
+
+        private val RESET_KEYWORDS = listOf(
+            "clear", "reset", "naya order", "cancel all", "sab hata do", "pura hata do",
+            "sab cancel", "cancel order", "sab nikal do", "start over", "khatam karo", "restart"
+        )
+
+        private val CONFIRM_KEYWORDS = listOf(
+            "confirm", "done", "bas itna hi", "itna hi", "bill bana do", "bill banao",
+            "order done", "place order", "checkout", "ho gaya", "theek hai", "thik hai",
+            "bas", "pack kar do", "pack kardo", "order confirm"
+        )
+
+        private val NOTES_CLEAR_KEYWORDS = listOf(
+            "remove notes", "clear notes", "notes hata do", "hata do notes", "delete notes", "reset notes"
+        )
+
+        private val META_KEYWORDS = listOf(
+            "check", "recording", "conversation", "analyze", "listen", "understand",
+            "improvement", "minutes", "minute", "model", "converter", "mortal"
+        )
+
+        private fun boundaryRegex(phrase: String): Regex =
+            Regex("(?<![\\p{L}\\p{N}_])${Regex.escape(phrase)}(?![\\p{L}\\p{N}_])")
+
+        private val REMOVAL_REGEXES = REMOVAL_KEYWORDS.map(::boundaryRegex)
+        private val ADDITIVE_REGEXES = EXPLICIT_ADDITIVE_KEYWORDS.map(::boundaryRegex)
+        private val RESET_REGEXES = RESET_KEYWORDS.map(::boundaryRegex)
+        private val CONFIRM_REGEXES = CONFIRM_KEYWORDS.map(::boundaryRegex)
+        private val NOTES_CLEAR_REGEXES = NOTES_CLEAR_KEYWORDS.map(::boundaryRegex)
+        private val META_REGEXES = META_KEYWORDS.map(::boundaryRegex)
+
+        private val CATEGORY_WORD_REGEXES = listOf(
+            "sandwich", "fries", "frappe", "coffee", "tea", "burger", "pizza", "wrap"
+        ).associateWith(::boundaryRegex)
+
+        // Strip leading/trailing punctuation without stripping Unicode combining marks (e.g. Devanagari matras)
+        private val PUNCT_EDGE_REGEX = Regex("^[\\p{P}\\p{S}]+|[\\p{P}\\p{S}]+$")
+        private val WHITESPACE_REGEX = Regex("\\s+")
+        private val CONJUNCTION_REGEX = Regex("\\b(?:aur|and|plus|or|with)\\b|[,;.]+")
+        private val NON_ITEM_NUM_CONTEXT_REGEX = Regex(
+            "\\b(?:table|order|counter|token|bill|receipt|seat|chair|car|gaadi|gadi|vehicle|phone|mobile|contact)\\s*(?:no\\.?|number|num|#)?\\s*\\d+\\b"
+        )
+
+        private val NON_ARTICLE_NUMERAL_GROUP = (WORD_TO_NUM.keys - ARTICLE_WORDS)
+            .sortedByDescending { it.length }
+            .joinToString("|") { Regex.escape(it) }
+
+        private val EXPLICIT_PREFIX_NUMERAL_REGEX = Regex(
+            "(?<![\\p{L}\\p{N}_])(?:\\d+|$NON_ARTICLE_NUMERAL_GROUP)(?![\\p{L}\\p{N}_])"
+        )
+
+        private val ADDITIVE_BEFORE_REGEX = Regex(
+            "(?<![\\p{L}\\p{N}_])(\\d+|$NON_ARTICLE_NUMERAL_GROUP)\\s+(?:aur|more)(?![\\p{L}\\p{N}_])"
+        )
+        private val ADDITIVE_AFTER_REGEX = Regex(
+            "(?<![\\p{L}\\p{N}_])(?:aur|more|plus|add|another)\\s+(\\d+|$NON_ARTICLE_NUMERAL_GROUP)(?![\\p{L}\\p{N}_])"
+        )
+        private val ANOTHER_REGEX = boundaryRegex("another")
+        private val DOUBLE_REGEX = Regex("\\b(?:double|do\\s*kardo|do\\s*kar\\s*do|two\\s*times)\\b")
+        private val TRIPLE_REGEX = Regex("\\b(?:triple|teen\\s*kardo|teen\\s*kar\\s*do|three\\s*times)\\b")
+        private val STANDALONE_FILLER_REGEX = Regex("\\b(?:kar\\s*do|kardo|piece|only)\\b")
+        private val LEADING_ADDITIVE_REGEX = Regex(
+            "^(?:aur|or|add)\\b|\\b(?:another|(?:\\d+|$NON_ARTICLE_NUMERAL_GROUP)\\s+more)\\b"
+        )
+
+        // Precompiled Hinglish normalization rules
+        private val HINGLISH_KAR_DO = Regex("\\bkar\\s+do\\b")
+        private val HINGLISH_HATA = Regex("\\bhata\\s*(do|dena|de|o)?\\b")
+        private val HINGLISH_NIKAL = Regex("\\bnikal\\s*(do|dena|de|o)?\\b")
+        private val HINGLISH_MAT = Regex("\\bmat\\s+(dalo|dalna|do)\\b")
+        private val HINGLISH_NAHI = Regex("\\bnahi\\s+chahiye\\b")
+        private val HINGLISH_CANCEL = Regex("\\bcancel\\s+(kar\\s*do|karo)?\\b")
+        private val HINGLISH_BANA = Regex("\\bbana\\s+do\\b")
+        private val HINGLISH_DE = Regex("\\bde\\s+do\\b")
+        private val HINGLISH_RAKH = Regex("\\brakh\\s+do\\b")
+        private val HINGLISH_PACK = Regex("\\bpack\\s+(kar\\s*do|kardo)?\\b")
+        private val HINGLISH_OPENER = Regex(
+            "^(acha|achha|theek|thik|aapka|aap|sir|madam|bhaiya|bhai|hello|hey|are|arrey)\\s+"
+        )
+
+        // Order notes precompiled patterns
+        private const val INDIAN_RTO_CODES =
+            "(?:an|ap|ar|as|br|cg|ch|dd|dl|dn|ga|gj|hp|hr|jh|jk|ka|kl|la|ld|mh|ml|mn|mp|mz|nl|od|or|pb|py|rj|sk|tn|tr|ts|uk|up|wb)"
+        private val INDIAN_PLATE_REGEX = Regex(
+            "\\b($INDIAN_RTO_CODES\\s*\\d{1,2}\\s*[a-z]{1,3}\\s*\\d{4}|\\d{2}\\s*bh\\s*\\d{4}\\s*[a-z]{1,2})\\b"
+        )
+        private val CAR_NUM_EXPLICIT_REGEX = Regex(
+            "\\b(?:car|gaadi|gadi|vehicle)\\s*(?:no\\.?|number|num|#)\\s*([a-z]{0,2}\\s*\\d{1,4})\\b"
+        )
+        private val CAR_NUM_BARE_REGEX = Regex(
+            "\\b(?:car|gaadi|gadi|vehicle)\\s+(\\d{3,4})\\b"
+        )
+        private val PARKING_REGEX = Regex("\\b(parking|parking delivery|car mein|gaadi mein)\\b")
+        private val PACK_REGEX = Regex(
+            "\\b(pack|pack\\s*kardo|pack\\s*kar\\s*do|parcel|parcel\\s*kardo|parcel\\s*kar\\s*do|takeaway|take\\s*away|to\\s*go)\\b"
+        )
+        private val DINE_IN_REGEX = Regex("\\b(dine\\s*in|yahi\\s*khayenge|table\\s*pe)\\b")
+        private val NO_SUGAR_REGEX = Regex("\\b(bina\\s*cheeni|no\\s*sugar|without\\s*sugar|sugar\\s*free|sugarfree)\\b")
+        private val LESS_SUGAR_REGEX = Regex("\\b(kam\\s*cheeni|less\\s*sugar|less\\s*sweet|sweet\\s*kam|kam\\s*meetha)\\b")
+        private val EXTRA_HOT_REGEX = Regex("\\b(extra\\s*hot|bahut\\s*garam|jyada\\s*garam|kadak)\\b")
+        private val MILD_SPICY_REGEX = Regex("\\b(kam\\s*spicy|less\\s*spicy|no\\s*spicy|kam\\s*mirchi|bina\\s*mirchi)\\b")
+        private val EXTRA_SPICY_REGEX = Regex("\\b(extra\\s*spicy|jyada\\s*spicy|bahut\\s*spicy|tez\\s*mirchi)\\b")
+        private val NO_ICE_REGEX = Regex("\\b(bina\\s*baraf|no\\s*ice|without\\s*ice)\\b")
+        private val LESS_ICE_REGEX = Regex("\\b(less\\s*ice|kam\\s*baraf)\\b")
+        private val NO_ONION_REGEX = Regex("\\b(bina\\s*pyaz|no\\s*onion|jain)\\b")
+        private val EXTRA_ONION_REGEX = Regex("\\b(extra\\s*onion|jyada\\s*pyaz)\\b")
+        private val OAT_MILK_REGEX = Regex("\\b(oat\\s*milk)\\b")
+        private val ALMOND_MILK_REGEX = Regex("\\b(almond\\s*milk)\\b")
+        private val DIGITS_ONLY_REGEX = Regex("\\d+")
+    }
+
+    fun resetSession() {
+        lastOrderModality = null
+    }
 
     fun processUtterance(
         rawText: String,
@@ -70,8 +183,19 @@ class LocalOrderEngine {
         val text = rawText.lowercase().trim()
         if (text.isBlank()) return currentState
 
-        // 1. Check Global Reset Commands
-        if (resetKeywords.any { text.contains(it) }) {
+        val cleaned = normalizeHinglish(text)
+
+        // Check notes clear BEFORE global reset so "clear notes" / "reset notes" does not wipe the entire cart
+        if (NOTES_CLEAR_REGEXES.any { it.containsMatchIn(cleaned) || it.containsMatchIn(text) }) {
+            return currentState.copy(
+                lastTranscript = rawText,
+                orderNotes = null,
+                statusMessage = "Cleared order notes"
+            )
+        }
+
+        // 1. Check Global Reset Commands (word-boundary safe)
+        if (RESET_REGEXES.any { it.containsMatchIn(text) }) {
             lastOrderModality = null
             return VoiceOrderState(
                 sessionId = UUID.randomUUID().toString(),
@@ -85,28 +209,15 @@ class LocalOrderEngine {
             )
         }
 
-        // 2. Normalize Hinglish verb phrases and conversational sentence openers
-        val cleaned = normalizeHinglish(text)
-
-        // 3. Extract all non-overlapping menu items in sequence
+        // 2. Extract all non-overlapping menu items in sequence
         val matches = extractAllMenuItems(cleaned)
 
-        // 3b. Extract order notes & modifiers (parking, vehicle plate, dietary notes, packaging)
+        // 3. Extract order notes & modifiers (parking, vehicle plate, dietary notes, packaging)
         val extractedNotes = extractOrderNotes(rawText, currentState.orderNotes)
 
         // If no menu items matched, check for standalone confirmation, removal, quantity update, or notes
         if (matches.isEmpty()) {
-            // Standalone notes clear: user says "remove notes", "clear notes", "notes hata do", "hata do notes"
-            val notesClearKeywords = listOf("remove notes", "clear notes", "notes hata do", "hata do notes", "delete notes", "reset notes")
-            if (notesClearKeywords.any { cleaned.contains(it) || text.lowercase().contains(it) }) {
-                return currentState.copy(
-                    lastTranscript = rawText,
-                    orderNotes = null,
-                    statusMessage = "Cleared order notes"
-                )
-            }
-
-            if (confirmKeywords.any { cleaned.contains(it) }) {
+            if (CONFIRM_REGEXES.any { it.containsMatchIn(cleaned) }) {
                 return currentState.copy(
                     state = VoiceStateMachineEnum.CONFIRMED,
                     lastTranscript = rawText,
@@ -116,13 +227,13 @@ class LocalOrderEngine {
             }
 
             // Standalone removal: user says "hata do", "sandwich hata do", "fries hata do", "cancel", "remove"
-            val isStandaloneRemoval = removalKeywords.any { cleaned.contains(it) }
+            val isStandaloneRemoval = REMOVAL_REGEXES.any { it.containsMatchIn(cleaned) }
             if (isStandaloneRemoval && currentState.items.isNotEmpty()) {
                 val updatedItems = currentState.items.toMutableList()
 
-                // Check if user specifically named a category/item word present in cart (e.g. "sandwich hata do")
-                val categoryWords = listOf("sandwich", "fries", "frappe", "coffee", "tea", "burger", "pizza", "wrap")
-                val mentionedWord = categoryWords.firstOrNull { cleaned.contains(it) }
+                val mentionedWord = CATEGORY_WORD_REGEXES.entries
+                    .firstOrNull { (_, regex) -> regex.containsMatchIn(cleaned) }
+                    ?.key
                 val targetIdx = if (mentionedWord != null) {
                     val found = updatedItems.indexOfLast { it.name.lowercase().contains(mentionedWord) }
                     if (found >= 0) found else updatedItems.size - 1
@@ -132,23 +243,20 @@ class LocalOrderEngine {
 
                 val removedItem = updatedItems.removeAt(targetIdx)
                 val subtotal = updatedItems.sumOf { it.itemTotal }
-                val tax = 0.0 // FILTR: Zero GST in Voice Order
-                val grandTotal = subtotal
                 val newState = if (updatedItems.isEmpty()) VoiceStateMachineEnum.IDLE else VoiceStateMachineEnum.ORDER_BUILDING
                 return currentState.copy(
                     state = newState,
                     items = updatedItems,
                     subtotal = subtotal,
-                    tax = tax,
-                    total = grandTotal,
+                    tax = 0.0,
+                    total = subtotal,
                     lastTranscript = rawText,
                     orderNotes = extractedNotes,
                     statusMessage = "Removed ${removedItem.name}"
                 )
             }
 
-            // Standalone quantity update on existing cart items:
-            // e.g. "do", "two", "teen", "three", "ek aur", "one more", "double kar do", "do kar do"
+            // Standalone quantity update on existing cart items
             val standaloneQty = extractStandaloneQuantity(cleaned)
             if (standaloneQty != null && currentState.items.isNotEmpty()) {
                 val updatedItems = currentState.items.toMutableList()
@@ -158,27 +266,23 @@ class LocalOrderEngine {
                     lastItem.quantity + standaloneQty.quantity
                 } else {
                     standaloneQty.quantity
-                }
+                }.coerceAtLeast(1)
                 val lineTotal = newQty * lastItem.unitPrice
                 updatedItems[lastIdx] = lastItem.copy(quantity = newQty, itemTotal = lineTotal)
 
                 val subtotal = updatedItems.sumOf { it.itemTotal }
-                val tax = 0.0 // FILTR: Zero GST in Voice Order
-                val grandTotal = subtotal
-
                 return currentState.copy(
                     state = VoiceStateMachineEnum.ORDER_BUILDING,
                     items = updatedItems,
                     subtotal = subtotal,
-                    tax = tax,
-                    total = grandTotal,
+                    tax = 0.0,
+                    total = subtotal,
                     lastTranscript = rawText,
                     orderNotes = extractedNotes,
                     statusMessage = "Updated ${lastItem.name} to ${newQty}×"
                 )
             }
 
-            // If notes or vehicle details were captured in a standalone remark
             if (extractedNotes != currentState.orderNotes) {
                 return currentState.copy(
                     lastTranscript = rawText,
@@ -193,16 +297,7 @@ class LocalOrderEngine {
             )
         }
 
-        val prevModality = lastOrderModality
-        val isDifferentSpeaker = modality?.isDifferentSpeakerFrom(prevModality) ?: false
-        val modalityTag = modality?.shortSummary(prevModality)
-
-        // Check if entire utterance starts with an additive conjunction
-        val utteranceHasLeadingAdditive = text.startsWith("aur ") ||
-            text.startsWith("or ") ||
-            text.startsWith("add ") ||
-            text.contains("one more") ||
-            text.contains("another")
+        val utteranceHasLeadingAdditive = LEADING_ADDITIVE_REGEX.containsMatchIn(text)
 
         val updatedItems = currentState.items.toMutableList()
         val actionsFeedback = mutableListOf<String>()
@@ -214,28 +309,33 @@ class LocalOrderEngine {
         }
         val isPureConfirmationTurn = allItemsAlreadyInCart && !utteranceHasLeadingAdditive
 
+        var nextPrefixStart = 0
         for ((i, match) in matches.withIndex()) {
-            val prefixStart = if (i > 0) matches[i - 1].end else 0
+            val prefixStart = nextPrefixStart.coerceAtMost(match.start)
             val prefix = cleaned.substring(prefixStart, match.start).trim()
 
-            // Intervening tokens between Item A and Item B belong strictly to Item B's prefix.
-            val suffix = if (i + 1 < matches.size) {
+            // Split intervening text strictly at conjunctions/punctuation so suffix[i] and prefix[i+1] never bleed
+            val suffix: String
+            if (i + 1 < matches.size) {
                 val nextStart = matches[i + 1].start
-                val intervening = cleaned.substring(match.end, nextStart).trim()
-                val conjMatch = Regex("\\b(aur|and|plus|or|with)\\b").find(intervening)
+                val intervening = cleaned.substring(match.end, nextStart)
+                val conjMatch = CONJUNCTION_REGEX.find(intervening)
                 if (conjMatch != null) {
-                    intervening.substring(0, conjMatch.range.first).trim()
+                    suffix = intervening.substring(0, conjMatch.range.first).trim()
+                    nextPrefixStart = match.end + conjMatch.range.last + 1
                 } else {
-                    "" // Belongs to next item's prefix
+                    suffix = ""
+                    nextPrefixStart = match.end
                 }
             } else {
-                cleaned.substring(match.end).trim()
+                suffix = cleaned.substring(match.end).trim()
+                nextPrefixStart = cleaned.length
             }
 
-            val isRemoval = removalKeywords.any { prefix.contains(it) || suffix.contains(it) }
-            val rawQuantity = extractQuantityFromContext(prefix, suffix, isFirstItem = (i == 0))
+            val isRemoval = REMOVAL_REGEXES.any { it.containsMatchIn(prefix) || it.containsMatchIn(suffix) }
+            val rawQuantity = extractQuantityFromContext(prefix, suffix)
             val isExplicitlyAdditive = utteranceHasLeadingAdditive ||
-                explicitAdditiveKeywords.any { kw -> Regex("\\b$kw\\b").containsMatchIn(prefix) }
+                ADDITIVE_REGEXES.any { it.containsMatchIn(prefix) }
             val modifiers = extractModifiers("$prefix $suffix")
 
             val matchedItem = match.item
@@ -246,8 +346,8 @@ class LocalOrderEngine {
             }
             val existing = if (existingIndex >= 0) updatedItems[existingIndex] else null
 
-            // In a pure confirmation turn without explicit additive words, keep existing cart quantity
-            val hasExplicitPrefixNumeral = Regex("\\b(\\d+|ek|do|teen|char|chaar|punch|paanch|one|two|three|four|five)\\b").containsMatchIn(prefix)
+            // In a pure confirmation turn without explicit numerals, keep existing cart quantity
+            val hasExplicitPrefixNumeral = EXPLICIT_PREFIX_NUMERAL_REGEX.containsMatchIn(prefix)
             val quantity = if (isPureConfirmationTurn && existing != null && !hasExplicitPrefixNumeral) {
                 existing.quantity
             } else {
@@ -271,29 +371,26 @@ class LocalOrderEngine {
             } else {
                 if (existingIndex >= 0 && existing != null) {
                     if (isExplicitlyAdditive) {
-                        // Explicit request to add more ("add one...", "one more...", "aur ek...")
                         val newQty = existing.quantity + quantity
                         val lineTotal = newQty * existing.unitPrice
                         updatedItems[existingIndex] = existing.copy(quantity = newQty, itemTotal = lineTotal)
                         actionsFeedback.add("Added +$quantity ${matchedItem.name} (${newQty}×)")
                     } else if (quantity == existing.quantity) {
-                        // Staff Repeat-Back Confirmation (or Customer repeating same item & quantity) -> IDEMPOTENT (No double-add)
                         actionsFeedback.add("Confirmed ${existing.quantity}× ${matchedItem.name}")
                     } else {
-                        // Different target quantity stated without 'more' -> Reconcile/SET to target quantity
                         val lineTotal = quantity * existing.unitPrice
                         updatedItems[existingIndex] = existing.copy(quantity = quantity, itemTotal = lineTotal)
                         actionsFeedback.add("Synced ${matchedItem.name} to ${quantity}×")
                     }
                 } else {
-                    // Brand-new item added to cart
-                    val lineTotal = quantity * matchedItem.price
+                    val effectiveUnitPrice = matchedItem.price + modifiers.sumOf { it.priceDelta }
+                    val lineTotal = quantity * effectiveUnitPrice
                     val newItem = VoiceOrderLineItem(
                         lineId = UUID.randomUUID().toString(),
                         sku = "SKU_${matchedItem.id}",
                         name = matchedItem.name,
                         quantity = quantity,
-                        unitPrice = matchedItem.price,
+                        unitPrice = effectiveUnitPrice,
                         modifiers = modifiers,
                         itemTotal = lineTotal
                     )
@@ -308,10 +405,7 @@ class LocalOrderEngine {
         }
 
         val subtotal = updatedItems.sumOf { it.itemTotal }
-        val tax = 0.0 // FILTR: Zero GST in Voice Order
-        val grandTotal = subtotal
-
-        val isUtteranceConfirmed = confirmKeywords.any { cleaned.contains(it) }
+        val isUtteranceConfirmed = CONFIRM_REGEXES.any { it.containsMatchIn(cleaned) }
         val newState = when {
             isUtteranceConfirmed -> VoiceStateMachineEnum.CONFIRMED
             updatedItems.isNotEmpty() -> VoiceStateMachineEnum.ORDER_BUILDING
@@ -328,8 +422,8 @@ class LocalOrderEngine {
             state = newState,
             items = updatedItems,
             subtotal = subtotal,
-            tax = tax,
-            total = grandTotal,
+            tax = 0.0,
+            total = subtotal,
             lastTranscript = rawText,
             statusMessage = feedbackMsg,
             orderNotes = extractedNotes
@@ -338,30 +432,25 @@ class LocalOrderEngine {
 
     private fun normalizeHinglish(raw: String): String {
         return raw.lowercase().trim()
-            .replace(Regex("\\bkar\\s+do\\b"), "kardo")
-            .replace(Regex("\\bhata\\s*(do|dena|de|o)?\\b"), "remove")
-            .replace(Regex("\\bnikal\\s*(do|dena|de|o)?\\b"), "remove")
-            .replace(Regex("\\bmat\\s+(dalo|dalna|do)\\b"), "remove")
-            .replace(Regex("\\bnahi\\s+chahiye\\b"), "remove")
-            .replace(Regex("\\bcancel\\s+(kar\\s*do|karo)?\\b"), "cancel")
-            .replace(Regex("\\bbana\\s+do\\b"), "make")
-            .replace(Regex("\\bde\\s+do\\b"), "give")
-            .replace(Regex("\\brakh\\s+do\\b"), "keep")
-            .replace(Regex("\\bpack\\s+(kar\\s*do|kardo)?\\b"), "pack")
-            .replace(Regex("^(acha|achha|theek|thik|aapka|aap|sir|madam|bhaiya|bhai|hello|hey|are|arrey)\\s+"), "")
+            .replace(HINGLISH_KAR_DO, "kardo")
+            .replace(HINGLISH_HATA, "remove")
+            .replace(HINGLISH_NIKAL, "remove")
+            .replace(HINGLISH_MAT, "remove")
+            .replace(HINGLISH_NAHI, "remove")
+            .replace(HINGLISH_CANCEL, "cancel")
+            .replace(HINGLISH_BANA, "make")
+            .replace(HINGLISH_DE, "give")
+            .replace(HINGLISH_RAKH, "keep")
+            .replace(HINGLISH_PACK, "pack")
+            .replace(HINGLISH_OPENER, "")
     }
 
     private fun extractAllMenuItems(text: String): List<ExtractedItemMatch> {
+        val matchers = MenuCatalog.getCompiledMatchers()
         val allMatches = mutableListOf<ExtractedItemMatch>()
-        for (item in MenuCatalog.items) {
-            val candidates = (item.aliases + listOf(item.name.lowercase()))
-                .distinct()
-                .sortedByDescending { it.length }
-            for (alias in candidates) {
-                val pattern = Regex("\\b${Regex.escape(alias)}\\b")
-                for (m in pattern.findAll(text)) {
-                    allMatches.add(ExtractedItemMatch(item, m.range.first, m.range.last + 1, alias))
-                }
+        for (matcher in matchers) {
+            for (m in matcher.regex.findAll(text)) {
+                allMatches.add(ExtractedItemMatch(matcher.item, m.range.first, m.range.last + 1, matcher.alias))
             }
         }
 
@@ -380,32 +469,64 @@ class LocalOrderEngine {
         return nonOverlapping
     }
 
-    private fun extractQuantityFromContext(prefix: String, suffix: String, isFirstItem: Boolean): Int {
-        // 1. Check explicit digits (1..99) in prefix
-        val prefixDigitMatch = Regex("\\b(\\d+)\\b").find(prefix)
-        if (prefixDigitMatch != null) {
-            val num = prefixDigitMatch.groupValues[1].toIntOrNull()
-            if (num != null && num in 1..99) return num
-        }
+    private fun tokenizeWords(text: String): List<String> =
+        text.split(WHITESPACE_REGEX)
+            .map { it.replace(PUNCT_EDGE_REGEX, "") }
+            .filter { it.isNotBlank() }
 
-        // 2. Check word numerals in prefix
-        val tokens = prefix.split(Regex("\\s+")).filter { it.isNotBlank() }
-        for ((idx, token) in tokens.withIndex()) {
-            // Disambiguate "char" / "chaar" at sentence start:
-            if ((token == "char" || token == "chaar") && isFirstItem && idx == 0) {
-                if (idx + 1 < tokens.size && wordToNum.containsKey(tokens[idx + 1])) {
+    private fun extractQuantityFromContext(prefix: String, suffix: String): Int {
+        val qtyPrefix = NON_ITEM_NUM_CONTEXT_REGEX.replace(prefix, " ")
+        val prefixTokens = tokenizeWords(qtyPrefix)
+
+        val candidates = mutableListOf<QtyCandidate>()
+        var prevNonArticleQty: Int? = null
+        for (token in prefixTokens) {
+            val digitNum = token.toIntOrNull()
+            if (digitNum != null && digitNum in 1..99) {
+                candidates.add(QtyCandidate(digitNum, isArticle = false))
+                prevNonArticleQty = digitNum
+                continue
+            }
+            val wordNum = WORD_TO_NUM[token]
+            if (wordNum != null) {
+                // In Hinglish, "chaar do" / "teen do" means "give 4/3", not 2
+                if (token == "do" && prevNonArticleQty != null && prevNonArticleQty >= 3) {
                     continue
                 }
+                val isArticle = token in ARTICLE_WORDS
+                candidates.add(QtyCandidate(wordNum, isArticle = isArticle))
+                if (!isArticle) {
+                    prevNonArticleQty = wordNum
+                }
+            } else {
+                prevNonArticleQty = null
             }
-            val num = wordToNum[token]
-            if (num != null) return num
         }
 
-        // 3. Fallback: check immediate suffix for digits or trailing numerals (e.g. "peri peri fries do")
-        val suffixTokens = suffix.split(Regex("\\s+")).take(2)
-        for (token in suffixTokens) {
-            val num = token.toIntOrNull() ?: wordToNum[token]
-            if (num != null && num in 1..99) return num
+        val explicitMatch = candidates.lastOrNull { !it.isArticle }
+        if (explicitMatch != null) return explicitMatch.value
+        val articleMatch = candidates.lastOrNull()
+        if (articleMatch != null) return articleMatch.value
+
+        // Fallback: check immediate suffix for digits or trailing numerals (e.g. "Fries, 2." or "americano teen")
+        val qtySuffix = NON_ITEM_NUM_CONTEXT_REGEX.replace(suffix, " ")
+        val suffixTokens = tokenizeWords(qtySuffix).take(3)
+        for ((idx, token) in suffixTokens.withIndex()) {
+            val digitNum = token.toIntOrNull()
+            if (digitNum != null && digitNum in 1..99) {
+                return digitNum
+            }
+            val wordNum = WORD_TO_NUM[token]
+            if (wordNum != null && token !in ARTICLE_WORDS) {
+                // Standalone trailing "do" without counter unit means Hindi "give" ("peri peri fries do" -> 1)
+                if (token == "do") {
+                    val nextToken = suffixTokens.getOrNull(idx + 1)
+                    if (nextToken == null || nextToken !in UNIT_COUNTER_WORDS) {
+                        continue
+                    }
+                }
+                return wordNum
+            }
         }
 
         return 1
@@ -414,7 +535,7 @@ class LocalOrderEngine {
     private fun extractModifiers(segment: String): List<VoiceSelectedModifier> {
         val mods = mutableListOf<VoiceSelectedModifier>()
         if (segment.contains("extra cheese")) {
-            mods.add(VoiceSelectedModifier(groupId = "cheese", name = "Extra Cheese", priceDelta = 20.0))
+            mods.add(VoiceSelectedModifier(groupId = "cheese", name = "Extra Cheese", priceDelta = 15.0))
         }
         if (segment.contains("no ice") || segment.contains("bina baraf")) {
             mods.add(VoiceSelectedModifier(groupId = "ice", name = "No Ice", priceDelta = 0.0))
@@ -428,42 +549,47 @@ class LocalOrderEngine {
         return mods
     }
 
-    private data class StandaloneQtyResult(val quantity: Int, val isAdditive: Boolean)
+    private fun parseNumeralToken(rawToken: String): Int? {
+        val clean = rawToken.replace(PUNCT_EDGE_REGEX, "")
+        val digit = clean.toIntOrNull()
+        if (digit != null && digit in 1..99) return digit
+        return WORD_TO_NUM[clean]
+    }
 
     private fun extractStandaloneQuantity(text: String): StandaloneQtyResult? {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return null
 
-        // Ignore meta/system conversation phrases that might accidentally contain numerals
-        val metaKeywords = listOf("check", "recording", "conversation", "analyze", "listen", "understand", "improvement", "minutes", "minute", "model", "converter", "mortal")
-        if (metaKeywords.any { trimmed.contains(it) }) {
+        if (META_REGEXES.any { it.containsMatchIn(trimmed) }) {
             return null
         }
 
-        // Explicit additive: "ek aur", "one more", "aur ek", "do aur", "two more"
-        if (Regex("\\b(ek\\s+aur|one\\s+more|aur\\s+ek|plus\\s+one)\\b").containsMatchIn(trimmed)) {
+        // Generalized additive: "1 more", "2 more", "ek aur", "chaar aur", "plus 2", "add 3", "another"
+        ADDITIVE_BEFORE_REGEX.find(trimmed)?.let { m ->
+            val qty = parseNumeralToken(m.groupValues[1])
+            if (qty != null) return StandaloneQtyResult(qty, isAdditive = true)
+        }
+        ADDITIVE_AFTER_REGEX.find(trimmed)?.let { m ->
+            val qty = parseNumeralToken(m.groupValues[1])
+            if (qty != null) return StandaloneQtyResult(qty, isAdditive = true)
+        }
+        if (ANOTHER_REGEX.containsMatchIn(trimmed)) {
             return StandaloneQtyResult(1, isAdditive = true)
-        }
-        if (Regex("\\b(do\\s+aur|two\\s+more|aur\\s+do|plus\\s+two)\\b").containsMatchIn(trimmed)) {
-            return StandaloneQtyResult(2, isAdditive = true)
-        }
-        if (Regex("\\b(teen\\s+aur|three\\s+more|aur\\s+teen)\\b").containsMatchIn(trimmed)) {
-            return StandaloneQtyResult(3, isAdditive = true)
         }
 
         // Double / Triple
-        if (Regex("\\b(double|do\\s*kardo|do\\s*kar\\s*do|two\\s*times)\\b").containsMatchIn(trimmed)) {
+        if (DOUBLE_REGEX.containsMatchIn(trimmed)) {
             return StandaloneQtyResult(2, isAdditive = false)
         }
-        if (Regex("\\b(triple|teen\\s*kardo|teen\\s*kar\\s*do|three\\s*times)\\b").containsMatchIn(trimmed)) {
+        if (TRIPLE_REGEX.containsMatchIn(trimmed)) {
             return StandaloneQtyResult(3, isAdditive = false)
         }
 
-        // Direct isolated numeral tokens: "do", "two", "teen", "three", "chaar", "four", "paanch", "five", "2", "3", "4"
-        val tokens = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (tokens.size <= 2 || (tokens.size == 3 && Regex("\\b(kar\\s*do|kardo|piece|only)\\b").containsMatchIn(trimmed))) {
+        // Direct isolated numeral tokens: "do", "two", "teen", "three", "2.", "3", etc.
+        val tokens = tokenizeWords(trimmed)
+        if (tokens.size <= 2 || (tokens.size == 3 && STANDALONE_FILLER_REGEX.containsMatchIn(trimmed))) {
             for (t in tokens) {
-                val num = t.toIntOrNull() ?: wordToNum[t]
+                val num = parseNumeralToken(t)
                 if (num != null && num in 1..99) {
                     return StandaloneQtyResult(num, isAdditive = false)
                 }
@@ -473,86 +599,96 @@ class LocalOrderEngine {
         return null
     }
 
+    private fun noteCategoryOf(noteText: String): String {
+        return when {
+            noteText.startsWith("🚗") || noteText.startsWith("🅿") -> "VEHICLE_PARKING"
+            noteText.startsWith("📦") || noteText.startsWith("🍽") -> "SERVICE_MODE"
+            noteText.contains("Sugar", ignoreCase = true) -> "SUGAR"
+            noteText.startsWith("🔥") -> "TEMP"
+            noteText.startsWith("🌶") -> "SPICE"
+            noteText.startsWith("🧊") -> "ICE"
+            noteText.startsWith("🧅") -> "ONION"
+            noteText.startsWith("🥛") -> "MILK"
+            else -> noteText
+        }
+    }
+
     fun extractOrderNotes(rawText: String, existingNotes: String?): String? {
         val text = rawText.lowercase().trim()
-        val detected = mutableListOf<String>()
+        val detected = mutableListOf<DetectedNote>()
 
-        // 1. Vehicle / Parking extraction
-        // Standard Indian Plate: DL 3C 1234, HR 26 DK 5678, UP 16 Z 9999, etc.
-        val plateRegex = Regex("\\b([a-z]{2}\\s*\\d{1,2}\\s*[a-z]{0,3}\\s*\\d{3,4})\\b")
-        val plateMatch = plateRegex.find(text)
-
-        val carNumRegex = Regex("\\b(?:car|gaadi|gadi|vehicle)\\s*(?:no\\.?|number|num)?\\s*([a-z0-9\\s]{2,10})\\b")
-        val carNumMatch = carNumRegex.find(text)
+        // 1. Vehicle / Parking extraction (valid Indian RTO codes or explicit car number marker)
+        val plateMatch = INDIAN_PLATE_REGEX.find(text)
+        val carNumMatch = CAR_NUM_EXPLICIT_REGEX.find(text) ?: CAR_NUM_BARE_REGEX.find(text)
 
         if (plateMatch != null) {
-            val plate = plateMatch.groupValues[1].uppercase().replace(Regex("\\s+"), " ")
-            detected.add("🚗 $plate")
+            val plate = plateMatch.groupValues[1].uppercase().replace(WHITESPACE_REGEX, " ")
+            detected.add(DetectedNote("VEHICLE_PARKING", "🚗 $plate"))
         } else if (carNumMatch != null) {
             val valStr = carNumMatch.groupValues[1].trim().uppercase()
             if (valStr.any { it.isDigit() }) {
-                val cleanNum = Regex("\\d+").find(valStr)?.value ?: valStr
-                detected.add("🚗 Car #$cleanNum")
+                val cleanNum = DIGITS_ONLY_REGEX.find(valStr)?.value ?: valStr
+                detected.add(DetectedNote("VEHICLE_PARKING", "🚗 Car #$cleanNum"))
             }
         }
 
-        if (Regex("\\b(parking|parking delivery|car mein|gaadi mein)\\b").containsMatchIn(text)) {
-            if (detected.none { it.contains("🚗") }) {
-                detected.add("🅿️ Parking Delivery")
+        if (PARKING_REGEX.containsMatchIn(text)) {
+            if (detected.none { it.category == "VEHICLE_PARKING" }) {
+                detected.add(DetectedNote("VEHICLE_PARKING", "🅿️ Parking Delivery"))
             }
         }
 
         // 2. Packaging / Service
-        if (Regex("\\b(pack|pack\\s*kardo|pack\\s*kar\\s*do|parcel|parcel\\s*kardo|parcel\\s*kar\\s*do|takeaway|take\\s*away|to\\s*go)\\b").containsMatchIn(text)) {
-            detected.add("📦 Parcel / Takeaway")
-        } else if (Regex("\\b(dine\\s*in|yahi\\s*khayenge|table\\s*pe)\\b").containsMatchIn(text)) {
-            detected.add("🍽️ Dine-In")
+        if (PACK_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("SERVICE_MODE", "📦 Parcel / Takeaway"))
+        } else if (DINE_IN_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("SERVICE_MODE", "🍽️ Dine-In"))
         }
 
         // 3. Dietary / Customization Notes
-        if (Regex("\\b(bina\\s*cheeni|no\\s*sugar|without\\s*sugar|sugar\\s*free|sugarfree)\\b").containsMatchIn(text)) {
-            detected.add("🚫 No Sugar")
-        } else if (Regex("\\b(kam\\s*cheeni|less\\s*sugar|less\\s*sweet|sweet\\s*kam|kam\\s*meetha)\\b").containsMatchIn(text)) {
-            detected.add("☕ Less Sugar")
+        if (NO_SUGAR_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("SUGAR", "🚫 No Sugar"))
+        } else if (LESS_SUGAR_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("SUGAR", "☕ Less Sugar"))
         }
 
-        if (Regex("\\b(extra\\s*hot|bahut\\s*garam|jyada\\s*garam|kadak)\\b").containsMatchIn(text)) {
-            detected.add("🔥 Extra Hot")
+        if (EXTRA_HOT_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("TEMP", "🔥 Extra Hot"))
         }
 
-        if (Regex("\\b(kam\\s*spicy|less\\s*spicy|no\\s*spicy|kam\\s*mirchi|bina\\s*mirchi)\\b").containsMatchIn(text)) {
-            detected.add("🌶️ Mild / Less Spicy")
-        } else if (Regex("\\b(extra\\s*spicy|jyada\\s*spicy|bahut\\s*spicy|tez\\s*mirchi)\\b").containsMatchIn(text)) {
-            detected.add("🌶️🌶️ Extra Spicy")
+        if (MILD_SPICY_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("SPICE", "🌶️ Mild / Less Spicy"))
+        } else if (EXTRA_SPICY_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("SPICE", "🌶️🌶️ Extra Spicy"))
         }
 
-        if (Regex("\\b(bina\\s*baraf|no\\s*ice|without\\s*ice)\\b").containsMatchIn(text)) {
-            detected.add("🧊 No Ice")
-        } else if (Regex("\\b(less\\s*ice|kam\\s*baraf)\\b").containsMatchIn(text)) {
-            detected.add("🧊 Less Ice")
+        if (NO_ICE_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("ICE", "🧊 No Ice"))
+        } else if (LESS_ICE_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("ICE", "🧊 Less Ice"))
         }
 
-        if (Regex("\\b(bina\\s*pyaz|no\\s*onion|jain)\\b").containsMatchIn(text)) {
-            detected.add("🧅 No Onion (Jain)")
-        } else if (Regex("\\b(extra\\s*onion|jyada\\s*pyaz)\\b").containsMatchIn(text)) {
-            detected.add("🧅 Extra Onion")
+        if (NO_ONION_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("ONION", "🧅 No Onion (Jain)"))
+        } else if (EXTRA_ONION_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("ONION", "🧅 Extra Onion"))
         }
 
-        if (Regex("\\b(oat\\s*milk)\\b").containsMatchIn(text)) {
-            detected.add("🥛 Oat Milk")
-        } else if (Regex("\\b(almond\\s*milk)\\b").containsMatchIn(text)) {
-            detected.add("🥛 Almond Milk")
+        if (OAT_MILK_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("MILK", "🥛 Oat Milk"))
+        } else if (ALMOND_MILK_REGEX.containsMatchIn(text)) {
+            detected.add(DetectedNote("MILK", "🥛 Almond Milk"))
         }
 
         if (detected.isEmpty()) return existingNotes
 
-        // Merge with existing notes (avoid duplicates by prefix emoji/type)
         val allNotes = (existingNotes?.split(" • ") ?: emptyList())
+            .filter { it.isNotBlank() }
             .toMutableList()
-        for (d in detected) {
-            val prefix = d.take(2)
-            allNotes.removeAll { it.startsWith(prefix) }
-            allNotes.add(d)
+
+        for (note in detected) {
+            allNotes.removeAll { noteCategoryOf(it) == note.category }
+            allNotes.add(note.text)
         }
 
         return allNotes.joinToString(" • ")

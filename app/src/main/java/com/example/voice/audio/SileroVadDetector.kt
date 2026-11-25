@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.util.Log
+import com.example.BuildConfig
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 
@@ -22,49 +23,68 @@ class SileroVadDetector(context: Context) {
     companion object {
         private const val TAG = "SileroVadDetector"
         private const val SAMPLE_RATE = 16000L
-        private const val WINDOW_SIZE = 512
+        const val WINDOW_SIZE = 512
         private const val CONTEXT_SIZE = 64
         private const val INPUT_SIZE = WINDOW_SIZE + CONTEXT_SIZE // 576 samples
     }
 
+    private val appContext = context.applicationContext
+
+    @Volatile
     private var env: OrtEnvironment? = null
+
+    @Volatile
     private var session: OrtSession? = null
+
+    @Volatile
+    private var isClosed = false
 
     // State shape: [2, 1, 128] = 256 floats
     private val stateArray = FloatArray(2 * 1 * 128)
     private val contextArray = FloatArray(CONTEXT_SIZE)
     private val inputBuffer = FloatArray(INPUT_SIZE)
+    private val chunkBuffer = FloatArray(WINDOW_SIZE)
+    private val sampleRateArray = longArrayOf(SAMPLE_RATE)
 
-    init {
-        try {
-            env = OrtEnvironment.getEnvironment()
-            val sessionOptions = OrtSession.SessionOptions().apply {
-                setIntraOpNumThreads(1)
-                setInterOpNumThreads(1)
+    /**
+     * Loads the ONNX model and initializes the session. Must be called off the Main thread.
+     */
+    @Synchronized
+    fun initialize(): Boolean {
+        if (isClosed) return false
+        if (session != null) return true
+
+        return try {
+            val ortEnv = OrtEnvironment.getEnvironment()
+            env = ortEnv
+            val modelBytes = appContext.assets.open("silero_vad.onnx").use { it.readBytes() }
+            OrtSession.SessionOptions().use { sessionOptions ->
+                sessionOptions.setIntraOpNumThreads(1)
+                sessionOptions.setInterOpNumThreads(1)
+                session = ortEnv.createSession(modelBytes, sessionOptions)
             }
-            val modelBytes = context.assets.open("silero_vad.onnx").use { it.readBytes() }
-            session = env?.createSession(modelBytes, sessionOptions)
             Log.i(TAG, "Silero VAD v5 ONNX neural shield initialized successfully (${modelBytes.size} bytes)")
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load Silero VAD ONNX model: ${e.message}", e)
+            false
         }
     }
 
-    fun isReady(): Boolean = session != null
+    fun isReady(): Boolean = !isClosed && session != null
 
     /**
      * Helper to compute speech probability directly from a ShortArray buffer.
      */
     @Synchronized
     fun computeProbabilityFromShorts(shorts: ShortArray, offset: Int = 0, length: Int = shorts.size): Float {
-        val sess = session ?: return 1.0f
-        if (length < WINDOW_SIZE || offset + WINDOW_SIZE > shorts.size) return 1.0f
+        if (isClosed || session == null) return 0f
+        if (offset < 0 || length < WINDOW_SIZE || offset + WINDOW_SIZE > shorts.size) return 0f
 
-        val chunk = FloatArray(WINDOW_SIZE)
         for (i in 0 until WINDOW_SIZE) {
-            chunk[i] = shorts[offset + i] / 32768.0f
+            chunkBuffer[i] = shorts[offset + i] / 32768.0f
         }
-        return computeChunkProbability(chunk)
+        return computeChunkProbability(chunkBuffer)
     }
 
     /**
@@ -72,6 +92,7 @@ class SileroVadDetector(context: Context) {
      */
     @Synchronized
     fun computeChunkProbability(chunk512: FloatArray): Float {
+        if (isClosed) return 0f
         val sess = session ?: return 0f
         val e = env ?: return 0f
         if (chunk512.size < WINDOW_SIZE) return 0f
@@ -88,7 +109,7 @@ class SileroVadDetector(context: Context) {
         try {
             inputTensor = OnnxTensor.createTensor(e, FloatBuffer.wrap(inputBuffer), longArrayOf(1, INPUT_SIZE.toLong()))
             stateTensor = OnnxTensor.createTensor(e, FloatBuffer.wrap(stateArray), longArrayOf(2, 1, 128))
-            srTensor = OnnxTensor.createTensor(e, LongBuffer.wrap(longArrayOf(SAMPLE_RATE)), longArrayOf())
+            srTensor = OnnxTensor.createTensor(e, LongBuffer.wrap(sampleRateArray), longArrayOf())
 
             val inputs = mapOf(
                 "input" to inputTensor,
@@ -156,11 +177,10 @@ class SileroVadDetector(context: Context) {
         var speechFramesCount = 0
         var maxProb = 0f
 
-        val chunk = FloatArray(WINDOW_SIZE)
         var offset = 0
         while (offset + WINDOW_SIZE <= floatSamples.size) {
-            System.arraycopy(floatSamples, offset, chunk, 0, WINDOW_SIZE)
-            val prob = computeChunkProbability(chunk)
+            System.arraycopy(floatSamples, offset, chunkBuffer, 0, WINDOW_SIZE)
+            val prob = computeChunkProbability(chunkBuffer)
             if (prob > maxProb) maxProb = prob
             if (prob >= threshold) {
                 speechFramesCount++
@@ -170,7 +190,12 @@ class SileroVadDetector(context: Context) {
 
         reset()
         val passed = speechFramesCount >= minSpeechFrames
-        Log.d(TAG, "Silero VAD evaluate: ${pcmBytes.size} bytes (${numShorts / 16000.0}s) -> maxProb=${"%.3f".format(maxProb)}, speechFrames=$speechFramesCount -> passed=$passed")
+        if (BuildConfig.DEBUG) {
+            Log.d(
+                TAG,
+                "Silero VAD evaluate: ${pcmBytes.size} bytes (${numShorts / 16000.0}s) -> maxProb=${"%.3f".format(maxProb)}, speechFrames=$speechFramesCount -> passed=$passed"
+            )
+        }
         return passed
     }
 
@@ -181,14 +206,17 @@ class SileroVadDetector(context: Context) {
         inputBuffer.fill(0f)
     }
 
+    @Synchronized
     fun close() {
+        isClosed = true
         try {
             session?.close()
-            session = null
-            env?.close()
-            env = null
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             // Ignore on shutdown
+        } finally {
+            session = null
+            // Do NOT close the process-wide OrtEnvironment singleton.
+            env = null
         }
     }
 }

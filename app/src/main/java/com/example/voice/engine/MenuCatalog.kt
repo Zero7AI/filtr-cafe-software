@@ -1,6 +1,9 @@
 package com.example.voice.engine
 
 import com.example.data.entity.MenuItemEntity
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 data class CatalogItem(
     val id: Int,
@@ -11,10 +14,25 @@ data class CatalogItem(
     val isAvailable: Boolean = true
 )
 
+data class CompiledAliasMatcher(
+    val item: CatalogItem,
+    val alias: String,
+    val regex: Regex
+)
+
 object MenuCatalog {
 
+    private val NON_ALNUM_REGEX = Regex("[^a-z0-9\\s]")
+    private val MULTI_SPACE_REGEX = Regex("\\s+")
+
+    private fun normalizeKey(value: String): String =
+        value.lowercase()
+            .replace(NON_ALNUM_REGEX, " ")
+            .trim()
+            .replace(MULTI_SPACE_REGEX, " ")
+
     // Default phonetic aliases for FILTR Coffee's signature menu items
-    private val defaultAliasesMap = mapOf(
+    private val defaultAliasesMap: Map<String, List<String>> = mapOf(
         "caramel frappe" to listOf(
             "caramel frappe", "caramel frap", "caramel frappy", "caramel frappi",
             "caramel frappie", "caramel frape", "frappe caramel", "frap caramel",
@@ -87,6 +105,21 @@ object MenuCatalog {
         )
     )
 
+    // Normalized exact lookup map (prevents substring bleeding like "Bombay Pizza" matching "bombay")
+    private val normalizedAliasesMap: Map<String, List<String>> = buildMap {
+        defaultAliasesMap.forEach { (k, v) -> put(normalizeKey(k), v) }
+        // Exact variant names used in tests/menus
+        defaultAliasesMap["bombay"]?.let { put("bombay sandwich", it) }
+        defaultAliasesMap["cheese corn"]?.let { put("cheese corn sandwich", it) }
+        defaultAliasesMap["caramalized onion"]?.let {
+            put("caramalized onion sandwich", it)
+            put("caramelized onion", it)
+            put("caramelized onion sandwich", it)
+        }
+        defaultAliasesMap["vanila frappe"]?.let { put("vanilla frappe", it) }
+        defaultAliasesMap["vanila iced coffee"]?.let { put("vanilla iced coffee", it) }
+    }
+
     // Base seed catalog matching FiltrRepository default menu
     val defaultItems: List<CatalogItem> = listOf(
         CatalogItem(1, "Americano", "ICED COFFEE", 79.0, defaultAliasesMap["americano"] ?: emptyList()),
@@ -131,20 +164,39 @@ object MenuCatalog {
         "[unk]"
     )
 
-    var onMenuUpdated: ((List<String>) -> Unit)? = null
+    private val catalogLock = Any()
+
+    private val _itemsFlow = MutableStateFlow(defaultItems)
+    val itemsFlow: StateFlow<List<CatalogItem>> = _itemsFlow.asStateFlow()
 
     @Volatile
-    private var liveItems: List<CatalogItem> = defaultItems
+    private var compiledMatchersSnapshot: List<CompiledAliasMatcher> = compileMatchers(defaultItems)
+
+    private fun compileMatchers(items: List<CatalogItem>): List<CompiledAliasMatcher> {
+        val list = mutableListOf<CompiledAliasMatcher>()
+        for (item in items) {
+            val candidates = (item.aliases + listOf(item.name.lowercase().trim()))
+                .map { it.lowercase().trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .sortedByDescending { it.length }
+            for (alias in candidates) {
+                val regex = Regex("(?<![\\p{L}\\p{N}_])${Regex.escape(alias)}(?![\\p{L}\\p{N}_])")
+                list.add(CompiledAliasMatcher(item = item, alias = alias, regex = regex))
+            }
+        }
+        return list.toList()
+    }
 
     /**
      * Automatic Acoustic Alias Generator for dynamic menu additions:
-     * Derives singular/plural, reverse word order, category stripping, and phonetic shortcuts.
+     * Derives singular/plural, reverse word order, category stripping, and safe phonetic shortcuts.
      */
-    fun generateAliasesForItem(name: String, category: String = ""): List<String> {
+    fun generateAliasesForItem(name: String, @Suppress("UNUSED_PARAMETER") category: String = ""): List<String> {
         val raw = name.lowercase().trim()
-        val clean = raw.replace(Regex("[^a-z0-9\\s]"), " ").trim().replace(Regex("\\s+"), " ")
+        val clean = normalizeKey(name)
         val result = mutableSetOf<String>()
-        result.add(raw)
+        if (raw.isNotBlank()) result.add(raw)
         if (clean.isNotBlank()) result.add(clean)
 
         val words = clean.split(" ").filter { it.isNotBlank() }
@@ -166,7 +218,8 @@ object MenuCatalog {
         }
 
         // Singular / plural derivation
-        for (w in listOf(raw, clean)) {
+        for (w in listOf(raw, clean).distinct()) {
+            if (w.isBlank()) continue
             if (w.endsWith("ies")) {
                 result.add(w.removeSuffix("ies") + "y")
             } else if (w.endsWith("es") && !w.endsWith("cheese")) {
@@ -178,7 +231,7 @@ object MenuCatalog {
             }
         }
 
-        // Common colloquial phonetic shortcuts
+        // Common colloquial phonetic shortcuts (avoid generic colliding words like "masala")
         if (clean.contains("frappe")) {
             result.add(clean.replace("frappe", "frap"))
             result.add(clean.replace("frappe", "frappy"))
@@ -188,7 +241,6 @@ object MenuCatalog {
         if (clean.contains("sandwich")) {
             result.add(clean.replace("sandwich", "sand"))
             result.add(clean.replace("sandwich", "toast"))
-            result.add(clean.replace("sandwich", "masala"))
         }
         if (clean.contains("coffee")) {
             result.add(clean.replace("coffee", "coffi"))
@@ -204,46 +256,80 @@ object MenuCatalog {
 
     /**
      * Dynamically synchronizes catalog with live Room database menu items:
+     * - Thread-safe atomic snapshot update
      * - Filters out inactive/unavailable items (isAvailable == true only)
-     * - Automatically synthesizes acoustic aliases for new custom items
-     * - Preserves signature fine-tuned aliases for existing items
+     * - Exact normalized key lookup in defaultAliasesMap (zero substring bleeding)
+     * - Prevents generated aliases from colliding across distinct menu items
      */
     fun syncWithRoomMenuItems(menuItems: List<MenuItemEntity>) {
         if (menuItems.isEmpty()) return
-        val available = menuItems.filter { it.isAvailable }
-        liveItems = available.map { entity ->
-            val key = entity.name.lowercase().trim()
-            val existingAliases = defaultAliasesMap[key]
-                ?: defaultAliasesMap.entries.find { key.contains(it.key) || it.key.contains(key) }?.value
-            val generated = generateAliasesForItem(entity.name, entity.category)
-            val combinedAliases = if (existingAliases != null) {
-                (existingAliases + generated).distinct()
-            } else {
-                generated
+
+        synchronized(catalogLock) {
+            val available = menuItems.filter { it.isAvailable }
+            val canonicalNames = available.map { normalizeKey(it.name) }.toSet()
+
+            // First pass: collect candidate aliases per item
+            val rawCandidates = available.map { entity ->
+                val normKey = normalizeKey(entity.name)
+                val exactAliases = normalizedAliasesMap[normKey]
+                val generated = generateAliasesForItem(entity.name, entity.category)
+                val combined = if (exactAliases != null) {
+                    (exactAliases + generated).distinct()
+                } else {
+                    generated
+                }
+                entity to combined
             }
-            CatalogItem(
-                id = entity.id,
-                name = entity.name,
-                category = entity.category,
-                price = entity.price,
-                aliases = combinedAliases,
-                isAvailable = entity.isAvailable
-            )
+
+            // Count alias ownership across items to prevent colliding non-canonical aliases
+            val aliasOwnerCount = mutableMapOf<String, Int>()
+            for ((_, aliases) in rawCandidates) {
+                for (a in aliases.map { normalizeKey(it) }.distinct()) {
+                    aliasOwnerCount[a] = (aliasOwnerCount[a] ?: 0) + 1
+                }
+            }
+
+            val updatedItems = rawCandidates.map { (entity, aliases) ->
+                val ownNormName = normalizeKey(entity.name)
+                val filteredAliases = aliases.filter { alias ->
+                    val normAlias = normalizeKey(alias)
+                    when {
+                        normAlias == ownNormName -> true
+                        normAlias in canonicalNames -> false // Never steal another item's canonical name
+                        (aliasOwnerCount[normAlias] ?: 0) > 1 -> false // Drop ambiguous cross-item aliases
+                        else -> true
+                    }
+                }.ifEmpty { listOf(entity.name.lowercase().trim()) }
+
+                CatalogItem(
+                    id = entity.id,
+                    name = entity.name,
+                    category = entity.category,
+                    price = entity.price,
+                    aliases = filteredAliases.toList(),
+                    isAvailable = entity.isAvailable
+                )
+            }.toList()
+
+            compiledMatchersSnapshot = compileMatchers(updatedItems)
+            _itemsFlow.value = updatedItems
         }
-        onMenuUpdated?.invoke(getActiveGrammarPhrases())
     }
 
     val items: List<CatalogItem>
-        get() = liveItems
+        get() = _itemsFlow.value
+
+    fun getCompiledMatchers(): List<CompiledAliasMatcher> = compiledMatchersSnapshot
 
     /**
      * Builds active speech grammar phrases including all active menu items,
      * synthesized aliases, numeric counts, modifiers, and unk sink.
      */
     fun getActiveGrammarPhrases(): List<String> {
+        val snapshot = _itemsFlow.value
         val phrases = mutableSetOf<String>()
         phrases.addAll(baseControlPhrases)
-        liveItems.forEach { item ->
+        snapshot.forEach { item ->
             val cleanName = item.name.lowercase().trim()
             if (cleanName.isNotBlank()) phrases.add(cleanName)
             item.aliases.forEach { alias ->
@@ -257,19 +343,45 @@ object MenuCatalog {
     }
 
     fun findBestMatch(phrase: String): CatalogItem? {
-        val lower = phrase.lowercase().trim()
-        // 1. Exact name or alias match
-        items.forEach { item ->
-            if (item.name.lowercase() == lower || item.aliases.any { it == lower }) {
+        val norm = normalizeKey(phrase)
+        if (norm.length < 2) return null
+
+        val snapshot = _itemsFlow.value
+
+        // 1. Exact canonical name or exact alias match
+        for (item in snapshot) {
+            if (normalizeKey(item.name) == norm || item.aliases.any { normalizeKey(it) == norm }) {
                 return item
             }
         }
-        // 2. Substring / contains match
-        items.forEach { item ->
-            if (item.aliases.any { alias -> lower.contains(alias) || alias.contains(lower) }) {
-                return item
+
+        if (norm.length < 3) return null
+
+        // 2. Word-bounded alias inside query, preferring longest matched alias
+        var bestItem: CatalogItem? = null
+        var bestScore = 0
+        for (item in snapshot) {
+            for (alias in item.aliases) {
+                val normAlias = normalizeKey(alias)
+                if (normAlias.length < 3) continue
+                val boundaryRegex = Regex("(?<![a-z0-9])${Regex.escape(normAlias)}(?![a-z0-9])")
+                if (boundaryRegex.containsMatchIn(norm) && normAlias.length > bestScore) {
+                    bestScore = normAlias.length
+                    bestItem = item
+                }
             }
         }
+        if (bestItem != null) return bestItem
+
+        // 3. Whole-word subset match (every query token matches a full word in item name)
+        val queryTokens = norm.split(" ").filter { it.length >= 2 }
+        if (queryTokens.isNotEmpty()) {
+            return snapshot.firstOrNull { item ->
+                val itemWords = normalizeKey(item.name).split(" ").toSet()
+                queryTokens.all { qt -> qt in itemWords }
+            }
+        }
+
         return null
     }
 }

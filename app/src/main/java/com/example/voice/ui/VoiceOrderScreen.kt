@@ -1,12 +1,24 @@
 package com.example.voice.ui
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.*
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -15,15 +27,33 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MicOff
-import androidx.compose.material.icons.filled.PointOfSale
 import androidx.compose.material.icons.filled.Remove
-import androidx.compose.material.icons.filled.Send
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
@@ -36,13 +66,17 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.entity.MenuItemEntity
 import com.example.voice.engine.CatalogItem
 import com.example.voice.engine.MenuCatalog
 import com.example.voice.model.VoiceOrderLineItem
 import com.example.voice.model.VoiceOrderState
-import com.example.voice.model.VoiceStateMachineEnum
 import com.example.voice.viewmodel.VoiceOrderViewModel
+import java.util.Locale
 
 // FILTR Shadcn Theme Palette
 private val ColorBg = Color(0xFFFAFAFA)
@@ -53,7 +87,6 @@ private val ColorBorderDark = Color(0xFFD4D4D8)
 private val ColorAmber = Color(0xFFF59E0B)
 private val ColorAmberDark = Color(0xFFD97706)
 private val ColorGreen = Color(0xFF10B981)
-private val ColorRed = Color(0xFFEF4444)
 private val ColorTextPrimary = Color(0xFF09090B)
 private val ColorTextSecondary = Color(0xFF71717A)
 
@@ -64,17 +97,73 @@ fun VoiceOrderScreen(
     onTransferToBilling: (List<VoiceOrderLineItem>, String?) -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     val orderState by viewModel.orderState.collectAsState()
     val isListening by viewModel.isListening.collectAsState()
     val isSpeechActive by viewModel.isSpeechActive.collectAsState()
     val transcript by viewModel.currentTranscript.collectAsState()
     val audioLevel by viewModel.audioLevel.collectAsState()
+    val showConfirmDialog by viewModel.showConfirmDialog.collectAsState()
+    val catalogItems by MenuCatalog.itemsFlow.collectAsState()
 
     var inputText by remember { mutableStateOf("") }
+    var permissionRequestedOnce by remember { mutableStateOf(false) }
 
-    // Start background capture & bind to service when screen opens
-    LaunchedEffect(Unit) {
-        viewModel.bindService(context)
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            viewModel.bindService(context)
+        } else {
+            viewModel.onMicPermissionDenied()
+        }
+    }
+
+    // Bind only when RECORD_AUDIO is granted; unbind & stop capture cleanly on stop or tab switch
+    DisposableEffect(lifecycleOwner) {
+        val hasMicPermission = {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    if (hasMicPermission()) {
+                        viewModel.bindService(context)
+                    } else if (!permissionRequestedOnce) {
+                        permissionRequestedOnce = true
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    } else {
+                        viewModel.onMicPermissionDenied()
+                    }
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    viewModel.unbindService(context)
+                }
+                else -> Unit
+            }
+        }
+
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            if (hasMicPermission()) {
+                viewModel.bindService(context)
+            } else if (!permissionRequestedOnce) {
+                permissionRequestedOnce = true
+                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            } else {
+                viewModel.onMicPermissionDenied()
+            }
+        }
+
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.unbindService(context)
+        }
     }
 
     // Keep menu catalog synced with Room items
@@ -82,6 +171,16 @@ fun VoiceOrderScreen(
         if (availableMenuItems.isNotEmpty()) {
             viewModel.syncMenuItemsWithRoom(availableMenuItems)
         }
+    }
+
+    if (showConfirmDialog && orderState.items.isNotEmpty()) {
+        VoiceOrderConfirmDialog(
+            orderState = orderState,
+            onConfirmTransfer = {
+                viewModel.confirmAndTransferToBilling(onTransferToBilling)
+            },
+            onDismiss = { viewModel.dismissConfirmDialog() }
+        )
     }
 
     Scaffold(
@@ -93,16 +192,24 @@ fun VoiceOrderScreen(
                 audioLevel = audioLevel,
                 transcript = transcript,
                 statusMessage = orderState.statusMessage,
-                onToggleListening = { viewModel.toggleListening() }
+                onToggleListening = {
+                    val granted = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (!isListening && !granted) {
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    } else {
+                        viewModel.toggleListening()
+                    }
+                }
             )
         },
         bottomBar = {
             VoiceOrderBottomBar(
                 hasItems = orderState.items.isNotEmpty(),
                 onReset = { viewModel.resetOrder() },
-                onConfirm = {
-                    viewModel.confirmAndTransferToBilling(onTransferToBilling)
-                }
+                onConfirm = { viewModel.requestConfirm() }
             )
         }
     ) { padding ->
@@ -116,7 +223,7 @@ fun VoiceOrderScreen(
             val trimmedInput = inputText.trim()
             val qtyMatch = Regex("^(\\d+)\\s*(.*)$").find(trimmedInput)
             val (extractedQty, searchQuery) = if (qtyMatch != null) {
-                val q = qtyMatch.groupValues[1].toIntOrNull() ?: 1
+                val q = (qtyMatch.groupValues[1].toIntOrNull() ?: 1).coerceAtLeast(1)
                 val rest = qtyMatch.groupValues[2].trim()
                 Pair(q, rest)
             } else {
@@ -124,8 +231,7 @@ fun VoiceOrderScreen(
             }
             val queryLower = searchQuery.lowercase()
 
-            val displayChips: List<CatalogItem> = remember(queryLower, availableMenuItems) {
-                val activeItems = MenuCatalog.items
+            val displayChips: List<CatalogItem> = remember(queryLower, catalogItems) {
                 if (queryLower.isBlank()) {
                     val defaultNames = listOf(
                         "Peri Peri Fries",
@@ -138,15 +244,11 @@ fun VoiceOrderScreen(
                         "Hazelnut Frappe"
                     )
                     val matchedDefaults = defaultNames.mapNotNull { name ->
-                        activeItems.find { it.name.equals(name, ignoreCase = true) }
+                        catalogItems.find { it.name.equals(name, ignoreCase = true) }
                     }
-                    if (matchedDefaults.isNotEmpty()) {
-                        matchedDefaults
-                    } else {
-                        activeItems.take(8)
-                    }
+                    matchedDefaults.ifEmpty { catalogItems.take(8) }
                 } else {
-                    activeItems.filter { item ->
+                    catalogItems.filter { item ->
                         val nameLower = item.name.lowercase()
                         val catLower = item.category.lowercase()
                         nameLower.contains(queryLower) ||
@@ -161,7 +263,7 @@ fun VoiceOrderScreen(
                 }
             }
 
-            // Compact Search & Manual Punch Input (Height 40dp)
+            // Search & Manual Punch Input (unclipped height)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -179,18 +281,18 @@ fun VoiceOrderScreen(
                             color = ColorTextSecondary
                         )
                     },
-                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
                     trailingIcon = {
                         if (inputText.isNotEmpty()) {
                             IconButton(
                                 onClick = { inputText = "" },
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(28.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Close,
                                     contentDescription = "Clear",
                                     tint = ColorTextSecondary,
-                                    modifier = Modifier.size(14.dp)
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
                         }
@@ -202,11 +304,10 @@ fun VoiceOrderScreen(
                                 val topMatch = displayChips.firstOrNull()
                                 if (topMatch != null && queryLower.isNotBlank()) {
                                     viewModel.addItemDirect(topMatch.name, topMatch.price, quantity = extractedQty)
-                                    inputText = ""
                                 } else {
                                     viewModel.submitUtterance(inputText)
-                                    inputText = ""
                                 }
+                                inputText = ""
                             }
                         }
                     ),
@@ -222,7 +323,7 @@ fun VoiceOrderScreen(
                     shape = RoundedCornerShape(8.dp),
                     modifier = Modifier
                         .weight(1f)
-                        .height(42.dp)
+                        .defaultMinSize(minHeight = 46.dp)
                 )
                 IconButton(
                     onClick = {
@@ -238,13 +339,13 @@ fun VoiceOrderScreen(
                     },
                     modifier = Modifier
                         .background(ColorTextPrimary, RoundedCornerShape(8.dp))
-                        .size(42.dp)
+                        .size(46.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Send,
+                        imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send",
                         tint = Color.White,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
             }
@@ -324,6 +425,110 @@ fun VoiceOrderScreen(
             VoiceFinancialSummaryCard(orderState = orderState)
         }
     }
+}
+
+@Composable
+private fun VoiceOrderConfirmDialog(
+    orderState: VoiceOrderState,
+    onConfirmTransfer: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = ColorSurface,
+        title = {
+            Text(
+                text = "Confirm Voice Order",
+                color = ColorTextPrimary,
+                fontWeight = FontWeight.Black,
+                fontSize = 17.sp
+            )
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                orderState.items.forEach { item ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "${item.quantity}× ${item.name}",
+                                color = ColorTextPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp
+                            )
+                            if (item.modifiers.isNotEmpty()) {
+                                Text(
+                                    text = item.modifiers.joinToString(", ") { "+ ${it.name}" },
+                                    color = ColorAmberDark,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                        Text(
+                            text = "₹${String.format(Locale.US, "%.0f", item.itemTotal)}",
+                            color = ColorTextPrimary,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+
+                orderState.orderNotes?.takeIf { it.isNotBlank() }?.let { notes ->
+                    HorizontalDivider(color = ColorBorder, modifier = Modifier.padding(vertical = 2.dp))
+                    Text(
+                        text = "Notes: $notes",
+                        color = ColorTextSecondary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                HorizontalDivider(color = ColorBorder, modifier = Modifier.padding(vertical = 2.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Total",
+                        color = ColorTextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = "₹${String.format(Locale.US, "%.2f", orderState.total)}",
+                        color = ColorAmberDark,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 15.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirmTransfer,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ColorAmberDark,
+                    contentColor = Color.White
+                )
+            ) {
+                Text("TRANSFER TO BILLING", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("CANCEL", color = ColorTextSecondary, fontWeight = FontWeight.SemiBold)
+            }
+        }
+    )
 }
 
 @Composable
@@ -508,8 +713,13 @@ private fun VoiceLineItemCard(
                         modifier = Modifier.padding(top = 1.dp)
                     ) {
                         item.modifiers.forEach { mod ->
+                            val modLabel = if (mod.priceDelta > 0) {
+                                "+ ${mod.name} (+₹${mod.priceDelta.toInt()})"
+                            } else {
+                                "+ ${mod.name}"
+                            }
                             Text(
-                                text = "+ ${mod.name}",
+                                text = modLabel,
                                 color = ColorAmberDark,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.SemiBold
@@ -518,7 +728,7 @@ private fun VoiceLineItemCard(
                     }
                 }
                 Text(
-                    text = "@ ₹${String.format("%.0f", item.unitPrice)} each",
+                    text = "@ ₹${String.format(Locale.US, "%.0f", item.unitPrice)} each",
                     color = ColorTextSecondary,
                     fontSize = 11.sp
                 )
@@ -569,7 +779,7 @@ private fun VoiceLineItemCard(
                 Spacer(modifier = Modifier.width(6.dp))
 
                 Text(
-                    text = "₹${String.format("%.0f", item.itemTotal)}",
+                    text = "₹${String.format(Locale.US, "%.0f", item.itemTotal)}",
                     color = ColorTextPrimary,
                     fontWeight = FontWeight.ExtraBold,
                     fontSize = 15.sp,
@@ -644,7 +854,7 @@ private fun VoiceFinancialSummaryCard(orderState: VoiceOrderState) {
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "₹${String.format("%.2f", orderState.total)}",
+                    text = "₹${String.format(Locale.US, "%.2f", orderState.total)}",
                     color = ColorTextPrimary,
                     fontWeight = FontWeight.ExtraBold,
                     fontSize = 18.sp,
@@ -686,13 +896,15 @@ private fun VoiceOrderBottomBar(
                 Text(text = "RESET", fontWeight = FontWeight.Bold, fontSize = 13.sp)
             }
 
-            // Button 2: CONFIRM (Opens pop-up to directly bill and go to billing section)
+            // Button 2: CONFIRM (Opens confirmation dialog before transferring to billing)
             Button(
                 onClick = onConfirm,
                 enabled = hasItems,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = ColorAmberDark,
-                    disabledContainerColor = ColorCard
+                    contentColor = Color.White,
+                    disabledContainerColor = ColorCard,
+                    disabledContentColor = ColorTextSecondary
                 ),
                 shape = RoundedCornerShape(8.dp),
                 modifier = Modifier
@@ -703,8 +915,7 @@ private fun VoiceOrderBottomBar(
                     text = "CONFIRM",
                     fontWeight = FontWeight.Black,
                     fontSize = 13.sp,
-                    letterSpacing = 0.5.sp,
-                    color = Color.White
+                    letterSpacing = 0.5.sp
                 )
             }
         }
@@ -739,7 +950,7 @@ fun OrderNotesCard(orderNotes: String) {
             }
             Text(
                 text = orderNotes,
-                color = ColorTextPrimary,
+                color = Color.White,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f)
@@ -747,4 +958,3 @@ fun OrderNotesCard(orderNotes: String) {
         }
     }
 }
-

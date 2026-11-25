@@ -1,17 +1,19 @@
 package com.example.voice.speech
 
-import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.example.BuildConfig
 import com.example.data.entity.MenuItemEntity
 import com.example.data.remote.DeepgramVoiceService
 import com.example.voice.audio.SpeakerModalityAnalyzer
 import com.example.voice.audio.VoiceModalityProfile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -21,19 +23,33 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * VAD-driven Speech Recognizer backed by Deepgram Nova-3 REST API.
  * Collects clean 16kHz PCM16 speech turns isolated by Silero VAD v5 and
- * transcribes each completed utterance with menu keyterm boosting.
+ * transcribes each completed utterance sequentially with menu keyterm boosting.
  */
 class DeepgramTurnRecognizer(
-    @Suppress("UNUSED_PARAMETER") private val context: Context,
     private val onTranscriptResult: (text: String, isFinal: Boolean, modality: VoiceModalityProfile?) -> Unit,
     private val onReadyStateChanged: (ready: Boolean, statusMsg: String) -> Unit
 ) {
-    private val tag = "DeepgramTurnRecognizer"
+    private data class TurnJob(
+        val wavBytes: ByteArray,
+        val menuItems: List<MenuItemEntity>,
+        val modality: VoiceModalityProfile,
+        val onFinalized: ((String, VoiceModalityProfile?) -> Unit)?
+    )
+
+    companion object {
+        private const val TAG = "DeepgramTurnRecognizer"
+        private const val DEFAULT_TURN_BUFFER_BYTES = 32_768
+        // Cap single turn buffer at ~25 seconds (16000 * 2 bytes/sec * 25 = 800KB)
+        private const val MAX_TURN_BUFFER_BYTES = 800_000
+        private const val MIN_TURN_BYTES = 8_000
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val modalityAnalyzer = SpeakerModalityAnalyzer()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val turnChannel = Channel<TurnJob>(Channel.UNLIMITED)
 
-    private val pcmBuffer = ByteArrayOutputStream()
+    private var pcmBuffer = ByteArrayOutputStream(DEFAULT_TURN_BUFFER_BYTES)
     private val bufferLock = Any()
 
     @Volatile
@@ -46,44 +62,61 @@ class DeepgramTurnRecognizer(
         mainHandler.post {
             onReadyStateChanged(true, "Deepgram Voice AI Ready")
         }
+
+        // Single-consumer queue guarantees turns are transcribed and emitted in strict FIFO order.
+        scope.launch {
+            for (job in turnChannel) {
+                if (!isReady.get()) break
+                processTurnJob(job)
+            }
+        }
     }
 
     fun updateMenuContext(items: List<MenuItemEntity>) {
-        activeMenuItems = items
-    }
-
-    fun updateGrammar(@Suppress("UNUSED_PARAMETER") phrases: List<String>) {
-        // Keyterms are dynamically pulled from activeMenuItems + MenuCatalog during transcription.
+        activeMenuItems = items.toList()
     }
 
     fun onTurnStart(preRollBytes: ByteArray) {
         if (!isReady.get() || !isEnabled.get()) return
         synchronized(bufferLock) {
-            pcmBuffer.reset()
+            pcmBuffer = ByteArrayOutputStream(DEFAULT_TURN_BUFFER_BYTES)
             modalityAnalyzer.reset()
             if (preRollBytes.isNotEmpty()) {
-                modalityAnalyzer.acceptPcmBytes(preRollBytes)
-                pcmBuffer.write(preRollBytes)
+                val offset = (preRollBytes.size - MAX_TURN_BUFFER_BYTES).coerceAtLeast(0)
+                val len = preRollBytes.size - offset
+                if (len > 0) {
+                    val slice = if (offset == 0) preRollBytes else preRollBytes.copyOfRange(offset, preRollBytes.size)
+                    modalityAnalyzer.acceptPcmBytes(slice)
+                    pcmBuffer.write(slice)
+                }
             }
         }
         mainHandler.post {
-            onTranscriptResult("Listening...", false, null)
+            if (isReady.get()) {
+                onTranscriptResult("Listening...", false, null)
+            }
         }
     }
 
     fun onTurnChunk(chunkBytes: ByteArray) {
         if (!isReady.get() || !isEnabled.get() || chunkBytes.isEmpty()) return
         synchronized(bufferLock) {
-            // Cap single turn buffer at ~25 seconds (16000 * 2 bytes/sec * 25 = 800KB)
-            if (pcmBuffer.size() < 800_000) {
-                modalityAnalyzer.acceptPcmBytes(chunkBytes)
-                pcmBuffer.write(chunkBytes)
+            val remaining = MAX_TURN_BUFFER_BYTES - pcmBuffer.size()
+            if (remaining > 0) {
+                val writeLen = minOf(chunkBytes.size, remaining)
+                val slice = if (writeLen == chunkBytes.size) chunkBytes else chunkBytes.copyOf(writeLen)
+                modalityAnalyzer.acceptPcmBytes(slice)
+                pcmBuffer.write(slice)
             }
         }
     }
 
     fun onTurnEnd(onFinalized: ((String, VoiceModalityProfile?) -> Unit)? = null) {
         if (!isReady.get() || !isEnabled.get()) {
+            synchronized(bufferLock) {
+                pcmBuffer = ByteArrayOutputStream(DEFAULT_TURN_BUFFER_BYTES)
+                modalityAnalyzer.reset()
+            }
             onFinalized?.invoke("", null)
             return
         }
@@ -93,41 +126,98 @@ class DeepgramTurnRecognizer(
         synchronized(bufferLock) {
             pcmData = pcmBuffer.toByteArray()
             modality = modalityAnalyzer.buildProfile()
-            pcmBuffer.reset()
+            // Recreate buffer so up to 800KB backing array is released immediately between turns
+            pcmBuffer = ByteArrayOutputStream(DEFAULT_TURN_BUFFER_BYTES)
             modalityAnalyzer.reset()
         }
 
         // Ignore ultra-short clicks (< 0.25s = 8000 bytes at 16kHz mono 16-bit)
-        if (pcmData.size < 8000) {
-            mainHandler.post { onTranscriptResult("", false, null) }
+        if (pcmData.size < MIN_TURN_BYTES) {
+            mainHandler.post {
+                if (isReady.get()) onTranscriptResult("", false, null)
+            }
             onFinalized?.invoke("", modality)
             return
         }
 
         mainHandler.post {
-            onTranscriptResult("Transcribing with Deepgram...", false, null)
+            if (isReady.get()) {
+                onTranscriptResult("Transcribing with Deepgram...", false, null)
+            }
         }
 
         val wavBytes = wrapPcm16AsWav(pcmData, sampleRate = 16000, channels = 1)
-        scope.launch {
+        val job = TurnJob(
+            wavBytes = wavBytes,
+            menuItems = activeMenuItems,
+            modality = modality,
+            onFinalized = onFinalized
+        )
+        val sendResult = turnChannel.trySend(job)
+        if (sendResult.isFailure) {
+            onFinalized?.invoke("", modality)
+        }
+    }
+
+    private suspend fun processTurnJob(job: TurnJob) {
+        try {
             val result = DeepgramVoiceService.getInstance().transcribeAudio(
-                audioBytes = wavBytes,
+                audioBytes = job.wavBytes,
                 mimeType = "audio/wav",
-                menuItems = activeMenuItems
+                menuItems = job.menuItems
             )
-            val transcript = result.getOrNull()?.transcript?.trim().orEmpty()
-            if (transcript.isNotBlank()) {
-                Log.i(tag, "Deepgram Turn Complete: \"$transcript\" (${modality.shortSummary()})")
-                mainHandler.post {
-                    onTranscriptResult(transcript, true, modality)
+            if (!isReady.get()) return
+
+            if (result.isSuccess) {
+                val transcript = result.getOrNull()?.transcript?.trim().orEmpty()
+                if (transcript.isNotBlank()) {
+                    if (BuildConfig.DEBUG) {
+                        Log.i(TAG, "Deepgram Turn Complete: \"$transcript\" (${job.modality.shortSummary()})")
+                    }
+                    mainHandler.post {
+                        if (isReady.get()) {
+                            onReadyStateChanged(true, "Deepgram Voice AI Ready")
+                            onTranscriptResult(transcript, true, job.modality)
+                        }
+                    }
+                } else {
+                    mainHandler.post {
+                        if (isReady.get()) {
+                            onReadyStateChanged(true, "No speech detected")
+                            onTranscriptResult("", false, null)
+                        }
+                    }
                 }
+                job.onFinalized?.invoke(transcript, job.modality)
             } else {
-                Log.w(tag, "Deepgram Turn empty/failed: ${result.exceptionOrNull()?.message}")
+                val errMsg = result.exceptionOrNull()?.message ?: "Transcription failed"
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "Deepgram Turn failed: $errMsg")
+                } else {
+                    Log.w(TAG, "Deepgram Turn failed")
+                }
                 mainHandler.post {
+                    if (isReady.get()) {
+                        onReadyStateChanged(true, "Voice error: $errMsg")
+                        onTranscriptResult("", false, null)
+                    }
+                }
+                job.onFinalized?.invoke("", job.modality)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val errMsg = e.message ?: "Voice processing failed"
+            if (BuildConfig.DEBUG) {
+                Log.e(TAG, "Turn job error: $errMsg", e)
+            }
+            mainHandler.post {
+                if (isReady.get()) {
+                    onReadyStateChanged(true, "Voice error: $errMsg")
                     onTranscriptResult("", false, null)
                 }
             }
-            onFinalized?.invoke(transcript, modality)
+            job.onFinalized?.invoke("", job.modality)
         }
     }
 
@@ -158,6 +248,11 @@ class DeepgramTurnRecognizer(
 
     fun shutdown() {
         isReady.set(false)
+        turnChannel.close()
         scope.cancel()
+        synchronized(bufferLock) {
+            pcmBuffer = ByteArrayOutputStream(0)
+            modalityAnalyzer.reset()
+        }
     }
 }

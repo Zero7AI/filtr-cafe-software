@@ -6,15 +6,26 @@ import com.example.data.entity.MenuItemEntity
 import com.example.voice.engine.LocalOrderEngine
 import com.example.voice.engine.MenuCatalog
 import com.example.voice.model.VoiceOrderState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONObject
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 data class DeepgramTranscription(
     val transcript: String,
@@ -29,9 +40,37 @@ data class DeepgramTranscription(
  */
 class DeepgramVoiceService private constructor() {
 
+    private data class HttpResult(
+        val code: Int,
+        val isSuccessful: Boolean,
+        val body: String
+    )
+
     companion object {
         private const val TAG = "DeepgramVoiceService"
         private const val CONFIG_CACHE_TTL_MS = 15 * 60 * 1000L
+
+        private val PHONE_COMPACT_REGEX = Regex("(?<=\\d)[\\s-]+(?=\\d)")
+        private val INDIAN_PHONE_REGEX = Regex("(?<!\\d)(?:(?:\\+?91|0)[\\s-]?)?([6-9]\\d{9})(?!\\d)")
+        private val FALLBACK_10_DIGIT_PHONE_REGEX = Regex("(?<!\\d)(\\d{10})(?!\\d)")
+
+        private val NAME_PATTERNS = listOf(
+            Regex("\\b(?:for|name is|customer)\\s+([A-Za-z]{2,20})\\b"),
+            Regex("\\b([A-Za-z]{2,20})\\s+ke naam pe\\b")
+        )
+
+        private val NAME_STOP_WORDS = setOf(
+            "a", "an", "the", "me", "us", "here", "now", "today", "only", "just",
+            "takeaway", "parcel", "packing", "dine", "table", "car", "parking",
+            "order", "pickup", "delivery", "counter", "bill", "customer", "guest",
+            "someone", "anyone", "bhai", "bhaiya", "sir", "madam", "please", "pls",
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "ek", "do", "teen", "char", "chaar", "paanch", "panch", "chhe", "saat", "aath", "nau", "das",
+            "single", "double", "triple", "more", "some", "extra", "less", "no", "with", "without",
+            "coffee", "frappe", "fries", "sandwich", "americano", "vietnamese", "hazelnut",
+            "caramel", "vanilla", "vanila", "paneer", "bombay", "cheese", "corn", "onion",
+            "salted", "peri", "iced", "hot", "cold", "sugar", "ice", "milk", "oat", "almond"
+        )
 
         @Volatile
         private var instance: DeepgramVoiceService? = null
@@ -43,50 +82,125 @@ class DeepgramVoiceService private constructor() {
     }
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    private val configMutex = Mutex()
     @Volatile
     private var cachedConfig: SupabaseService.DeepgramConfig? = null
     @Volatile
     private var lastConfigFetchMs: Long = 0L
 
-    private suspend fun resolveConfig(): SupabaseService.DeepgramConfig {
-        val now = System.currentTimeMillis()
-        val cached = cachedConfig
-        if (cached != null && cached.apiKey.isNotBlank() && (now - lastConfigFetchMs) < CONFIG_CACHE_TTL_MS) {
-            return cached
+    private suspend fun invalidateConfigCache() {
+        configMutex.withLock {
+            cachedConfig = null
+            lastConfigFetchMs = 0L
+        }
+    }
+
+    private suspend fun resolveConfig(forceRefresh: Boolean = false): SupabaseService.DeepgramConfig {
+        return configMutex.withLock {
+            val now = System.currentTimeMillis()
+            val cached = cachedConfig
+            if (!forceRefresh && cached != null && cached.apiKey.isNotBlank() &&
+                (now - lastConfigFetchMs) < CONFIG_CACHE_TTL_MS
+            ) {
+                return@withLock cached
+            }
+
+            val remote = try {
+                SupabaseService.getInstance().fetchDeepgramConfig()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+
+            val buildKey = try {
+                val field = BuildConfig::class.java.getField("DEEPGRAM_API_KEY")
+                (field.get(null) as? String).orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+
+            val effectiveKey = remote?.apiKey?.takeIf { it.isNotBlank() }
+                ?: buildKey.takeIf { it.isNotBlank() && it != "MY_DEEPGRAM_API_KEY" }
+                ?: ""
+
+            val resolved = SupabaseService.DeepgramConfig(
+                apiKey = effectiveKey,
+                model = remote?.model?.ifBlank { "nova-3" } ?: "nova-3",
+                language = remote?.language?.ifBlank { "multi" } ?: "multi"
+            )
+            if (resolved.apiKey.isNotBlank()) {
+                cachedConfig = resolved
+                lastConfigFetchMs = now
+            }
+            resolved
+        }
+    }
+
+    private suspend fun executeRequest(request: Request): HttpResult =
+        suspendCancellableCoroutine { cont ->
+            val call = client.newCall(request)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(e)
+                    }
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use { resp ->
+                            val result = HttpResult(
+                                code = resp.code,
+                                isSuccessful = resp.isSuccessful,
+                                body = resp.body?.string().orEmpty()
+                            )
+                            if (cont.isActive) {
+                                cont.resume(result)
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        if (cont.isActive) {
+                            cont.resumeWithException(t)
+                        }
+                    }
+                }
+            })
         }
 
-        val remote = try {
-            SupabaseService.getInstance().fetchDeepgramConfig()
-        } catch (_: Exception) {
-            null
+    private fun buildListenRequest(
+        audioBytes: ByteArray,
+        normalizedMime: String,
+        config: SupabaseService.DeepgramConfig,
+        menuItems: List<MenuItemEntity>
+    ): Request {
+        val urlBuilder = StringBuilder("https://api.deepgram.com/v1/listen")
+        urlBuilder.append("?model=").append(encodeParam(config.model))
+        urlBuilder.append("&language=").append(encodeParam(config.language))
+        urlBuilder.append("&smart_format=true&punctuate=true&numerals=true")
+
+        val terms = buildMenuKeyterms(menuItems)
+        val isNova2 = config.model.startsWith("nova-2", ignoreCase = true)
+        val paramName = if (isNova2) "keywords" else "keyterm"
+        for (term in terms) {
+            val encodedTerm = encodeParam(term)
+            val paramValue = if (isNova2) "$encodedTerm:2" else encodedTerm
+            urlBuilder.append("&$paramName=").append(paramValue)
         }
 
-        val buildKey = try {
-            val field = BuildConfig::class.java.getField("DEEPGRAM_API_KEY")
-            (field.get(null) as? String).orEmpty()
-        } catch (_: Exception) {
-            ""
-        }
-
-        val effectiveKey = remote?.apiKey?.takeIf { it.isNotBlank() }
-            ?: buildKey.takeIf { it.isNotBlank() && it != "MY_DEEPGRAM_API_KEY" }
-            ?: ""
-
-        val resolved = SupabaseService.DeepgramConfig(
-            apiKey = effectiveKey,
-            model = remote?.model?.ifBlank { "nova-3" } ?: "nova-3",
-            language = remote?.language?.ifBlank { "multi" } ?: "multi"
-        )
-        if (resolved.apiKey.isNotBlank()) {
-            cachedConfig = resolved
-            lastConfigFetchMs = now
-        }
-        return resolved
+        return Request.Builder()
+            .url(urlBuilder.toString())
+            .addHeader("Authorization", "Token ${config.apiKey}")
+            .addHeader("Content-Type", normalizedMime)
+            .post(audioBytes.toRequestBody(normalizedMime.toMediaType()))
+            .build()
     }
 
     /**
@@ -101,57 +215,94 @@ class DeepgramVoiceService private constructor() {
             return@withContext Result.failure(Exception("Empty audio recording"))
         }
 
-        val config = resolveConfig()
+        var config = resolveConfig()
         if (config.apiKey.isBlank()) {
             return@withContext Result.failure(Exception("Deepgram API key is not configured"))
         }
 
-        try {
-            val normalizedMime = when {
-                mimeType.contains("wav", ignoreCase = true) -> "audio/wav"
-                mimeType.contains("mp3", ignoreCase = true) -> "audio/mpeg"
-                mimeType.contains("ogg", ignoreCase = true) -> "audio/ogg"
-                else -> "audio/mp4"
-            }
+        val normalizedMime = when {
+            mimeType.contains("wav", ignoreCase = true) -> "audio/wav"
+            mimeType.contains("mp3", ignoreCase = true) -> "audio/mpeg"
+            mimeType.contains("ogg", ignoreCase = true) -> "audio/ogg"
+            else -> "audio/mp4"
+        }
 
-            val urlBuilder = StringBuilder("https://api.deepgram.com/v1/listen")
-            urlBuilder.append("?model=").append(encodeParam(config.model))
-            urlBuilder.append("&language=").append(encodeParam(config.language))
-            urlBuilder.append("&smart_format=true&punctuate=true&numerals=true")
+        var authRefreshed = false
+        var lastError: Exception? = null
 
-            // Append dynamic menu keyterms (Nova-3) or keywords (Nova-2)
-            val terms = buildMenuKeyterms(menuItems)
-            val paramName = if (config.model.startsWith("nova-2", ignoreCase = true)) "keywords" else "keyterm"
-            for (term in terms) {
-                val value = if (paramName == "keywords") "$term:2" else term
-                urlBuilder.append("&$paramName=").append(encodeParam(value))
-            }
+        for (attempt in 0..1) {
+            try {
+                val request = buildListenRequest(audioBytes, normalizedMime, config, menuItems)
+                val response = executeRequest(request)
 
-            val request = Request.Builder()
-                .url(urlBuilder.toString())
-                .addHeader("Authorization", "Token ${config.apiKey}")
-                .addHeader("Content-Type", normalizedMime)
-                .post(audioBytes.toRequestBody(normalizedMime.toMediaType()))
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                val bodyStr = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "Deepgram HTTP ${response.code}: $bodyStr")
-                    return@withContext Result.failure(Exception("Deepgram API error (HTTP ${response.code})"))
+                if (response.code == 401 || response.code == 403) {
+                    if (BuildConfig.DEBUG) {
+                        Log.w(TAG, "Deepgram auth HTTP ${response.code}: ${response.body}")
+                    } else {
+                        Log.w(TAG, "Deepgram auth HTTP ${response.code}")
+                    }
+                    invalidateConfigCache()
+                    if (!authRefreshed) {
+                        authRefreshed = true
+                        val refreshed = resolveConfig(forceRefresh = true)
+                        if (refreshed.apiKey.isNotBlank() && refreshed.apiKey != config.apiKey) {
+                            config = refreshed
+                            continue
+                        }
+                    }
+                    return@withContext Result.failure(Exception("Deepgram authentication failed (HTTP ${response.code})"))
                 }
 
-                val parsed = parseDeepgramResponseJson(bodyStr)
+                if (!response.isSuccessful) {
+                    if (BuildConfig.DEBUG) {
+                        Log.w(TAG, "Deepgram HTTP ${response.code}: ${response.body}")
+                    } else {
+                        Log.w(TAG, "Deepgram HTTP ${response.code}")
+                    }
+                    lastError = Exception("Deepgram API error (HTTP ${response.code})")
+                    if (response.code in 500..599 && attempt == 0) {
+                        delay(250)
+                        continue
+                    }
+                    return@withContext Result.failure(lastError)
+                }
+
+                val parsed = parseDeepgramResponseJson(response.body)
                 if (parsed.transcript.isBlank()) {
                     return@withContext Result.failure(Exception("No speech detected in recording"))
                 }
-                Log.d(TAG, "Deepgram transcript (${parsed.confidence}): \"${parsed.transcript}\"")
-                Result.success(parsed)
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "Deepgram transcript (${parsed.confidence}): \"${parsed.transcript}\"")
+                }
+                return@withContext Result.success(parsed)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: IOException) {
+                lastError = e
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "Deepgram IO error (attempt ${attempt + 1}): ${e.message}")
+                }
+                if (attempt == 0) {
+                    delay(250)
+                    continue
+                }
+            } catch (e: Exception) {
+                if (BuildConfig.DEBUG) {
+                    Log.e(TAG, "Deepgram transcribeAudio failed: ${e.message}", e)
+                } else {
+                    Log.e(TAG, "Deepgram transcribeAudio failed: ${e.javaClass.simpleName}")
+                }
+                return@withContext Result.failure(e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Deepgram transcribeAudio failed: ${e.message}", e)
-            Result.failure(e)
         }
+
+        val finalError = lastError ?: Exception("Deepgram transcription failed")
+        if (BuildConfig.DEBUG) {
+            Log.e(TAG, "Deepgram transcribeAudio failed after retry: ${finalError.message}", finalError)
+        } else {
+            Log.e(TAG, "Deepgram transcribeAudio failed after retry: ${finalError.javaClass.simpleName}")
+        }
+        Result.failure(finalError)
     }
 
     /**
@@ -186,16 +337,20 @@ class DeepgramVoiceService private constructor() {
             return Result.failure(Exception("Empty transcript"))
         }
 
+        val availableMenu = menuItems.filter { it.isAvailable }
         if (menuItems.isNotEmpty()) {
-            MenuCatalog.syncWithRoomMenuItems(menuItems)
+            if (availableMenu.isEmpty()) {
+                return Result.failure(Exception("No menu items are currently available."))
+            }
+            MenuCatalog.syncWithRoomMenuItems(availableMenu)
         }
 
         val engine = LocalOrderEngine()
         val orderState = engine.processUtterance(cleaned, VoiceOrderState())
 
         val parsedItems = orderState.items.map { line ->
-            val roomName = menuItems.find { it.name.equals(line.name, ignoreCase = true) }?.name ?: line.name
-            ParsedOrderItem(menuItemName = roomName, quantity = line.quantity)
+            val roomName = availableMenu.find { it.name.equals(line.name, ignoreCase = true) }?.name ?: line.name
+            ParsedOrderItem(menuItemName = roomName, quantity = line.quantity.coerceAtLeast(1))
         }
 
         if (parsedItems.isEmpty()) {
@@ -203,7 +358,7 @@ class DeepgramVoiceService private constructor() {
         }
 
         val lower = cleaned.lowercase()
-        val customerName = extractCustomerName(cleaned, lower)
+        val customerName = extractCustomerName(lower, availableMenu)
         val contactNumber = extractPhoneNumber(cleaned)
         val notes = extractOrderNotes(lower, orderState)
 
@@ -259,20 +414,16 @@ class DeepgramVoiceService private constructor() {
         return (menuNames + coreTerms).distinct().take(65)
     }
 
-    private fun extractCustomerName(original: String, lower: String): String {
-        val patterns = listOf(
-            Regex("(?:for|name is|customer)\\s+([A-Za-z]{2,20})"),
-            Regex("([A-Za-z]{2,20})\\s+ke naam pe")
-        )
-        val stopWords = setOf(
-            "a", "an", "the", "me", "us", "takeaway", "parcel", "packing",
-            "coffee", "frappe", "fries", "sandwich", "less", "extra", "no"
-        )
-        for (regex in patterns) {
-            val match = regex.find(lower)
-            if (match != null) {
+    private fun extractCustomerName(lower: String, menuItems: List<MenuItemEntity>): String {
+        val menuTokens = menuItems
+            .flatMap { it.name.lowercase().split(Regex("[^a-z0-9]+")) }
+            .filter { it.length >= 2 }
+            .toSet()
+
+        for (regex in NAME_PATTERNS) {
+            for (match in regex.findAll(lower)) {
                 val raw = match.groupValues[1].trim()
-                if (raw.isNotBlank() && raw !in stopWords) {
+                if (raw.isNotBlank() && raw !in NAME_STOP_WORDS && raw !in menuTokens) {
                     return raw.replaceFirstChar { it.uppercase() }
                 }
             }
@@ -281,8 +432,12 @@ class DeepgramVoiceService private constructor() {
     }
 
     private fun extractPhoneNumber(text: String): String {
-        val compact = text.replace(Regex("(?<=\\d)[\\s-]+(?=\\d)"), "")
-        return Regex("\\b\\d{10}\\b").find(compact)?.value ?: ""
+        val compact = text.replace(PHONE_COMPACT_REGEX, "")
+        val indianMatch = INDIAN_PHONE_REGEX.find(compact)
+        if (indianMatch != null) {
+            return indianMatch.groupValues[1]
+        }
+        return FALLBACK_10_DIGIT_PHONE_REGEX.find(compact)?.groupValues?.getOrNull(1) ?: ""
     }
 
     private fun extractOrderNotes(lower: String, orderState: VoiceOrderState): String {

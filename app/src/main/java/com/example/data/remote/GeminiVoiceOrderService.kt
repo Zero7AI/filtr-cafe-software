@@ -2,15 +2,26 @@ package com.example.data.remote
 
 import com.example.BuildConfig
 import com.example.data.entity.MenuItemEntity
+import com.example.voice.engine.LocalOrderEngine
+import com.example.voice.engine.MenuCatalog
+import com.example.voice.model.VoiceOrderState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 data class ParsedOrderItem(
     val menuItemName: String,
@@ -26,28 +37,135 @@ data class ParsedVoiceOrder(
 )
 
 class GeminiVoiceOrderService {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
+
+    private data class HttpResult(
+        val code: Int,
+        val isSuccessful: Boolean,
+        val body: String
+    )
+
+    companion object {
+        private const val GEMINI_GENERATE_URL =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        private val sharedClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .callTimeout(35, TimeUnit.SECONDS)
+                .build()
+        }
+    }
+
+    private fun resolveApiKey(): String? {
+        val key = BuildConfig.GEMINI_API_KEY.trim()
+        return key.takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+    }
+
+    private suspend fun executeRequest(request: Request): HttpResult =
+        suspendCancellableCoroutine { cont ->
+            val call = sharedClient.newCall(request)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(e)
+                    }
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use { resp ->
+                            val result = HttpResult(
+                                code = resp.code,
+                                isSuccessful = resp.isSuccessful,
+                                body = resp.body?.string().orEmpty()
+                            )
+                            if (cont.isActive) {
+                                cont.resume(result)
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        if (cont.isActive) {
+                            cont.resumeWithException(t)
+                        }
+                    }
+                }
+            })
+        }
+
+    private fun buildGeminiRequest(apiKey: String, payload: JSONObject): Request {
+        val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+        return Request.Builder()
+            .url(GEMINI_GENERATE_URL)
+            .addHeader("x-goog-api-key", apiKey)
+            .post(body)
+            .build()
+    }
+
+    private fun extractGeminiText(responseBodyStr: String): String {
+        val responseJson = JSONObject(responseBodyStr)
+        val candidates = responseJson.optJSONArray("candidates")
+        val firstCandidate = candidates?.optJSONObject(0)
+        val parts = firstCandidate?.optJSONObject("content")?.optJSONArray("parts")
+        return parts?.optJSONObject(0)?.optString("text", "")?.trim().orEmpty()
+    }
+
+    private fun matchParsedOrderItems(
+        itemsArray: JSONArray,
+        availableItems: List<MenuItemEntity>
+    ): List<ParsedOrderItem> {
+        val parsedItems = mutableListOf<ParsedOrderItem>()
+        for (i in 0 until itemsArray.length()) {
+            val itemObj = itemsArray.optJSONObject(i) ?: continue
+            val rawName = itemObj.optString("menuItemName", "").trim()
+            if (rawName.isBlank()) continue
+            val qty = itemObj.optInt("quantity", 1).coerceAtLeast(1)
+
+            val matchedItem = availableItems.find {
+                it.name.equals(rawName, ignoreCase = true)
+            } ?: if (rawName.length >= 2) {
+                availableItems.find {
+                    it.name.lowercase().contains(rawName.lowercase()) ||
+                        rawName.lowercase().contains(it.name.lowercase())
+                }
+            } else {
+                null
+            }
+
+            if (matchedItem != null) {
+                parsedItems.add(ParsedOrderItem(menuItemName = matchedItem.name, quantity = qty))
+            }
+        }
+        return parsedItems
+    }
 
     suspend fun parseVoiceOrder(
         transcript: String,
         menuItems: List<MenuItemEntity>
     ): Result<ParsedVoiceOrder> = withContext(Dispatchers.IO) {
-        val userProvidedKey = "AQ.Ab8RN6ItBjoSsHK9wibcIad6P57X7vWBOE4O9fWheNkc8NI-Pg"
-        val apiKey = if (BuildConfig.GEMINI_API_KEY.isNotBlank() && BuildConfig.GEMINI_API_KEY != "MY_GEMINI_API_KEY") {
-            BuildConfig.GEMINI_API_KEY
-        } else {
-            userProvidedKey
+        val cleanedTranscript = transcript.trim()
+        if (cleanedTranscript.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Empty transcript"))
         }
 
+        val availableItems = menuItems.filter { it.isAvailable }
+        if (availableItems.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("No available menu items"))
+        }
+
+        val apiKey = resolveApiKey()
+            ?: return@withContext Result.failure(IllegalStateException("Gemini API key is not configured"))
+
         try {
-            val menuSummary = menuItems.joinToString("\n") { "- ${it.name} (Category: ${it.category}, Price: ₹${it.price})" }
+            val menuSummary = availableItems.joinToString("\n") {
+                "- ${it.name} (Category: ${it.category}, Price: ₹${it.price})"
+            }
 
             val promptText = """
-                Spoken Order Transcript: "$transcript"
+                Spoken Order Transcript: "$cleanedTranscript"
 
                 Available Menu Items:
                 $menuSummary
@@ -56,7 +174,7 @@ class GeminiVoiceOrderService {
                 - customerName (String, default to "Walk-in Customer" if not mentioned)
                 - contactNumber (String, default to "" if not mentioned)
                 - notes (String, default to "" if no special request/customizations mentioned like "less sugar", "extra hot", "no ice", "spicy", "takeaway")
-                - items (Array of objects with "menuItemName" matching one of the menu item names above, and "quantity" as integer)
+                - items (Array of objects with "menuItemName" matching one of the menu item names above, and "quantity" as integer >= 1)
 
                 Output ONLY valid raw JSON with no markdown backticks.
             """.trimIndent()
@@ -72,74 +190,46 @@ class GeminiVoiceOrderService {
                     })
                 }
                 put("contents", contents)
-
-                val generationConfig = JSONObject().apply {
+                put("generationConfig", JSONObject().apply {
                     put("temperature", 0.1)
                     put("responseMimeType", "application/json")
-                }
-                put("generationConfig", generationConfig)
+                })
             }
 
-            val requestUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=$apiKey"
-            val body = requestJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
+            if (!response.isSuccessful) {
+                return@withContext parseOrderLocally(cleanedTranscript, availableItems)
+            }
 
-            val request = Request.Builder()
-                .url(requestUrl)
-                .post(body)
-                .build()
+            val textResponse = extractGeminiText(response.body)
+            if (textResponse.isBlank()) {
+                return@withContext parseOrderLocally(cleanedTranscript, availableItems)
+            }
 
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    return@withContext parseOrderLocally(transcript, menuItems)
-                }
+            val parsedOrderJson = JSONObject(textResponse)
+            val customerName = parsedOrderJson.optString("customerName", "Walk-in Customer").trim()
+            val contactNumber = parsedOrderJson.optString("contactNumber", "").trim()
+            val notes = parsedOrderJson.optString("notes", "").trim()
+            val itemsArray = parsedOrderJson.optJSONArray("items") ?: JSONArray()
 
-                val responseBodyStr = response.body?.string() ?: ""
-                val responseJson = JSONObject(responseBodyStr)
-                val candidates = responseJson.optJSONArray("candidates")
-                val firstCandidate = candidates?.optJSONObject(0)
-                val parts = firstCandidate?.optJSONObject("content")?.optJSONArray("parts")
-                val textResponse = parts?.optJSONObject(0)?.optString("text") ?: ""
+            val parsedItems = matchParsedOrderItems(itemsArray, availableItems)
+            if (parsedItems.isEmpty()) {
+                return@withContext parseOrderLocally(cleanedTranscript, availableItems)
+            }
 
-                val parsedOrderJson = JSONObject(textResponse.trim())
-                val customerName = parsedOrderJson.optString("customerName", "Walk-in Customer")
-                val contactNumber = parsedOrderJson.optString("contactNumber", "")
-                val notes = parsedOrderJson.optString("notes", "")
-                val itemsArray = parsedOrderJson.optJSONArray("items") ?: JSONArray()
-
-                val parsedItems = mutableListOf<ParsedOrderItem>()
-                for (i in 0 until itemsArray.length()) {
-                    val itemObj = itemsArray.getJSONObject(i)
-                    val rawName = itemObj.optString("menuItemName", "")
-                    val qty = itemObj.optInt("quantity", 1)
-
-                    // Find closest matching menu item name
-                    val matchedItem = menuItems.find {
-                        it.name.equals(rawName, ignoreCase = true)
-                    } ?: menuItems.find {
-                        it.name.lowercase().contains(rawName.lowercase()) || rawName.lowercase().contains(it.name.lowercase())
-                    }
-
-                    if (matchedItem != null) {
-                        parsedItems.add(ParsedOrderItem(menuItemName = matchedItem.name, quantity = qty))
-                    }
-                }
-
-                if (parsedItems.isEmpty()) {
-                    return@withContext parseOrderLocally(transcript, menuItems)
-                }
-
-                Result.success(
-                    ParsedVoiceOrder(
-                        customerName = if (customerName.isBlank()) "Walk-in Customer" else customerName,
-                        contactNumber = contactNumber,
-                        items = parsedItems,
-                        notes = notes
-                    )
+            Result.success(
+                ParsedVoiceOrder(
+                    customerName = customerName.ifBlank { "Walk-in Customer" },
+                    contactNumber = contactNumber,
+                    items = parsedItems,
+                    notes = notes,
+                    rawTranscript = cleanedTranscript
                 )
-            }
-        } catch (e: Exception) {
-            // Fallback to local regex/keyword parser on error
-            parseOrderLocally(transcript, menuItems)
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            parseOrderLocally(cleanedTranscript, availableItems)
         }
     }
 
@@ -148,15 +238,22 @@ class GeminiVoiceOrderService {
         mimeType: String,
         menuItems: List<MenuItemEntity>
     ): Result<ParsedVoiceOrder> = withContext(Dispatchers.IO) {
-        val userProvidedKey = "AQ.Ab8RN6ItBjoSsHK9wibcIad6P57X7vWBOE4O9fWheNkc8NI-Pg"
-        val apiKey = if (BuildConfig.GEMINI_API_KEY.isNotBlank() && BuildConfig.GEMINI_API_KEY != "MY_GEMINI_API_KEY") {
-            BuildConfig.GEMINI_API_KEY
-        } else {
-            userProvidedKey
+        if (audioBytes.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("Empty audio recording"))
         }
 
+        val availableItems = menuItems.filter { it.isAvailable }
+        if (availableItems.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("No available menu items"))
+        }
+
+        val apiKey = resolveApiKey()
+            ?: return@withContext Result.failure(IllegalStateException("Gemini API key is not configured"))
+
         try {
-            val menuSummary = menuItems.joinToString("\n") { "- Item Name: \"${it.name}\" | Category: ${it.category} | Price: ₹${it.price}" }
+            val menuSummary = availableItems.joinToString("\n") {
+                "- Item Name: \"${it.name}\" | Category: ${it.category} | Price: ₹${it.price}"
+            }
             val base64Audio = android.util.Base64.encodeToString(audioBytes, android.util.Base64.NO_WRAP)
 
             val promptText = """
@@ -225,129 +322,98 @@ class GeminiVoiceOrderService {
                     })
                 }
                 put("contents", contents)
-
-                val generationConfig = JSONObject().apply {
+                put("generationConfig", JSONObject().apply {
                     put("temperature", 0.1)
                     put("responseMimeType", "application/json")
-                }
-                put("generationConfig", generationConfig)
+                })
             }
 
-            val requestUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=$apiKey"
-            val body = requestJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(Exception("Gemini API error (HTTP ${response.code})"))
+            }
 
-            val request = Request.Builder()
-                .url(requestUrl)
-                .post(body)
-                .build()
+            val textResponse = extractGeminiText(response.body)
+            if (textResponse.isBlank()) {
+                return@withContext Result.failure(Exception("Gemini returned an empty response"))
+            }
 
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    return@withContext parseOrderLocally("", menuItems)
-                }
+            val parsedOrderJson = JSONObject(textResponse)
+            val rawTranscript = parsedOrderJson.optString("rawTranscript", "").trim()
+            val customerName = parsedOrderJson.optString("customerName", "Walk-in Customer").trim()
+            val contactNumber = parsedOrderJson.optString("contactNumber", "").trim()
+            val notes = parsedOrderJson.optString("notes", "").trim()
+            val itemsArray = parsedOrderJson.optJSONArray("items") ?: JSONArray()
 
-                val responseBodyStr = response.body?.string() ?: ""
-                val responseJson = JSONObject(responseBodyStr)
-                val candidates = responseJson.optJSONArray("candidates")
-                val firstCandidate = candidates?.optJSONObject(0)
-                val parts = firstCandidate?.optJSONObject("content")?.optJSONArray("parts")
-                val textResponse = parts?.optJSONObject(0)?.optString("text") ?: ""
+            val parsedItems = matchParsedOrderItems(itemsArray, availableItems)
+            if (parsedItems.isEmpty()) {
+                return@withContext Result.failure(Exception("No matching menu items recognized from audio"))
+            }
 
-                val parsedOrderJson = JSONObject(textResponse.trim())
-                val rawTranscript = parsedOrderJson.optString("rawTranscript", "")
-                val customerName = parsedOrderJson.optString("customerName", "Walk-in Customer")
-                val contactNumber = parsedOrderJson.optString("contactNumber", "")
-                val notes = parsedOrderJson.optString("notes", "")
-                val itemsArray = parsedOrderJson.optJSONArray("items") ?: JSONArray()
-
-                val parsedItems = mutableListOf<ParsedOrderItem>()
-                for (i in 0 until itemsArray.length()) {
-                    val itemObj = itemsArray.getJSONObject(i)
-                    val rawName = itemObj.optString("menuItemName", "")
-                    val qty = itemObj.optInt("quantity", 1)
-
-                    val matchedItem = menuItems.find {
-                        it.name.equals(rawName, ignoreCase = true)
-                    } ?: menuItems.find {
-                        it.name.lowercase().contains(rawName.lowercase()) || rawName.lowercase().contains(it.name.lowercase())
-                    }
-
-                    if (matchedItem != null) {
-                        parsedItems.add(ParsedOrderItem(menuItemName = matchedItem.name, quantity = qty))
-                    }
-                }
-
-                if (parsedItems.isEmpty()) {
-                    return@withContext parseOrderLocally("", menuItems)
-                }
-
-                Result.success(
-                    ParsedVoiceOrder(
-                        customerName = if (customerName.isBlank()) "Walk-in Customer" else customerName,
-                        contactNumber = contactNumber,
-                        items = parsedItems,
-                        notes = notes,
-                        rawTranscript = rawTranscript
-                    )
+            Result.success(
+                ParsedVoiceOrder(
+                    customerName = customerName.ifBlank { "Walk-in Customer" },
+                    contactNumber = contactNumber,
+                    items = parsedItems,
+                    notes = notes,
+                    rawTranscript = rawTranscript
                 )
-            }
+            )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            parseOrderLocally("", menuItems)
+            Result.failure(e)
         }
     }
 
     private fun parseOrderLocally(
         transcript: String,
-        menuItems: List<MenuItemEntity>
+        availableItems: List<MenuItemEntity>
     ): Result<ParsedVoiceOrder> {
-        val lower = transcript.lowercase()
-        val parsedItems = mutableListOf<ParsedOrderItem>()
-
-        // Extract numbers / quantities
-        menuItems.forEach { menuItem ->
-            val itemNameLower = menuItem.name.lowercase()
-            // Check for key words e.g. "filter coffee", "brownie", "croissant"
-            val keyTokens = itemNameLower.split(" ").filter { it.length > 3 }
-            val matches = keyTokens.any { lower.contains(it) } || lower.contains(itemNameLower)
-
-            if (matches) {
-                // Determine quantity around item name
-                var qty = 1
-                if (lower.contains("2 ") || lower.contains("two ")) qty = 2
-                else if (lower.contains("3 ") || lower.contains("three ")) qty = 3
-                else if (lower.contains("4 ") || lower.contains("four ")) qty = 4
-                else if (lower.contains("5 ") || lower.contains("five ")) qty = 5
-
-                parsedItems.add(ParsedOrderItem(menuItem.name, qty))
-            }
+        val cleaned = transcript.trim()
+        if (cleaned.isBlank() || availableItems.isEmpty()) {
+            return Result.failure(Exception("No menu items matched"))
         }
 
-        // Extract customer name if "for <Name>" is present
+        MenuCatalog.syncWithRoomMenuItems(availableItems)
+        val orderState = LocalOrderEngine().processUtterance(cleaned, VoiceOrderState())
+
+        val parsedItems = orderState.items.map { line ->
+            val roomName = availableItems.find { it.name.equals(line.name, ignoreCase = true) }?.name ?: line.name
+            ParsedOrderItem(menuItemName = roomName, quantity = line.quantity.coerceAtLeast(1))
+        }
+
+        if (parsedItems.isEmpty()) {
+            return Result.failure(Exception("Could not match any available menu items"))
+        }
+
+        val lower = cleaned.lowercase()
+        val stopWords = setOf(
+            "a", "an", "the", "me", "us", "takeaway", "parcel", "packing",
+            "table", "one", "two", "three", "four", "five", "dine", "car",
+            "parking", "order", "coffee", "frappe", "fries", "sandwich"
+        )
         var customerName = "Walk-in Customer"
-        val forIndex = lower.indexOf("for ")
-        if (forIndex != -1) {
-            val afterFor = transcript.substring(forIndex + 4).trim().split(" ")[0]
-            if (afterFor.isNotBlank() && afterFor.lowercase() !in listOf("a", "the", "me", "us", "takeaway")) {
-                customerName = afterFor.replaceFirstChar { it.uppercase() }
-            }
+        val nameMatch = Regex("\\b(?:for|name is|customer)\\s+([A-Za-z]{2,20})\\b").findAll(lower)
+            .map { it.groupValues[1].trim() }
+            .firstOrNull { it.isNotBlank() && it !in stopWords }
+        if (nameMatch != null) {
+            customerName = nameMatch.replaceFirstChar { it.uppercase() }
         }
 
-        // Extract phone number if digits are present
-        val phoneRegex = Regex("\\b\\d{10}\\b")
-        val phoneMatch = phoneRegex.find(transcript)
-        val contactNumber = phoneMatch?.value ?: ""
-
-        val defaultItems = if (parsedItems.isEmpty() && menuItems.isNotEmpty()) {
-            listOf(ParsedOrderItem(menuItems.first().name, 1))
-        } else {
-            parsedItems
-        }
+        val compact = cleaned.replace(Regex("(?<=\\d)[\\s-]+(?=\\d)"), "")
+        val contactNumber = Regex("(?<!\\d)(?:(?:\\+?91|0)[\\s-]?)?([6-9]\\d{9})(?!\\d)")
+            .find(compact)?.groupValues?.getOrNull(1)
+            ?: Regex("(?<!\\d)(\\d{10})(?!\\d)").find(compact)?.groupValues?.getOrNull(1)
+            ?: ""
 
         return Result.success(
             ParsedVoiceOrder(
                 customerName = customerName,
                 contactNumber = contactNumber,
-                items = defaultItems
+                items = parsedItems,
+                notes = orderState.orderNotes.orEmpty(),
+                rawTranscript = cleaned
             )
         )
     }
@@ -356,19 +422,15 @@ class GeminiVoiceOrderService {
         title: String,
         date: String = ""
     ): Result<String> = withContext(Dispatchers.IO) {
-        val userProvidedKey = "AQ.Ab8RN6ItBjoSsHK9wibcIad6P57X7vWBOE4O9fWheNkc8NI-Pg"
-        val apiKey = if (BuildConfig.GEMINI_API_KEY.isNotBlank() && BuildConfig.GEMINI_API_KEY != "MY_GEMINI_API_KEY") {
-            BuildConfig.GEMINI_API_KEY
-        } else {
-            userProvidedKey
-        }
+        val apiKey = resolveApiKey()
+            ?: return@withContext Result.failure(IllegalStateException("Gemini API key is not configured"))
 
         try {
             val promptText = """
                 Write a short, heartfelt 2-sentence micro-journal entry for a specialty coffee shop customer receipt.
                 Topic / R&D Title: "$title"
                 ${if (date.isNotBlank()) "Date: $date" else ""}
-                
+
                 Guidelines:
                 - Tone: passionate, vintage, personal, showing hard work and obsession behind perfecting coffee for our customers.
                 - Max 25 words.
@@ -387,39 +449,26 @@ class GeminiVoiceOrderService {
                     })
                 }
                 put("contents", contents)
-                val generationConfig = JSONObject().apply {
+                put("generationConfig", JSONObject().apply {
                     put("temperature", 0.7)
-                }
-                put("generationConfig", generationConfig)
+                })
             }
 
-            val requestUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=$apiKey"
-            val body = requestJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-
-            val request = Request.Builder()
-                .url(requestUrl)
-                .post(body)
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    return@withContext Result.success("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
-                }
-                val responseBodyStr = response.body?.string() ?: ""
-                val responseJson = JSONObject(responseBodyStr)
-                val candidates = responseJson.optJSONArray("candidates")
-                val firstCandidate = candidates?.optJSONObject(0)
-                val parts = firstCandidate?.optJSONObject("content")?.optJSONArray("parts")
-                val textResponse = parts?.optJSONObject(0)?.optString("text")?.trim() ?: ""
-                if (textResponse.isNotBlank()) {
-                    Result.success(textResponse.replace("\"", "").trim())
-                } else {
-                    Result.success("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
-                }
+            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(Exception("Gemini API error (HTTP ${response.code})"))
             }
+
+            val textResponse = extractGeminiText(response.body)
+            if (textResponse.isNotBlank()) {
+                Result.success(textResponse.replace("\"", "").trim())
+            } else {
+                Result.failure(Exception("Empty story note response"))
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Result.success("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
+            Result.failure(e)
         }
     }
 }
-

@@ -1,10 +1,14 @@
 package com.example.voice.viewmodel
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.entity.MenuItemEntity
@@ -12,29 +16,34 @@ import com.example.voice.audio.AudioCaptureService
 import com.example.voice.audio.VoiceModalityProfile
 import com.example.voice.engine.LocalOrderEngine
 import com.example.voice.engine.MenuCatalog
-import com.example.voice.model.VoiceOrderState
 import com.example.voice.model.VoiceOrderLineItem
+import com.example.voice.model.VoiceOrderState
 import com.example.voice.model.VoiceStateMachineEnum
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 class VoiceOrderViewModel : ViewModel() {
 
     private val orderEngine = LocalOrderEngine()
+    private val engineMutex = Mutex()
 
     private val _orderState = MutableStateFlow(
         VoiceOrderState(
             sessionId = UUID.randomUUID().toString(),
             restaurantId = "FILTR Coffee",
             counterId = "Counter POS 1",
-            deviceId = android.os.Build.MODEL,
-            state = VoiceStateMachineEnum.LISTENING,
-            statusMessage = "Starting Deepgram Voice Engine..."
+            deviceId = Build.MODEL,
+            state = VoiceStateMachineEnum.IDLE,
+            statusMessage = "Initializing Voice Engine..."
         )
     )
     val orderState: StateFlow<VoiceOrderState> = _orderState.asStateFlow()
@@ -55,18 +64,24 @@ class VoiceOrderViewModel : ViewModel() {
     val showConfirmDialog: StateFlow<Boolean> = _showConfirmDialog.asStateFlow()
 
     private var captureService: AudioCaptureService? = null
+    private var boundAppContext: Context? = null
     private var isBound = false
+    private var isBindingInProgress = false
     private var autoResetJob: Job? = null
+
+    @Volatile
+    private var latestMenuItems: List<MenuItemEntity> = emptyList()
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            val service = (binder as AudioCaptureService.LocalBinder).getService()
+            val localBinder = binder as? AudioCaptureService.LocalBinder ?: return
+            val service = localBinder.getService()
             captureService = service
             isBound = true
+            isBindingInProgress = false
 
-            // Set up automatic live grammar updates whenever MenuCatalog changes
-            MenuCatalog.onMenuUpdated = { phrases ->
-                captureService?.voskRecognizer?.updateGrammar(phrases)
+            if (latestMenuItems.isNotEmpty()) {
+                service.turnRecognizer.updateMenuContext(latestMenuItems)
             }
 
             service.audioLevelCallback = { rms ->
@@ -79,58 +94,140 @@ class VoiceOrderViewModel : ViewModel() {
                 onInProcessTranscript(text, isFinal, modality)
             }
             service.statusCallback = { ready, msg ->
-                _orderState.value = _orderState.value.copy(
-                    state = if (ready) VoiceStateMachineEnum.LISTENING else VoiceStateMachineEnum.IDLE,
-                    statusMessage = msg
-                )
-                if (ready) {
-                    val activePhrases = MenuCatalog.getActiveGrammarPhrases()
-                    service.voskRecognizer.updateGrammar(activePhrases)
+                _orderState.update { current ->
+                    val nextState = when {
+                        !ready -> if (current.items.isNotEmpty()) VoiceStateMachineEnum.ORDER_BUILDING else VoiceStateMachineEnum.IDLE
+                        current.items.isNotEmpty() -> VoiceStateMachineEnum.ORDER_BUILDING
+                        else -> VoiceStateMachineEnum.LISTENING
+                    }
+                    current.copy(
+                        state = nextState,
+                        statusMessage = msg
+                    )
                 }
+            }
+
+            if (_isListening.value) {
+                service.resumeListening()
+            } else {
+                service.pauseListening()
             }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            clearServiceCallbacks(captureService)
             captureService = null
             isBound = false
+            isBindingInProgress = false
         }
     }
 
     fun bindService(context: Context) {
-        if (!isBound) {
-            val intent = Intent(context, AudioCaptureService::class.java)
-            try {
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
-            } catch (e: Exception) {
-                // Fallback to startService
-                context.startService(intent)
+        val appContext = context.applicationContext
+        val hasPermission = ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasPermission) {
+            onMicPermissionDenied()
+            return
+        }
+
+        if (isBound || isBindingInProgress) return
+
+        boundAppContext = appContext
+        isBindingInProgress = true
+
+        val intent = Intent(appContext, AudioCaptureService::class.java).apply {
+            action = if (_isListening.value) {
+                AudioCaptureService.ACTION_START_LISTENING
+            } else {
+                AudioCaptureService.ACTION_PAUSE_LISTENING
             }
-            context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(intent)
+            } else {
+                appContext.startService(intent)
+            }
+        } catch (e: Exception) {
+            isBindingInProgress = false
+            _isListening.value = false
+            _orderState.update {
+                it.copy(
+                    state = if (it.items.isNotEmpty()) VoiceStateMachineEnum.ORDER_BUILDING else VoiceStateMachineEnum.IDLE,
+                    statusMessage = "Voice service start blocked: ${e.message ?: "permission/background limit"}"
+                )
+            }
+            return
+        }
+
+        val bound = runCatching {
+            appContext.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        }.getOrDefault(false)
+
+        if (!bound) {
+            isBindingInProgress = false
+            _orderState.update {
+                it.copy(
+                    state = if (it.items.isNotEmpty()) VoiceStateMachineEnum.ORDER_BUILDING else VoiceStateMachineEnum.IDLE,
+                    statusMessage = "Could not bind audio service"
+                )
+            }
+        }
+    }
+
+    fun onMicPermissionDenied() {
+        _isListening.value = false
+        _isSpeechActive.value = false
+        _audioLevel.value = 0.0
+        _orderState.update {
+            it.copy(
+                state = if (it.items.isNotEmpty()) VoiceStateMachineEnum.ORDER_BUILDING else VoiceStateMachineEnum.IDLE,
+                statusMessage = "Microphone permission required for voice ordering"
+            )
         }
     }
 
     fun syncMenuItemsWithRoom(menuItems: List<MenuItemEntity>) {
-        MenuCatalog.syncWithRoomMenuItems(menuItems)
-        captureService?.voskRecognizer?.updateMenuContext(menuItems)
-        val activePhrases = MenuCatalog.getActiveGrammarPhrases()
-        captureService?.voskRecognizer?.updateGrammar(activePhrases)
+        latestMenuItems = menuItems.toList()
+        MenuCatalog.syncWithRoomMenuItems(latestMenuItems)
+        captureService?.turnRecognizer?.updateMenuContext(latestMenuItems)
     }
 
     fun toggleListening() {
         val next = !_isListening.value
-        _isListening.value = next
-        captureService?.voskRecognizer?.isEnabled?.set(next)
-        _orderState.value = _orderState.value.copy(
-            statusMessage = if (next) {
-                "Deepgram Voice AI Active"
-            } else {
-                "Voice Listening Paused"
+        if (next) {
+            val appCtx = boundAppContext
+            if (appCtx != null &&
+                ContextCompat.checkSelfPermission(appCtx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+            ) {
+                onMicPermissionDenied()
+                return
             }
-        )
+            _isListening.value = true
+            captureService?.resumeListening()
+            _orderState.update {
+                it.copy(
+                    state = if (it.items.isNotEmpty()) VoiceStateMachineEnum.ORDER_BUILDING else VoiceStateMachineEnum.LISTENING,
+                    statusMessage = "Deepgram Voice AI Active"
+                )
+            }
+        } else {
+            _isListening.value = false
+            _isSpeechActive.value = false
+            _audioLevel.value = 0.0
+            captureService?.pauseListening()
+            _orderState.update {
+                it.copy(
+                    state = if (it.items.isNotEmpty()) VoiceStateMachineEnum.ORDER_BUILDING else VoiceStateMachineEnum.IDLE,
+                    statusMessage = "Voice Listening Paused"
+                )
+            }
+        }
     }
 
     private fun onInProcessTranscript(
@@ -150,8 +247,14 @@ class VoiceOrderViewModel : ViewModel() {
     ) {
         viewModelScope.launch {
             _currentTranscript.value = rawText
-            val newState = orderEngine.processUtterance(rawText, _orderState.value, modality)
-            _orderState.value = newState
+            val newState = engineMutex.withLock {
+                val snapshot = _orderState.value
+                val processed = withContext(Dispatchers.Default) {
+                    orderEngine.processUtterance(rawText, snapshot, modality)
+                }
+                _orderState.update { processed }
+                processed
+            }
             restartInactivityTimer(newState)
 
             // If voice command triggered confirmation, show confirm dialog
@@ -162,6 +265,7 @@ class VoiceOrderViewModel : ViewModel() {
     }
 
     fun quickAdd(itemName: String, quantity: Int = 1) {
+        if (quantity <= 0) return
         val matched = MenuCatalog.items.find { it.name.equals(itemName, ignoreCase = true) }
             ?: MenuCatalog.findBestMatch(itemName)
         if (matched != null) {
@@ -172,43 +276,53 @@ class VoiceOrderViewModel : ViewModel() {
     }
 
     fun addItemDirect(name: String, price: Double, quantity: Int = 1) {
-        val currentItems = _orderState.value.items.toMutableList()
-        val index = currentItems.indexOfFirst { it.name.equals(name, ignoreCase = true) }
-        if (index >= 0) {
-            val item = currentItems[index]
-            val newQty = item.quantity + quantity
-            val newTotal = newQty * item.unitPrice
-            currentItems[index] = item.copy(quantity = newQty, itemTotal = newTotal)
-        } else {
-            val lineTotal = quantity * price
-            currentItems.add(
-                VoiceOrderLineItem(
-                    lineId = UUID.randomUUID().toString(),
-                    sku = "SKU_${name.replace(" ", "_").uppercase()}",
-                    name = name,
-                    quantity = quantity,
-                    unitPrice = price,
-                    itemTotal = lineTotal
+        if (quantity <= 0) return
+        var latestState: VoiceOrderState? = null
+        _orderState.update { current ->
+            val currentItems = current.items.toMutableList()
+            val index = currentItems.indexOfFirst {
+                it.name.equals(name, ignoreCase = true) && it.modifiers.isEmpty()
+            }
+            if (index >= 0) {
+                val item = currentItems[index]
+                val newQty = item.quantity + quantity
+                val newTotal = newQty * item.unitPrice
+                currentItems[index] = item.copy(quantity = newQty, itemTotal = newTotal)
+            } else {
+                val lineTotal = quantity * price
+                currentItems.add(
+                    VoiceOrderLineItem(
+                        lineId = UUID.randomUUID().toString(),
+                        sku = "SKU_${name.replace(" ", "_").uppercase()}",
+                        name = name,
+                        quantity = quantity,
+                        unitPrice = price,
+                        itemTotal = lineTotal
+                    )
                 )
+            }
+            val subtotal = currentItems.sumOf { it.itemTotal }
+            val updated = current.copy(
+                state = VoiceStateMachineEnum.ORDER_BUILDING,
+                items = currentItems,
+                subtotal = subtotal,
+                tax = 0.0,
+                total = subtotal,
+                statusMessage = "Added ${quantity}× $name"
             )
+            latestState = updated
+            updated
         }
-        val subtotal = currentItems.sumOf { it.itemTotal }
-        val updated = _orderState.value.copy(
-            state = VoiceStateMachineEnum.ORDER_BUILDING,
-            items = currentItems,
-            subtotal = subtotal,
-            tax = 0.0,
-            total = subtotal,
-            statusMessage = "Added ${quantity}× $name"
-        )
-        _orderState.value = updated
-        restartInactivityTimer(updated)
+        latestState?.let(::restartInactivityTimer)
     }
 
     fun onItemQuantityChange(lineId: String, delta: Int) {
-        val currentItems = _orderState.value.items.toMutableList()
-        val index = currentItems.indexOfFirst { it.lineId == lineId }
-        if (index >= 0) {
+        var latestState: VoiceOrderState? = null
+        _orderState.update { current ->
+            val currentItems = current.items.toMutableList()
+            val index = currentItems.indexOfFirst { it.lineId == lineId }
+            if (index < 0) return@update current
+
             val item = currentItems[index]
             val newQty = item.quantity + delta
             if (newQty <= 0) {
@@ -218,16 +332,23 @@ class VoiceOrderViewModel : ViewModel() {
                 currentItems[index] = item.copy(quantity = newQty, itemTotal = newTotal)
             }
             val subtotal = currentItems.sumOf { it.itemTotal }
-            val updated = _orderState.value.copy(
+            val nextState = if (currentItems.isEmpty()) {
+                if (_isListening.value) VoiceStateMachineEnum.LISTENING else VoiceStateMachineEnum.IDLE
+            } else {
+                VoiceStateMachineEnum.ORDER_BUILDING
+            }
+            val updated = current.copy(
+                state = nextState,
                 items = currentItems,
                 subtotal = subtotal,
                 tax = 0.0,
                 total = subtotal,
                 statusMessage = "Updated cart items"
             )
-            _orderState.value = updated
-            restartInactivityTimer(updated)
+            latestState = updated
+            updated
         }
+        latestState?.let(::restartInactivityTimer)
     }
 
     /**
@@ -236,20 +357,21 @@ class VoiceOrderViewModel : ViewModel() {
     fun resetOrder(reasonMsg: String = "Order cleared. Ready for next order.") {
         autoResetJob?.cancel()
         orderEngine.resetSession()
-        val emptyState = VoiceOrderState(
-            sessionId = UUID.randomUUID().toString(),
-            restaurantId = "FILTR Coffee",
-            counterId = "Counter POS 1",
-            deviceId = android.os.Build.MODEL,
-            state = VoiceStateMachineEnum.IDLE,
-            items = emptyList(),
-            subtotal = 0.0,
-            tax = 0.0,
-            total = 0.0,
-            lastTranscript = "",
-            statusMessage = reasonMsg
-        )
-        _orderState.value = emptyState
+        _orderState.update {
+            VoiceOrderState(
+                sessionId = UUID.randomUUID().toString(),
+                restaurantId = "FILTR Coffee",
+                counterId = "Counter POS 1",
+                deviceId = Build.MODEL,
+                state = if (_isListening.value) VoiceStateMachineEnum.LISTENING else VoiceStateMachineEnum.IDLE,
+                items = emptyList(),
+                subtotal = 0.0,
+                tax = 0.0,
+                total = 0.0,
+                lastTranscript = "",
+                statusMessage = reasonMsg
+            )
+        }
         _currentTranscript.value = ""
         _showConfirmDialog.value = false
     }
@@ -262,6 +384,16 @@ class VoiceOrderViewModel : ViewModel() {
 
     fun dismissConfirmDialog() {
         _showConfirmDialog.value = false
+        _orderState.update { current ->
+            if (current.state == VoiceStateMachineEnum.CONFIRMED && current.items.isNotEmpty()) {
+                current.copy(
+                    state = VoiceStateMachineEnum.ORDER_BUILDING,
+                    statusMessage = "Continue editing voice order"
+                )
+            } else {
+                current
+            }
+        }
     }
 
     /**
@@ -269,8 +401,9 @@ class VoiceOrderViewModel : ViewModel() {
      * and clears the voice ticket ready for the next customer.
      */
     fun confirmAndTransferToBilling(onTransfer: (List<VoiceOrderLineItem>, String?) -> Unit) {
-        val itemsToTransfer = _orderState.value.items.toList()
-        val notesToTransfer = _orderState.value.orderNotes
+        val current = _orderState.value
+        val itemsToTransfer = current.items.toList()
+        val notesToTransfer = current.orderNotes
         _showConfirmDialog.value = false
         if (itemsToTransfer.isNotEmpty()) {
             onTransfer(itemsToTransfer, notesToTransfer)
@@ -278,26 +411,52 @@ class VoiceOrderViewModel : ViewModel() {
         }
     }
 
-    private fun restartInactivityTimer(state: VoiceOrderState) {
+    private fun restartInactivityTimer(@Suppress("UNUSED_PARAMETER") state: VoiceOrderState) {
         // In FILTR billing, orders with punched items must NEVER be auto-deleted by silence.
         // Explicit [ RESET ] button is used by the cashier to clear the order to zero.
         autoResetJob?.cancel()
     }
 
+    private fun clearServiceCallbacks(service: AudioCaptureService?) {
+        service?.audioLevelCallback = null
+        service?.speechStateCallback = null
+        service?.transcriptCallback = null
+        service?.statusCallback = null
+    }
+
     fun unbindService(context: Context) {
-        if (isBound) {
-            try {
-                context.unbindService(serviceConnection)
-            } catch (e: Exception) {
-                // Ignore
+        val appCtx = boundAppContext ?: context.applicationContext
+        val service = captureService
+        clearServiceCallbacks(service)
+        service?.stopCaptureAndService()
+
+        if (isBound || isBindingInProgress) {
+            runCatching {
+                appCtx.unbindService(serviceConnection)
             }
-            isBound = false
         }
+        runCatching {
+            appCtx.stopService(Intent(appCtx, AudioCaptureService::class.java))
+        }
+
+        captureService = null
+        boundAppContext = null
+        isBound = false
+        isBindingInProgress = false
+        _isSpeechActive.value = false
+        _audioLevel.value = 0.0
     }
 
     override fun onCleared() {
-        MenuCatalog.onMenuUpdated = null
         autoResetJob?.cancel()
+        val service = captureService
+        clearServiceCallbacks(service)
+        boundAppContext?.let { appCtx ->
+            unbindService(appCtx)
+        } ?: run {
+            service?.stopCaptureAndService()
+            captureService = null
+        }
         super.onCleared()
     }
 }
