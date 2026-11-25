@@ -6,21 +6,25 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -53,6 +57,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -62,6 +67,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private fun orderBelongsToCustomer(orderWithItems: OrderWithItems, customer: CustomerEntity): Boolean {
+    val custPhone = customer.contactNumber.filter { it.isDigit() }
+    val orderPhone = orderWithItems.order.contactNumber.filter { it.isDigit() }
+    if (custPhone.length >= 6 && orderPhone == custPhone) return true
+    val custName = customer.name.trim()
+    return custName.isNotBlank() && orderWithItems.order.customerName.trim().equals(custName, ignoreCase = true)
+}
+
 @Composable
 fun CustomersScreen(
     customers: List<CustomerEntity>,
@@ -70,13 +83,20 @@ fun CustomersScreen(
     onUpdateCustomer: (CustomerEntity) -> Unit,
     onDeleteCustomer: (CustomerEntity) -> Unit,
     onMarkOrderPaid: (OrderWithItems, String) -> Unit,
+    onSettleAllOrders: (customerName: String, pendingOrders: List<OrderWithItems>, paymentMode: String) -> Unit = { _, pending, mode ->
+        pending.forEach { onMarkOrderPaid(it, mode) }
+    },
     modifier: Modifier = Modifier
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var showAddDialog by remember { mutableStateOf(false) }
     var editingCustomer by remember { mutableStateOf<CustomerEntity?>(null) }
     var deletingCustomer by remember { mutableStateOf<CustomerEntity?>(null) }
-    var selectedCustomer by remember { mutableStateOf<CustomerEntity?>(null) }
+    var selectedCustomerId by remember { mutableStateOf<Int?>(null) }
+
+    val selectedCustomer = remember(customers, selectedCustomerId) {
+        selectedCustomerId?.let { id -> customers.find { it.id == id } }
+    }
 
     val filteredCustomers = remember(customers, searchQuery) {
         if (searchQuery.isBlank()) customers
@@ -88,16 +108,18 @@ fun CustomersScreen(
 
     // Show detail view if a customer is selected
     if (selectedCustomer != null) {
-        val customer = selectedCustomer!!
-        val customerOrders = remember(ordersList, customer.name) {
-            ordersList.filter { it.order.customerName.equals(customer.name, ignoreCase = true) }
+        val customerOrders = remember(ordersList, selectedCustomer) {
+            ordersList.filter { orderBelongsToCustomer(it, selectedCustomer) }
                 .sortedByDescending { it.order.timestamp }
         }
         CustomerDetailView(
-            customer = customer,
+            customer = selectedCustomer,
             customerOrders = customerOrders,
-            onBack = { selectedCustomer = null },
+            onBack = { selectedCustomerId = null },
             onMarkOrderPaid = onMarkOrderPaid,
+            onSettleAllOrders = { pending, mode ->
+                onSettleAllOrders(selectedCustomer.name, pending, mode)
+            },
             modifier = modifier
         )
         return
@@ -205,15 +227,15 @@ fun CustomersScreen(
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(filteredCustomers, key = { it.id }) { customer ->
-                    val pendingAmount = remember(ordersList, customer.name) {
+                    val pendingAmount = remember(ordersList, customer) {
                         ordersList
-                            .filter { it.order.customerName.equals(customer.name, ignoreCase = true) && !it.order.isPaid }
+                            .filter { orderBelongsToCustomer(it, customer) && !it.order.isPaid }
                             .sumOf { it.order.totalAmount }
                     }
                     CustomerCard(
                         customer = customer,
                         pendingAmount = pendingAmount,
-                        onClick = { selectedCustomer = customer },
+                        onClick = { selectedCustomerId = customer.id },
                         onEdit = { editingCustomer = customer },
                         onDelete = { deletingCustomer = customer }
                     )
@@ -316,7 +338,7 @@ private fun CustomerDetailView(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
-                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White, modifier = Modifier.size(20.dp))
+                        Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White, modifier = Modifier.size(20.dp))
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     Column(modifier = Modifier.weight(1f)) {
@@ -344,7 +366,11 @@ private fun CustomerDetailView(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                     Surface(color = Color.White.copy(alpha = 0.12f), shape = RoundedCornerShape(6.dp), modifier = Modifier.weight(1f)) {
                         Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(text = "TOTAL", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Color.White.copy(alpha = 0.5f), letterSpacing = 0.5.sp)
@@ -381,7 +407,11 @@ private fun CustomerDetailView(
             }
         } else {
             var orderFilter by remember { mutableStateOf("ALL") }
-            Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 listOf("ALL" to "All (${customerOrders.size})", "UNPAID" to "⏳ Unpaid ($unpaidCount)", "PAID" to "✅ Paid ($paidCount)").forEach { (key, label) ->
                     Surface(
                         color = if (orderFilter == key) Color(0xFF09090B) else Color.White,
@@ -473,13 +503,13 @@ private fun CustomerDetailView(
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
-                            onClick = { unpaidOrders.forEach { onMarkOrderPaid(it, "CASH") }; showSettleAllDialog = false },
+                            onClick = { onSettleAllOrders(unpaidOrders, "CASH"); showSettleAllDialog = false },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A)),
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier.weight(1f).height(44.dp)
                         ) { Text("💵 Cash", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 14.sp) }
                         Button(
-                            onClick = { unpaidOrders.forEach { onMarkOrderPaid(it, "UPI") }; showSettleAllDialog = false },
+                            onClick = { onSettleAllOrders(unpaidOrders, "UPI"); showSettleAllDialog = false },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier.weight(1f).height(44.dp)
@@ -498,9 +528,13 @@ private fun CustomerDetailView(
 @Composable
 private fun CustomerOrderCard(orderWithItems: OrderWithItems, onPaymentAction: () -> Unit) {
     val order = orderWithItems.order
-    val dateFormatted = SimpleDateFormat("dd MMM, yyyy  •  hh:mm a", Locale.getDefault()).format(Date(order.timestamp))
-    val itemsSummary = orderWithItems.items.take(3).joinToString(", ") { "${it.itemName} ×${it.quantity}" }
-    val remainingItems = orderWithItems.items.size - 3
+    val dateFormatted = remember(order.timestamp) {
+        SimpleDateFormat("dd MMM, yyyy  •  hh:mm a", Locale.getDefault()).format(Date(order.timestamp))
+    }
+    val (itemsSummary, remainingItems) = remember(orderWithItems.items) {
+        orderWithItems.items.take(3).joinToString(", ") { "${it.itemName} ×${it.quantity}" } to
+            (orderWithItems.items.size - 3)
+    }
 
     Card(
         shape = RoundedCornerShape(14.dp),
@@ -547,9 +581,12 @@ private fun CustomerOrderCard(orderWithItems: OrderWithItems, onPaymentAction: (
 
 // ==================== CUSTOMER CARD ====================
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CustomerCard(customer: CustomerEntity, pendingAmount: Double, onClick: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
-    val dateFormatted = if (customer.lastOrderTimestamp > 0) SimpleDateFormat("dd MMM", Locale.getDefault()).format(Date(customer.lastOrderTimestamp)) else "No orders"
+    val dateFormatted = remember(customer.lastOrderTimestamp) {
+        if (customer.lastOrderTimestamp > 0) SimpleDateFormat("dd MMM", Locale.getDefault()).format(Date(customer.lastOrderTimestamp)) else "No orders"
+    }
 
     Card(
         shape = RoundedCornerShape(16.dp),
@@ -581,7 +618,11 @@ private fun CustomerCard(customer: CustomerEntity, pendingAmount: Double, onClic
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 Surface(color = Color(0xFFF4F4F5), shape = RoundedCornerShape(8.dp)) { Text(text = "📋 ${customer.totalOrders}", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF52525B), modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) }
                 Surface(color = Color(0xFFF4F4F5), shape = RoundedCornerShape(8.dp)) { Text(text = "₹${String.format(Locale.US, "%.0f", customer.totalSpent)}", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF52525B), modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) }
                 if (pendingAmount > 0) {
@@ -608,10 +649,10 @@ private fun AddEditCustomerDialog(existingCustomer: CustomerEntity?, onDismiss: 
         icon = { Icon(imageVector = if (existingCustomer == null) Icons.Default.Add else Icons.Default.Edit, contentDescription = null, tint = Color(0xFF09090B), modifier = Modifier.size(28.dp)) },
         title = { Text(text = if (existingCustomer == null) "Add Customer" else "Edit Customer", fontWeight = FontWeight.Bold, fontSize = 18.sp) },
         text = {
-            Column {
+            Column(modifier = Modifier.imePadding()) {
                 OutlinedTextField(value = name, onValueChange = { name = it; nameError = null }, label = { Text("Customer Name *") }, leadingIcon = { Icon(imageVector = Icons.Default.Person, contentDescription = null) }, singleLine = true, isError = nameError != null, supportingText = nameError?.let { { Text(it, color = Color(0xFFDC2626)) } }, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().testTag("dialog_customer_name_input"))
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(value = contact, onValueChange = { contact = it }, label = { Text("Contact Number (Optional)") }, leadingIcon = { Icon(imageVector = Icons.Default.Phone, contentDescription = null) }, singleLine = true, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().testTag("dialog_customer_contact_input"))
+                OutlinedTextField(value = contact, onValueChange = { contact = it }, label = { Text("Contact Number (Optional)") }, leadingIcon = { Icon(imageVector = Icons.Default.Phone, contentDescription = null) }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), singleLine = true, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().testTag("dialog_customer_contact_input"))
             }
         },
         confirmButton = {

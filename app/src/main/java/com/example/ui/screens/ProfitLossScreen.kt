@@ -11,6 +11,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -34,11 +36,13 @@ import com.example.data.entity.OrderWithItems
 import com.example.data.entity.StaffMember
 import com.example.data.entity.calculatePacksAndCost
 import com.example.ui.BillingUiState
+import kotlinx.coroutines.delay
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 // Theme Colors
 private val DarkCardBg = Color(0xFF18181B)
@@ -84,12 +88,30 @@ fun ProfitLossScreen(
     var customStartMs by remember { mutableStateOf<Long?>(null) }
     var customEndMs by remember { mutableStateOf<Long?>(null) }
 
+    // Midnight boundary ticker so date-based views update automatically across midnight
+    var dayBoundaryTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val nowCal = Calendar.getInstance()
+            val nextMidnight = Calendar.getInstance().apply {
+                add(Calendar.DAY_OF_YEAR, 1)
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 1)
+                set(Calendar.MILLISECOND, 0)
+            }
+            val delayMs = (nextMidnight.timeInMillis - nowCal.timeInMillis).coerceAtLeast(1_000L)
+            delay(delayMs)
+            dayBoundaryTick++
+        }
+    }
+
     // Active Month navigation (defaults to current month, e.g. "2026-09")
-    val currentMonthKey = remember { SimpleDateFormat("yyyy-MM", Locale.US).format(Date()) }
+    val currentMonthKey = remember(dayBoundaryTick) { SimpleDateFormat("yyyy-MM", Locale.US).format(Date()) }
     var selectedMonthKey by remember { mutableStateOf(currentMonthKey) }
 
     // Cloud Backfill for selected date filter / month / custom range
-    LaunchedEffect(dateFilter, selectedMonthKey, customStartMs, customEndMs) {
+    LaunchedEffect(dateFilter, selectedMonthKey, customStartMs, customEndMs, dayBoundaryTick) {
         val nowMs = System.currentTimeMillis()
         when (dateFilter) {
             "TODAY" -> {
@@ -119,7 +141,7 @@ fun ProfitLossScreen(
             }
             "LAST_7_DAYS" -> {
                 val weekAgo = Calendar.getInstance().apply {
-                    add(Calendar.DAY_OF_YEAR, -7)
+                    add(Calendar.DAY_OF_YEAR, -6)
                     set(Calendar.HOUR_OF_DAY, 0)
                     set(Calendar.MINUTE, 0)
                     set(Calendar.SECOND, 0)
@@ -167,7 +189,8 @@ fun ProfitLossScreen(
         ordersList,
         fixedCosts,
         customStartMs,
-        customEndMs
+        customEndMs,
+        dayBoundaryTick
     ) {
         computePeriodProration(
             dateFilter = dateFilter,
@@ -195,10 +218,10 @@ fun ProfitLossScreen(
 
         filteredOrders.forEach { orderWithItems ->
             orderWithItems.items.forEach { orderItem ->
-                // Match recipe by menuItemId OR by itemName
+                // Match recipe by menuItemId (> 0) OR by exact itemName
                 val recipeUsages = usages.filter {
-                    it.menuItemId == orderItem.menuItemId ||
-                    it.menuItemName.equals(orderItem.itemName, ignoreCase = true)
+                    (orderItem.menuItemId > 0 && it.menuItemId == orderItem.menuItemId) ||
+                    it.menuItemName.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
                 }
 
                 if (recipeUsages.isNotEmpty()) {
@@ -214,11 +237,9 @@ fun ProfitLossScreen(
                         }
                     }
                 } else {
-                    // Fallback to matching direct inventory item
+                    // Fallback to exact matching direct inventory item
                     val directItem = inventoryItems.find {
-                        it.name.equals(orderItem.itemName, ignoreCase = true) ||
-                        orderItem.itemName.contains(it.name, ignoreCase = true) ||
-                        it.name.contains(orderItem.itemName, ignoreCase = true)
+                        it.name.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
                     }
                     if (directItem != null) {
                         val consumed = orderItem.quantity.toDouble()
@@ -345,7 +366,7 @@ fun ProfitLossScreen(
                         "CUSTOM" to "Custom Range"
                     )
 
-                    items(filterOptions) { (key, label) ->
+                    items(filterOptions, key = { it.first }) { (key, label) ->
                         val isSelected = dateFilter == key
                         FilterChip(
                             selected = isSelected,
@@ -401,7 +422,7 @@ fun ProfitLossScreen(
                                     modifier = Modifier.size(36.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ArrowBack,
+                                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                                         contentDescription = "Previous Month",
                                         tint = StatusAmber
                                     )
@@ -426,7 +447,7 @@ fun ProfitLossScreen(
                                     modifier = Modifier.size(36.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ArrowForward,
+                                        imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                                         contentDescription = "Next Month",
                                         tint = StatusAmber
                                     )
@@ -824,10 +845,25 @@ fun ProfitLossScreen(
 
                     HorizontalDivider(color = DarkCardBorder)
 
+                    val overheadDim = when (dateFilter) {
+                        "MONTH" -> getDaysInMonthKey(selectedMonthKey)
+                        "YESTERDAY" -> {
+                            val yKey = SimpleDateFormat("yyyy-MM", Locale.US).format(
+                                Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }.time
+                            )
+                            getDaysInMonthKey(yKey)
+                        }
+                        else -> {
+                            val parsedKey = proratedBreakdown.monthKeyDescription.take(7)
+                            if (parsedKey.matches(Regex("\\d{4}-\\d{2}"))) getDaysInMonthKey(parsedKey)
+                            else getDaysInMonthKey(currentMonthKey)
+                        }
+                    }.toDouble()
+
                     OverheadItemRow(
                         icon = Icons.Default.Storefront,
                         name = "Shop Rent",
-                        monthlyAmount = (proratedBreakdown.rent / proratedBreakdown.daysCount) * 30.0,
+                        monthlyAmount = (proratedBreakdown.rent / proratedBreakdown.daysCount) * overheadDim,
                         proratedAmount = proratedBreakdown.rent,
                         dailyRate = proratedBreakdown.rent / proratedBreakdown.daysCount
                     )
@@ -835,7 +871,7 @@ fun ProfitLossScreen(
                     OverheadItemRow(
                         icon = Icons.Default.ElectricBolt,
                         name = "Electricity Bill",
-                        monthlyAmount = (proratedBreakdown.electricity / proratedBreakdown.daysCount) * 30.0,
+                        monthlyAmount = (proratedBreakdown.electricity / proratedBreakdown.daysCount) * overheadDim,
                         proratedAmount = proratedBreakdown.electricity,
                         dailyRate = proratedBreakdown.electricity / proratedBreakdown.daysCount
                     )
@@ -843,7 +879,7 @@ fun ProfitLossScreen(
                     OverheadItemRow(
                         icon = Icons.Default.People,
                         name = "Staff Salaries (${proratedBreakdown.staffCount} staff)",
-                        monthlyAmount = (proratedBreakdown.staffSalaries / proratedBreakdown.daysCount) * 30.0,
+                        monthlyAmount = (proratedBreakdown.staffSalaries / proratedBreakdown.daysCount) * overheadDim,
                         proratedAmount = proratedBreakdown.staffSalaries,
                         dailyRate = proratedBreakdown.staffSalaries / proratedBreakdown.daysCount,
                         subDetail = if (proratedBreakdown.staffMembers.isNotEmpty()) {
@@ -854,7 +890,7 @@ fun ProfitLossScreen(
                     OverheadItemRow(
                         icon = Icons.Default.CleaningServices,
                         name = "Maid / Daily Cleaning",
-                        monthlyAmount = (proratedBreakdown.maidSalary / proratedBreakdown.daysCount) * 30.0,
+                        monthlyAmount = (proratedBreakdown.maidSalary / proratedBreakdown.daysCount) * overheadDim,
                         proratedAmount = proratedBreakdown.maidSalary,
                         dailyRate = proratedBreakdown.maidSalary / proratedBreakdown.daysCount
                     )
@@ -862,7 +898,7 @@ fun ProfitLossScreen(
                     OverheadItemRow(
                         icon = Icons.Default.Build,
                         name = "Misc & Maintenance",
-                        monthlyAmount = (proratedBreakdown.miscellaneous / proratedBreakdown.daysCount) * 30.0,
+                        monthlyAmount = (proratedBreakdown.miscellaneous / proratedBreakdown.daysCount) * overheadDim,
                         proratedAmount = proratedBreakdown.miscellaneous,
                         dailyRate = proratedBreakdown.miscellaneous / proratedBreakdown.daysCount
                     )
@@ -1072,11 +1108,11 @@ fun ProfitLossScreen(
         CustomDateRangePickerDialog(
             onDismiss = { showCustomDateDialog = false },
             onDateRangeApplied = { startMs, endMs ->
+                val clampedEnd = if (endMs < startMs) startMs else endMs
                 customStartMs = startMs
-                customEndMs = endMs
+                customEndMs = clampedEnd
                 dateFilter = "CUSTOM"
                 showCustomDateDialog = false
-                onBackfillOrders(startMs, endMs)
             }
         )
     }
@@ -1169,7 +1205,7 @@ private fun computePeriodProration(
 
         "LAST_7_DAYS" -> {
             val weekAgoCal = Calendar.getInstance().apply {
-                add(Calendar.DAY_OF_YEAR, -7)
+                add(Calendar.DAY_OF_YEAR, -6)
                 set(Calendar.HOUR_OF_DAY, 0)
                 set(Calendar.MINUTE, 0)
                 set(Calendar.SECOND, 0)
@@ -1381,7 +1417,7 @@ private fun computePeriodProration(
                         daysCount = 1,
                         isConfiguredInDb = false,
                         monthKeyDescription = todayMonthKey,
-                        dailyBurden = mCost.dailyCost(30),
+                        dailyBurden = mCost.dailyCost(getDaysInMonthKey(todayMonthKey)),
                         staffMembers = mCost.parseStaffMembers()
                     ),
                     orders
@@ -1404,7 +1440,7 @@ private fun computePeriodProration(
                     daysCount = 1,
                     isConfiguredInDb = false,
                     monthKeyDescription = todayMonthKey,
-                    dailyBurden = mCost.dailyCost(30),
+                    dailyBurden = mCost.dailyCost(getDaysInMonthKey(todayMonthKey)),
                     staffMembers = mCost.parseStaffMembers()
                 ),
                 ordersList
@@ -1805,6 +1841,20 @@ private fun OverheadItemRow(
 
 // ==================== SET FIXED COSTS DIALOG ====================
 
+private data class EditableStaffRow(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val salaryStr: String
+)
+
+private fun formatEditableAmount(value: Double): String {
+    return when {
+        value <= 0.0 -> ""
+        value % 1.0 == 0.0 -> value.toLong().toString()
+        else -> value.toString()
+    }
+}
+
 @Composable
 fun SetFixedCostsDialog(
     targetMonthKey: String,
@@ -1812,53 +1862,57 @@ fun SetFixedCostsDialog(
     onDismiss: () -> Unit,
     onSave: (FixedCostEntity) -> Unit
 ) {
-    var activeMonthKey by remember { mutableStateOf(targetMonthKey) }
+    var activeMonthKey by remember(targetMonthKey) { mutableStateOf(targetMonthKey) }
 
     // When activeMonthKey changes, reload entity
     val resolvedEntity = remember(activeMonthKey, allConfiguredCosts) {
         getFixedCostForMonthKey(activeMonthKey, allConfiguredCosts)
     }
 
-    var rentStr by remember(resolvedEntity) { mutableStateOf(formatDecimal(resolvedEntity.rent)) }
-    var electricityStr by remember(resolvedEntity) { mutableStateOf(formatDecimal(resolvedEntity.electricity)) }
-    var maidSalaryStr by remember(resolvedEntity) { mutableStateOf(formatDecimal(resolvedEntity.maidSalary)) }
-    var miscStr by remember(resolvedEntity) { mutableStateOf(formatDecimal(resolvedEntity.miscellaneous)) }
-    var notes by remember(resolvedEntity) { mutableStateOf(resolvedEntity.notes) }
+    var rentStr by remember(activeMonthKey) { mutableStateOf(formatEditableAmount(resolvedEntity.rent)) }
+    var electricityStr by remember(activeMonthKey) { mutableStateOf(formatEditableAmount(resolvedEntity.electricity)) }
+    var maidSalaryStr by remember(activeMonthKey) { mutableStateOf(formatEditableAmount(resolvedEntity.maidSalary)) }
+    var miscStr by remember(activeMonthKey) { mutableStateOf(formatEditableAmount(resolvedEntity.miscellaneous)) }
+    var notes by remember(activeMonthKey) { mutableStateOf(resolvedEntity.notes) }
 
-    // Individual staff members state (name and salary for each person)
-    var staffList by remember(resolvedEntity) {
-        mutableStateOf(resolvedEntity.parseStaffMembers())
+    // Individual staff members state (editable text avoids ".0" backspace trap)
+    var staffRows by remember(activeMonthKey) {
+        mutableStateOf(
+            resolvedEntity.parseStaffMembers().map {
+                EditableStaffRow(name = it.name, salaryStr = formatEditableAmount(it.salary))
+            }
+        )
     }
 
-    fun updateStaffMember(index: Int, name: String, salary: Double) {
-        val updated = staffList.toMutableList()
+    fun updateStaffRow(index: Int, name: String, salaryStr: String) {
+        val updated = staffRows.toMutableList()
         if (index in updated.indices) {
-            updated[index] = updated[index].copy(name = name, salary = salary)
-            staffList = updated
+            updated[index] = updated[index].copy(name = name, salaryStr = salaryStr)
+            staffRows = updated
         }
     }
 
     fun addStaffMember() {
-        staffList = staffList + StaffMember(
-            name = "Staff ${staffList.size + 1}",
-            salary = 15000.0
+        staffRows = staffRows + EditableStaffRow(
+            name = "Staff ${staffRows.size + 1}",
+            salaryStr = "15000"
         )
     }
 
     fun removeStaffMember(index: Int) {
-        if (staffList.size > 1 && index in staffList.indices) {
-            val updated = staffList.toMutableList()
+        if (staffRows.size > 1 && index in staffRows.indices) {
+            val updated = staffRows.toMutableList()
             updated.removeAt(index)
-            staffList = updated
+            staffRows = updated
         }
     }
 
-    val rent = rentStr.toDoubleOrNull() ?: 0.0
-    val electricity = electricityStr.toDoubleOrNull() ?: 0.0
-    val staffSalaries = staffList.sumOf { it.salary }
-    val staffCount = staffList.size
-    val maidSalary = maidSalaryStr.toDoubleOrNull() ?: 0.0
-    val misc = miscStr.toDoubleOrNull() ?: 0.0
+    val rent = (rentStr.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+    val electricity = (electricityStr.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+    val staffSalaries = staffRows.sumOf { (it.salaryStr.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0) }
+    val staffCount = staffRows.size
+    val maidSalary = (maidSalaryStr.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+    val misc = (miscStr.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
 
     val totalMonthly = rent + electricity + staffSalaries + maidSalary + misc
     val daysInThisMonth = getDaysInMonthKey(activeMonthKey)
@@ -1927,7 +1981,7 @@ fun SetFixedCostsDialog(
                                     onClick = { activeMonthKey = getPreviousMonthKey(activeMonthKey) },
                                     modifier = Modifier.size(32.dp)
                                 ) {
-                                    Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Prev", tint = StatusAmber)
+                                    Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Prev", tint = StatusAmber)
                                 }
 
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1957,7 +2011,7 @@ fun SetFixedCostsDialog(
                                     onClick = { activeMonthKey = getNextMonthKey(activeMonthKey) },
                                     modifier = Modifier.size(32.dp)
                                 ) {
-                                    Icon(imageVector = Icons.Default.ArrowForward, contentDescription = "Next", tint = StatusAmber)
+                                    Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next", tint = StatusAmber)
                                 }
                             }
                         }
@@ -2097,7 +2151,7 @@ fun SetFixedCostsDialog(
                                     border = BorderStroke(1.dp, StatusAmber.copy(alpha = 0.3f))
                                 ) {
                                     Text(
-                                        text = "${staffList.size} Staff • ${formatInr(staffSalaries)}/mo",
+                                        text = "${staffRows.size} Staff • ${formatInr(staffSalaries)}/mo",
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = StatusAmber,
@@ -2109,7 +2163,8 @@ fun SetFixedCostsDialog(
                             HorizontalDivider(color = DarkCardBorder)
 
                             // List of individual staff members
-                            staffList.forEachIndexed { index, member ->
+                            staffRows.forEachIndexed { index, member ->
+                                key(member.id) {
                                 Surface(
                                     color = DarkCardBg,
                                     shape = RoundedCornerShape(8.dp),
@@ -2154,7 +2209,7 @@ fun SetFixedCostsDialog(
                                                 )
                                             }
 
-                                            if (staffList.size > 1) {
+                                            if (staffRows.size > 1) {
                                                 IconButton(
                                                     onClick = { removeStaffMember(index) },
                                                     modifier = Modifier.size(24.dp)
@@ -2176,7 +2231,7 @@ fun SetFixedCostsDialog(
                                             OutlinedTextField(
                                                 value = member.name,
                                                 onValueChange = { newName ->
-                                                    updateStaffMember(index, newName, member.salary)
+                                                    updateStaffRow(index, newName, member.salaryStr)
                                                 },
                                                 label = { Text("Staff Name", fontSize = 11.sp) },
                                                 placeholder = { Text("e.g. Ramesh", fontSize = 11.sp) },
@@ -2185,16 +2240,20 @@ fun SetFixedCostsDialog(
                                                     focusedBorderColor = StatusAmber,
                                                     unfocusedBorderColor = DarkCardBorder,
                                                     focusedTextColor = Color.White,
-                                                    unfocusedTextColor = Color.White
+                                                    unfocusedTextColor = Color.White,
+                                                    focusedLabelColor = StatusAmber,
+                                                    unfocusedLabelColor = MutedTextColor,
+                                                    focusedPlaceholderColor = MutedTextColor,
+                                                    unfocusedPlaceholderColor = MutedTextColor,
+                                                    cursorColor = StatusAmber
                                                 ),
                                                 modifier = Modifier.weight(0.55f)
                                             )
 
                                             OutlinedTextField(
-                                                value = if (member.salary > 0) formatDecimal(member.salary) else "",
+                                                value = member.salaryStr,
                                                 onValueChange = { newSalaryStr ->
-                                                    val newSalary = newSalaryStr.toDoubleOrNull() ?: 0.0
-                                                    updateStaffMember(index, member.name, newSalary)
+                                                    updateStaffRow(index, member.name, newSalaryStr)
                                                 },
                                                 label = { Text("Salary (₹/mo)", fontSize = 11.sp) },
                                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -2203,12 +2262,16 @@ fun SetFixedCostsDialog(
                                                     focusedBorderColor = StatusAmber,
                                                     unfocusedBorderColor = DarkCardBorder,
                                                     focusedTextColor = Color.White,
-                                                    unfocusedTextColor = Color.White
+                                                    unfocusedTextColor = Color.White,
+                                                    focusedLabelColor = StatusAmber,
+                                                    unfocusedLabelColor = MutedTextColor,
+                                                    cursorColor = StatusAmber
                                                 ),
                                                 modifier = Modifier.weight(0.45f)
                                             )
                                         }
                                     }
+                                }
                                 }
                             }
 
@@ -2244,7 +2307,10 @@ fun SetFixedCostsDialog(
                             focusedBorderColor = StatusAmber,
                             unfocusedBorderColor = DarkCardBorder,
                             focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedTextColor = Color.White,
+                            focusedLabelColor = StatusAmber,
+                            unfocusedLabelColor = MutedTextColor,
+                            cursorColor = StatusAmber
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -2264,7 +2330,10 @@ fun SetFixedCostsDialog(
                             focusedBorderColor = StatusAmber,
                             unfocusedBorderColor = DarkCardBorder,
                             focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedTextColor = Color.White,
+                            focusedLabelColor = StatusAmber,
+                            unfocusedLabelColor = MutedTextColor,
+                            cursorColor = StatusAmber
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -2281,7 +2350,10 @@ fun SetFixedCostsDialog(
                             focusedBorderColor = StatusAmber,
                             unfocusedBorderColor = DarkCardBorder,
                             focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedTextColor = Color.White,
+                            focusedLabelColor = StatusAmber,
+                            unfocusedLabelColor = MutedTextColor,
+                            cursorColor = StatusAmber
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -2298,7 +2370,10 @@ fun SetFixedCostsDialog(
                             focusedBorderColor = StatusAmber,
                             unfocusedBorderColor = DarkCardBorder,
                             focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedTextColor = Color.White,
+                            focusedLabelColor = StatusAmber,
+                            unfocusedLabelColor = MutedTextColor,
+                            cursorColor = StatusAmber
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -2314,7 +2389,12 @@ fun SetFixedCostsDialog(
                             focusedBorderColor = StatusAmber,
                             unfocusedBorderColor = DarkCardBorder,
                             focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedTextColor = Color.White,
+                            focusedLabelColor = StatusAmber,
+                            unfocusedLabelColor = MutedTextColor,
+                            focusedPlaceholderColor = MutedTextColor,
+                            unfocusedPlaceholderColor = MutedTextColor,
+                            cursorColor = StatusAmber
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -2332,9 +2412,9 @@ fun SetFixedCostsDialog(
                                 electricityStr = "6000"
                                 maidSalaryStr = "2000"
                                 miscStr = "5000"
-                                staffList = listOf(
-                                    StaffMember(name = "Barista 1", salary = 15000.0),
-                                    StaffMember(name = "Barista 2", salary = 15000.0)
+                                staffRows = listOf(
+                                    EditableStaffRow(name = "Barista 1", salaryStr = "15000"),
+                                    EditableStaffRow(name = "Barista 2", salaryStr = "15000")
                                 )
                             },
                             shape = RoundedCornerShape(10.dp),
@@ -2347,17 +2427,23 @@ fun SetFixedCostsDialog(
                         Button(
                             onClick = {
                                 if (activeMonthKey.isNotBlank()) {
-                                    val totalSalaries = staffList.sumOf { it.salary }
+                                    val mappedStaff = staffRows.map {
+                                        StaffMember(
+                                            name = it.name.trim().ifBlank { "Staff" },
+                                            salary = (it.salaryStr.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+                                        )
+                                    }
+                                    val totalSalaries = mappedStaff.sumOf { it.salary }
                                     val entity = FixedCostEntity(
                                         monthKey = activeMonthKey,
                                         rent = rent,
                                         electricity = electricity,
-                                        staffCount = staffList.size,
+                                        staffCount = mappedStaff.size,
                                         staffSalaries = totalSalaries,
                                         maidSalary = maidSalary,
                                         miscellaneous = misc,
                                         notes = notes,
-                                        staffMembersJson = FixedCostEntity.staffListToJson(staffList),
+                                        staffMembersJson = FixedCostEntity.staffListToJson(mappedStaff),
                                         updatedAt = System.currentTimeMillis()
                                     )
                                     onSave(entity)
@@ -2531,7 +2617,7 @@ fun getFixedCostForMonthKey(
 }
 
 private fun formatInr(value: Double): String {
-    val format = NumberFormat.getCurrencyInstance(Locale("en", "IN"))
+    val format = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
     format.maximumFractionDigits = 0
     return format.format(value)
 }

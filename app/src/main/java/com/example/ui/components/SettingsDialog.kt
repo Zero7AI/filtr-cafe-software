@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -74,7 +75,7 @@ fun SettingsDialog(
     onSaveWebhookUrl: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var webhookUrlText by remember { mutableStateOf(currentWebhookUrl) }
+    var webhookUrlText by remember(currentWebhookUrl) { mutableStateOf(currentWebhookUrl) }
     val context = LocalContext.current
 
     AlertDialog(
@@ -100,6 +101,7 @@ fun SettingsDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
+                    .imePadding()
                     .testTag("settings_dialog")
             ) {
                 // Cloud Database Status Card

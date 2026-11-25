@@ -18,7 +18,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -120,7 +120,9 @@ fun AppUpdateDialog(
         },
         text = {
             Column(
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
             ) {
                 if (isForceUpdate && status is AppUpdateStatus.Available) {
                     Surface(
@@ -159,7 +161,7 @@ fun AppUpdateDialog(
                                 Text("v${BuildConfig.VERSION_NAME}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                             }
                             Icon(
-                                imageVector = Icons.Default.ArrowForward,
+                                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                                 contentDescription = null,
                                 tint = AmberAccentSecondary,
                                 modifier = Modifier.size(18.dp)

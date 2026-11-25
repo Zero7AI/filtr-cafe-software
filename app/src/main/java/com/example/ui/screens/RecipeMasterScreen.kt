@@ -6,8 +6,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -169,7 +171,7 @@ fun RecipeMasterScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            items(categories) { cat ->
+            items(categories, key = { it }) { cat ->
                 val isSelected = selectedCategory == cat
                 FilterChip(
                     selected = isSelected,
@@ -194,7 +196,7 @@ fun RecipeMasterScreen(
             modifier = Modifier.fillMaxSize()
         ) {
             groupedItems.forEach { (category, items) ->
-                item {
+                item(key = "header_$category") {
                     Text(
                         text = category.uppercase(),
                         color = AmberAccent,
@@ -206,20 +208,28 @@ fun RecipeMasterScreen(
                 }
 
                 items(items, key = { it.name.trim().lowercase() }) { menuItem ->
-                    val itemUsages = usages.filter {
-                        it.menuItemId == menuItem.id || it.menuItemName.equals(menuItem.name, ignoreCase = true)
-                    }.distinctBy { it.inventoryItemId }
+                    val (itemUsages, ingredientCosts, totalCogs) = remember(
+                        menuItem.id,
+                        menuItem.name,
+                        usages,
+                        inventoryItems
+                    ) {
+                        val matched = usages.filter {
+                            (menuItem.id != 0 && it.menuItemId == menuItem.id) ||
+                                it.menuItemName.equals(menuItem.name, ignoreCase = true)
+                        }.distinctBy { it.inventoryItemId }
 
-                    // Compute live COGS for this menuItem
-                    var totalCogs = 0.0
-                    val ingredientCosts = itemUsages.map { usage ->
-                        val invItem = inventoryItems.find { it.id == usage.inventoryItemId }
-                        val cost = if (invItem != null) {
-                            val (_, c) = calculatePacksAndCost(usage.quantityUsed, usage.unit, invItem)
-                            c
-                        } else 0.0
-                        totalCogs += cost
-                        Pair(usage, cost)
+                        var cogsAcc = 0.0
+                        val costs = matched.map { usage ->
+                            val invItem = inventoryItems.find { it.id == usage.inventoryItemId }
+                            val cost = if (invItem != null) {
+                                val (_, c) = calculatePacksAndCost(usage.quantityUsed, usage.unit, invItem)
+                                c
+                            } else 0.0
+                            cogsAcc += cost
+                            Pair(usage, cost)
+                        }
+                        Triple(matched, costs, cogsAcc)
                     }
 
                     val profitMargin = menuItem.price - totalCogs
@@ -506,9 +516,14 @@ private fun AddEditUsageDialog(
             border = BorderStroke(1.dp, SurfaceVariantColor),
             modifier = Modifier
                 .fillMaxWidth(0.9f)
+                .imePadding()
                 .padding(16.dp)
         ) {
-            Column(modifier = Modifier.padding(20.dp)) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
                 Text(
                     text = if (initialUsage != null) "Edit Recipe Component" else "Add Recipe Component",
                     color = Color.White,
@@ -544,7 +559,7 @@ private fun AddEditUsageDialog(
                             unfocusedBorderColor = SurfaceVariantColor
                         ),
                         modifier = Modifier
-                            .menuAnchor()
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = true)
                             .fillMaxWidth()
                     )
 

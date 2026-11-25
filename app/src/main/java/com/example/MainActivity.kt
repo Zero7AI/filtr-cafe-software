@@ -32,8 +32,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Analytics
@@ -96,6 +94,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.ui.FiltrTab
 import com.example.ui.MainViewModel
+import com.example.ui.STAFF_ALLOWED_TABS
 import com.example.ui.components.AccountsUpiDialog
 import com.example.ui.components.ActiveDevicesDialog
 import com.example.ui.components.AddEditMenuItemDialog
@@ -109,6 +108,7 @@ import com.example.ui.components.ReceiptStoryDialog
 import com.example.ui.components.SettingsDialog
 import com.example.ui.components.VoiceOrderMicButton
 import com.example.ui.components.VoiceOrderReviewDialog
+import com.example.ui.screens.AddStockDialog
 import com.example.ui.screens.BillingScreen
 import com.example.ui.screens.ChecklistScreen
 import com.example.ui.screens.CustomersScreen
@@ -156,12 +156,6 @@ class MainActivity : ComponentActivity() {
             FiltrTheme {
                 val context = LocalContext.current
                 val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-                val menuItems by viewModel.filteredMenuItems.collectAsStateWithLifecycle()
-                val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
-                val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
-                val upiAccounts by viewModel.upiAccounts.collectAsStateWithLifecycle()
-                val inventoryItems by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                val inventoryUsages by viewModel.inventoryUsages.collectAsStateWithLifecycle()
 
                 // Thermal Printer state
                 val isPrinterConnected by printerService.isConnected.collectAsStateWithLifecycle()
@@ -170,35 +164,32 @@ class MainActivity : ComponentActivity() {
                 val availablePrinters by printerService.availablePrinters.collectAsStateWithLifecycle()
                 var showPrinterDialog by remember { mutableStateOf(false) }
 
-                // Check and request notification permission on Android 13+ (API 33+)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    val permissionLauncher = rememberLauncherForActivityResult(
-                        contract = ActivityResultContracts.RequestPermission()
-                    ) { _ -> }
-                    LaunchedEffect(Unit) {
-                        val permission = Manifest.permission.POST_NOTIFICATIONS
-                        if (ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED) {
-                            permissionLauncher.launch(permission)
+                // Request required runtime permissions together only after device activation
+                val permissionsLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestMultiplePermissions()
+                ) { _ -> }
+                LaunchedEffect(uiState.deviceAccessStatus) {
+                    if (uiState.deviceAccessStatus == "ACTIVE") {
+                        val neededPermissions = buildList {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                add(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                add(Manifest.permission.RECORD_AUDIO)
+                            }
+                        }
+                        if (neededPermissions.isNotEmpty()) {
+                            permissionsLauncher.launch(neededPermissions.toTypedArray())
                         }
                     }
                 }
 
-                // Check and request microphone permission for offline voice ordering
-                val micPermissionLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.RequestPermission()
-                ) { _ -> }
-                LaunchedEffect(Unit) {
-                    val permission = Manifest.permission.RECORD_AUDIO
-                    if (ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED) {
-                        micPermissionLauncher.launch(permission)
-                    }
-                }
-
-                // Check low stock and dispatch debounced notification
-                LaunchedEffect(inventoryItems, inventoryUsages) {
-                    if (inventoryItems.isNotEmpty()) {
-                        InventoryNotificationHelper.checkAndNotifyLowStock(context, inventoryItems, inventoryUsages)
-                    }
+                // Isolated low-stock notification observer (avoids root recomposition on inventory changes)
+                if (uiState.deviceAccessStatus == "ACTIVE") {
+                    LowStockNotificationEffect(viewModel = viewModel)
                 }
 
                 val isStaffMode = uiState.currentRole == "STAFF"
@@ -206,6 +197,12 @@ class MainActivity : ComponentActivity() {
                 val snackbarHostState = remember { SnackbarHostState() }
                 val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
                 val scope = rememberCoroutineScope()
+
+                LaunchedEffect(isStaffMode, uiState.currentTab) {
+                    if (isStaffMode && uiState.currentTab !in STAFF_ALLOWED_TABS) {
+                        viewModel.selectTab(FiltrTab.BILLING)
+                    }
+                }
 
                 LaunchedEffect(uiState.snackbarMessage) {
                     uiState.snackbarMessage?.let { message ->
@@ -216,21 +213,13 @@ class MainActivity : ComponentActivity() {
 
                 ModalNavigationDrawer(
                     drawerState = drawerState,
-                    gesturesEnabled = true,
+                    gesturesEnabled = uiState.deviceAccessStatus == "ACTIVE" && !uiState.isForceUpdate,
                     drawerContent = {
                         if (isStaffMode) {
                             ModalDrawerSheet(
                                 drawerContainerColor = Color(0xFF09090B),
                                 drawerContentColor = Color.White,
-                                modifier = Modifier
-                                    .width(300.dp)
-                                    .pointerInput(Unit) {
-                                        detectHorizontalDragGestures { change, dragAmount ->
-                                            if (dragAmount < -20f) {
-                                                scope.launch { drawerState.close() }
-                                            }
-                                        }
-                                    }
+                                modifier = Modifier.width(300.dp)
                             ) {
                                 Column(
                                     modifier = Modifier
@@ -378,15 +367,7 @@ class MainActivity : ComponentActivity() {
                             ModalDrawerSheet(
                                 drawerContainerColor = Color(0xFF09090B),
                                 drawerContentColor = Color.White,
-                                modifier = Modifier
-                                    .width(300.dp)
-                                    .pointerInput(Unit) {
-                                        detectHorizontalDragGestures { change, dragAmount ->
-                                            if (dragAmount < -20f) {
-                                                scope.launch { drawerState.close() }
-                                            }
-                                        }
-                                    }
+                                modifier = Modifier.width(300.dp)
                             ) {
                                 Column(
                                     modifier = Modifier
@@ -886,6 +867,8 @@ class MainActivity : ComponentActivity() {
                         ) {
                             when (uiState.currentTab) {
                                 FiltrTab.BILLING -> {
+                                    val menuItems by viewModel.filteredMenuItems.collectAsStateWithLifecycle()
+                                    val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
                                     BillingScreen(
                                         state = uiState,
                                         menuItems = menuItems,
@@ -904,16 +887,21 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                                 FiltrTab.VOICE_ORDER -> {
-                                    val voiceViewModel: VoiceOrderViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
-                                    VoiceOrderScreen(
-                                        viewModel = voiceViewModel,
-                                        availableMenuItems = allMenuItems,
-                                        onTransferToBilling = { voiceItems, notes ->
-                                            viewModel.transferVoiceOrderToCart(voiceItems, notes)
-                                        }
-                                    )
+                                    if (!isStaffMode) {
+                                        val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
+                                        val voiceViewModel: VoiceOrderViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+                                        VoiceOrderScreen(
+                                            viewModel = voiceViewModel,
+                                            availableMenuItems = allMenuItems,
+                                            onTransferToBilling = { voiceItems, notes ->
+                                                viewModel.transferVoiceOrderToCart(voiceItems, notes)
+                                            }
+                                        )
+                                    }
                                 }
                                 FiltrTab.ORDERS -> {
+                                    val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
+                                    val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
                                     OrdersScreen(
                                         state = uiState,
                                         ordersList = ordersList,
@@ -943,167 +931,205 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                                 FiltrTab.MENU -> {
-                                    MenuMasterScreen(
-                                        state = uiState,
-                                        menuItems = menuItems,
-                                        allMenuItems = allMenuItems,
-                                        onCategorySelected = { viewModel.setSelectedCategory(it) },
-                                        onSearchQueryChanged = { viewModel.setSearchQuery(it) },
-                                        onOpenAddEditDialog = { viewModel.openAddEditItemDialog(it) },
-                                        onToggleAvailability = { viewModel.saveMenuItem(it.name, it.category, it.price, it.description, !it.isAvailable) },
-                                        onDeleteItem = { viewModel.requestDeleteMenuItem(it) },
-                                        onMoveItemUp = { item, list -> viewModel.moveMenuItemUp(item, list) },
-                                        onMoveItemDown = { item, list -> viewModel.moveMenuItemDown(item, list) },
-                                        onSetItemPosition = { item, pos, list -> viewModel.moveMenuItem(item, pos, list) },
-                                        onOpenAddCategoryDialog = { viewModel.openAddCategoryDialog() },
-                                        onRestoreDefaultMenu = { viewModel.restoreDefaultMenu() },
-                                        onSyncItemMasterToSheets = { viewModel.syncItemMasterToSheets() }
-                                    )
+                                    if (!isStaffMode) {
+                                        val menuItems by viewModel.filteredMenuItems.collectAsStateWithLifecycle()
+                                        val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
+                                        MenuMasterScreen(
+                                            state = uiState,
+                                            menuItems = menuItems,
+                                            allMenuItems = allMenuItems,
+                                            onCategorySelected = { viewModel.setSelectedCategory(it) },
+                                            onSearchQueryChanged = { viewModel.setSearchQuery(it) },
+                                            onOpenAddEditDialog = { viewModel.openAddEditItemDialog(it) },
+                                            onToggleAvailability = { viewModel.saveMenuItem(it.name, it.category, it.price, it.description, !it.isAvailable) },
+                                            onDeleteItem = { viewModel.requestDeleteMenuItem(it) },
+                                            onMoveItemUp = { item, list -> viewModel.moveMenuItemUp(item, list) },
+                                            onMoveItemDown = { item, list -> viewModel.moveMenuItemDown(item, list) },
+                                            onSetItemPosition = { item, pos, list -> viewModel.moveMenuItem(item, pos, list) },
+                                            onOpenAddCategoryDialog = { viewModel.openAddCategoryDialog() },
+                                            onRestoreDefaultMenu = { viewModel.restoreDefaultMenu() },
+                                            onSyncItemMasterToSheets = { viewModel.syncItemMasterToSheets() }
+                                        )
+                                    }
                                 }
                                 FiltrTab.DASHBOARD -> {
-                                    DashboardScreen(
-                                        state = uiState,
-                                        ordersList = ordersList,
-                                        onDateFilterSelected = { viewModel.setDashboardDateFilter(it) },
-                                        onOpenCalendarClick = { viewModel.openCustomDatePicker() },
-                                        onDateRangeSelected = { startMs, endMs -> viewModel.setCustomDateRange(startMs, endMs) },
-                                        onDismissCalendarDialog = { viewModel.dismissCustomDatePicker() }
-                                    )
+                                    if (!isStaffMode) {
+                                        val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
+                                        DashboardScreen(
+                                            state = uiState,
+                                            ordersList = ordersList,
+                                            onDateFilterSelected = { viewModel.setDashboardDateFilter(it) },
+                                            onOpenCalendarClick = { viewModel.openCustomDatePicker() },
+                                            onDateRangeSelected = { startMs, endMs -> viewModel.setCustomDateRange(startMs, endMs) },
+                                            onDismissCalendarDialog = { viewModel.dismissCustomDatePicker() }
+                                        )
+                                    }
                                 }
                                 FiltrTab.INVENTORY_ORDER -> {
-                                    val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
-                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                    InventoryOrderScreen(
-                                        state = uiState,
-                                        inventoryOrders = inventoryOrdersList,
-                                        inventoryItems = inventoryItemsList,
-                                        onOpenAddOrder = { viewModel.openAddInventoryOrderDialog() },
-                                        onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
-                                        onDeleteOrder = { viewModel.requestDeleteInventoryOrder(it) },
-                                        onConfirmDeleteOrder = { viewModel.confirmDeleteInventoryOrder(it) },
-                                        onDismissDeleteOrder = { viewModel.dismissDeleteInventoryOrder() },
-                                        onSaveOrder = { supplier, notes, items -> viewModel.saveInventoryOrder(supplier, notes, items) },
-                                        onDismissAddOrder = { viewModel.dismissAddInventoryOrderDialog() },
-                                        onSaveInventoryItem = { name, cat, unit, price, stdQty -> viewModel.saveInventoryItem(name, cat, unit, price, stdQty) },
-                                        onEditInventoryItem = { viewModel.openAddInventoryItemDialog(it) },
-                                        onDeleteInventoryItem = { viewModel.deleteInventoryItem(it) },
-                                        onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
-                                        onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
-                                        onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) }
-                                    )
+                                    if (!isStaffMode) {
+                                        val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
+                                        val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                        InventoryOrderScreen(
+                                            state = uiState,
+                                            inventoryOrders = inventoryOrdersList,
+                                            inventoryItems = inventoryItemsList,
+                                            onOpenAddOrder = { viewModel.openAddInventoryOrderDialog() },
+                                            onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
+                                            onDeleteOrder = { viewModel.requestDeleteInventoryOrder(it) },
+                                            onConfirmDeleteOrder = { viewModel.confirmDeleteInventoryOrder(it) },
+                                            onDismissDeleteOrder = { viewModel.dismissDeleteInventoryOrder() },
+                                            onSaveOrder = { supplier, notes, items -> viewModel.saveInventoryOrder(supplier, notes, items) },
+                                            onDismissAddOrder = { viewModel.dismissAddInventoryOrderDialog() },
+                                            onSaveInventoryItem = { name, cat, unit, price, stdQty -> viewModel.saveInventoryItem(name, cat, unit, price, stdQty) },
+                                            onEditInventoryItem = { viewModel.openAddInventoryItemDialog(it) },
+                                            onDeleteInventoryItem = { viewModel.deleteInventoryItem(it) },
+                                            onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
+                                            onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
+                                            onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) },
+                                            onUpdateInventoryItem = { viewModel.updateInventoryItem(it) }
+                                        )
+                                    }
                                 }
                                 FiltrTab.INVENTORIES -> {
-                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                    val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
-                                    val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
-                                    InventoriesScreen(
-                                        state = uiState,
-                                        inventoryItems = inventoryItemsList,
-                                        usages = usagesList,
-                                        ordersList = ordersList,
-                                        inventoryOrders = inventoryOrdersList,
-                                        onUpdateStock = { id, stock -> viewModel.updateStockLevel(id, stock) },
-                                        onStartEditingStock = { viewModel.startEditingStock(it) },
-                                        onCancelEditingStock = { viewModel.cancelEditingStock() },
-                                        onOpenAddStockDialog = { viewModel.openAddStockDialog(it) },
-                                        onDismissAddStockDialog = { viewModel.dismissAddStockDialog() },
-                                        onAddStockPacks = { id, packs -> viewModel.addStockPacks(id, packs) },
-                                        onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
-                                        onSaveInventoryItem = { name, cat, unit, price, stdQty -> viewModel.saveInventoryItem(name, cat, unit, price, stdQty) },
-                                        onEditInventoryItem = { viewModel.openAddInventoryItemDialog(it) },
-                                        onDeleteInventoryItem = { viewModel.deleteInventoryItem(it) },
-                                        onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
-                                        onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
-                                        onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) }
-                                    )
+                                    if (!isStaffMode) {
+                                        val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
+                                        val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                        val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
+                                        val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
+                                        InventoriesScreen(
+                                            state = uiState,
+                                            inventoryItems = inventoryItemsList,
+                                            usages = usagesList,
+                                            ordersList = ordersList,
+                                            inventoryOrders = inventoryOrdersList,
+                                            onUpdateStock = { id, stock -> viewModel.updateStockLevel(id, stock) },
+                                            onStartEditingStock = { viewModel.startEditingStock(it) },
+                                            onCancelEditingStock = { viewModel.cancelEditingStock() },
+                                            onOpenAddStockDialog = { viewModel.openAddStockDialog(it) },
+                                            onDismissAddStockDialog = { viewModel.dismissAddStockDialog() },
+                                            onAddStockPacks = { id, packs -> viewModel.addStockPacks(id, packs) },
+                                            onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
+                                            onSaveInventoryItem = { name, cat, unit, price, stdQty -> viewModel.saveInventoryItem(name, cat, unit, price, stdQty) },
+                                            onEditInventoryItem = { viewModel.openAddInventoryItemDialog(it) },
+                                            onDeleteInventoryItem = { viewModel.deleteInventoryItem(it) },
+                                            onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
+                                            onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
+                                            onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) }
+                                        )
+                                    }
                                 }
                                 FiltrTab.INVENTORY_USAGE -> {
-                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                    val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
-                                    InventoryUsageScreen(
-                                        state = uiState,
-                                        inventoryItems = inventoryItemsList,
-                                        usages = usagesList,
-                                        ordersList = ordersList,
-                                        onOpenAddStockDialog = { viewModel.openAddStockDialog(it) }
-                                    )
+                                    if (!isStaffMode) {
+                                        val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
+                                        val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                        val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
+                                        InventoryUsageScreen(
+                                            state = uiState,
+                                            inventoryItems = inventoryItemsList,
+                                            usages = usagesList,
+                                            ordersList = ordersList,
+                                            onOpenAddStockDialog = { viewModel.openAddStockDialog(it) }
+                                        )
+                                        if (uiState.showAddStockDialog) {
+                                            uiState.addStockItem?.let { item ->
+                                                AddStockDialog(
+                                                    item = item,
+                                                    onDismiss = { viewModel.dismissAddStockDialog() },
+                                                    onAddStock = { qty -> viewModel.addStockPacks(item.id, qty) }
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                                 FiltrTab.RECIPE_MASTER -> {
-                                    val menuItemsList by viewModel.menuItems.collectAsStateWithLifecycle()
-                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                    val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
-                                    RecipeMasterScreen(
-                                        state = uiState,
-                                        menuItems = menuItemsList,
-                                        inventoryItems = inventoryItemsList,
-                                        usages = usagesList,
-                                        onOpenUsageDialog = { id, name -> viewModel.openUsagePerSkuDialog(id, name) },
-                                        onDismissUsageDialog = { viewModel.dismissUsagePerSkuDialog() },
-                                        onSaveUsage = { menuId, menuName, invId, invName, qty, unit ->
-                                            viewModel.saveUsage(menuId, menuName, invId, invName, qty, unit)
-                                        },
-                                        onDeleteUsage = { viewModel.deleteUsage(it) }
-                                    )
+                                    if (!isStaffMode) {
+                                        val menuItemsList by viewModel.menuItems.collectAsStateWithLifecycle()
+                                        val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                        val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
+                                        RecipeMasterScreen(
+                                            state = uiState,
+                                            menuItems = menuItemsList,
+                                            inventoryItems = inventoryItemsList,
+                                            usages = usagesList,
+                                            onOpenUsageDialog = { id, name -> viewModel.openUsagePerSkuDialog(id, name) },
+                                            onDismissUsageDialog = { viewModel.dismissUsagePerSkuDialog() },
+                                            onSaveUsage = { menuId, menuName, invId, invName, qty, unit ->
+                                                viewModel.saveUsage(menuId, menuName, invId, invName, qty, unit)
+                                            },
+                                            onDeleteUsage = { viewModel.deleteUsage(it) }
+                                        )
+                                    }
                                 }
                                 FiltrTab.CUSTOMERS -> {
-                                    val customersList by viewModel.customers.collectAsStateWithLifecycle()
-                                    CustomersScreen(
-                                        customers = customersList,
-                                        ordersList = ordersList,
-                                        onAddCustomer = { name, contact -> viewModel.addCustomer(name, contact) },
-                                        onUpdateCustomer = { viewModel.updateExistingCustomer(it) },
-                                        onDeleteCustomer = { viewModel.deleteCustomer(it) },
-                                        onMarkOrderPaid = { order, mode -> viewModel.setOrderPaymentMode(order, mode) }
-                                    )
+                                    if (!isStaffMode) {
+                                        val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
+                                        val customersList by viewModel.customers.collectAsStateWithLifecycle()
+                                        CustomersScreen(
+                                            customers = customersList,
+                                            ordersList = ordersList,
+                                            onAddCustomer = { name, contact -> viewModel.addCustomer(name, contact) },
+                                            onUpdateCustomer = { viewModel.updateExistingCustomer(it) },
+                                            onDeleteCustomer = { viewModel.deleteCustomer(it) },
+                                            onMarkOrderPaid = { order, mode -> viewModel.setOrderPaymentMode(order, mode) },
+                                            onSettleAllOrders = { custName, pending, mode ->
+                                                viewModel.settleAllCustomerOrders(custName, pending, mode)
+                                            }
+                                        )
+                                    }
                                 }
                                 FiltrTab.RECEIPT_DESIGN -> {
-                                    ReceiptDesignScreen(
-                                        state = uiState,
-                                        onBack = { viewModel.selectTab(FiltrTab.BILLING) },
-                                        onUpdateText = { tagline, subtitle, f1, f2, f3, isStoryEnabled ->
-                                            viewModel.updateReceiptDesignText(tagline, subtitle, f1, f2, f3, isStoryEnabled)
-                                        },
-                                        onSelectPhoto = { fileName ->
-                                            viewModel.selectStoryPhoto(fileName)
-                                        },
-                                        onSavePhotoMetadata = { fileName, title, date, caption ->
-                                            viewModel.updateStoryPhotoMetadata(fileName, title, date, caption)
-                                        },
-                                        onUploadPhoto = { bytes, title, date, caption ->
-                                            viewModel.uploadStoryPhoto(bytes, title, date, caption)
-                                        },
-                                        onDeletePhoto = { fileName ->
-                                            viewModel.deleteStoryPhotoByName(fileName)
-                                        },
-                                        onRefreshPhotos = {
-                                            viewModel.loadStoryPhotos()
-                                        },
-                                        onGenerateNote = { title, date, onResult ->
-                                            scope.launch {
-                                                val note = viewModel.generateStoryNoteAsync(title, date)
-                                                onResult(note)
+                                    if (!isStaffMode) {
+                                        ReceiptDesignScreen(
+                                            state = uiState,
+                                            onBack = { viewModel.selectTab(FiltrTab.BILLING) },
+                                            onUpdateText = { tagline, subtitle, f1, f2, f3, isStoryEnabled ->
+                                                viewModel.updateReceiptDesignText(tagline, subtitle, f1, f2, f3, isStoryEnabled)
+                                            },
+                                            onSelectPhoto = { fileName ->
+                                                viewModel.selectStoryPhoto(fileName)
+                                            },
+                                            onSavePhotoMetadata = { fileName, title, date, caption ->
+                                                viewModel.updateStoryPhotoMetadata(fileName, title, date, caption)
+                                            },
+                                            onUploadPhoto = { bytes, title, date, caption ->
+                                                viewModel.uploadStoryPhoto(bytes, title, date, caption)
+                                            },
+                                            onDeletePhoto = { fileName ->
+                                                viewModel.deleteStoryPhotoByName(fileName)
+                                            },
+                                            onRefreshPhotos = {
+                                                viewModel.loadStoryPhotos()
+                                            },
+                                            onGenerateNote = { title, date, onResult ->
+                                                scope.launch {
+                                                    val note = viewModel.generateStoryNoteAsync(title, date)
+                                                    onResult(note)
+                                                }
+                                            },
+                                            getPhotoUrl = { fileName ->
+                                                viewModel.getStoryPhotoUrl(fileName)
                                             }
-                                        },
-                                        getPhotoUrl = { fileName ->
-                                            viewModel.getStoryPhotoUrl(fileName)
-                                        }
-                                    )
+                                        )
+                                    }
                                 }
                                 FiltrTab.PROFIT_LOSS -> {
-                                    val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                    val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
-                                    val fixedCostsList by viewModel.fixedCosts.collectAsStateWithLifecycle()
-                                    ProfitLossScreen(
-                                        state = uiState,
-                                        ordersList = ordersList,
-                                        inventoryItems = inventoryItemsList,
-                                        usages = usagesList,
-                                        fixedCosts = fixedCostsList,
-                                        onOpenFixedCostDialog = { viewModel.openFixedCostDialog(it) },
-                                        onDismissFixedCostDialog = { viewModel.dismissFixedCostDialog() },
-                                        onSaveFixedCost = { viewModel.saveFixedCost(it) },
-                                        onBackfillOrders = { startMs, endMs -> viewModel.backfillOrdersForDateRange(startMs, endMs) }
-                                    )
+                                    if (!isStaffMode) {
+                                        val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
+                                        val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                        val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
+                                        val fixedCostsList by viewModel.fixedCosts.collectAsStateWithLifecycle()
+                                        ProfitLossScreen(
+                                            state = uiState,
+                                            ordersList = ordersList,
+                                            inventoryItems = inventoryItemsList,
+                                            usages = usagesList,
+                                            fixedCosts = fixedCostsList,
+                                            onOpenFixedCostDialog = { viewModel.openFixedCostDialog(it) },
+                                            onDismissFixedCostDialog = { viewModel.dismissFixedCostDialog() },
+                                            onSaveFixedCost = { viewModel.saveFixedCost(it) },
+                                            onBackfillOrders = { startMs, endMs -> viewModel.backfillOrdersForDateRange(startMs, endMs) }
+                                        )
+                                    }
                                 }
                                 FiltrTab.CHECKLIST -> {
                                     val checklistSections by viewModel.checklistSections.collectAsStateWithLifecycle()
@@ -1126,20 +1152,26 @@ class MainActivity : ComponentActivity() {
                                     ManualInventoryScreen(
                                         state = uiState,
                                         inventoryItems = inventoryItemsList,
-                                        onSaveClosingInventory = { stockMap, staffNotes ->
-                                            viewModel.saveClosingInventoryAudit(stockMap, staffNotes)
+                                        onSaveClosingInventory = { stockMap, staffNotes, onComplete ->
+                                            viewModel.saveClosingInventoryAudit(stockMap, staffNotes, onComplete)
                                         },
-                                        onAddNewInventoryItem = { name, category, unit, price, packSize ->
-                                            viewModel.saveInventoryItem(name, category, unit, price, packSize)
+                                        onAddNewInventoryItem = { name, category, unit, price, packSize, initialStock ->
+                                            viewModel.saveInventoryItem(name, category, unit, price, packSize, initialStock)
                                         },
-                                        onUpdateInventoryItem = { item ->
-                                            viewModel.updateInventoryItem(item)
+                                        onUpdateInventoryItem = { item, newCount ->
+                                            viewModel.updateInventoryItemWithStock(item, newCount)
+                                        },
+                                        onDraftCountChanged = { itemId, newCount ->
+                                            viewModel.updateManualInventoryDraftCount(itemId, newCount)
+                                        },
+                                        onDraftNotesChanged = { notes ->
+                                            viewModel.updateManualInventoryDraftNotes(notes)
                                         }
                                     )
                                 }
                             }
 
-                            // Prominent AI Voice Order Mic Button at Bottom Right (Only on Billing screen to avoid obstructing management screens)
+                            // Prominent AI Voice Order Mic Button at Bottom Right (positioned above sticky cart bar when cart is active)
                             if (uiState.currentTab == FiltrTab.BILLING) {
                                 VoiceOrderMicButton(
                                     isListening = uiState.isListeningVoice,
@@ -1150,12 +1182,15 @@ class MainActivity : ComponentActivity() {
                                     onCancel = { viewModel.cancelVoiceListening() },
                                     modifier = Modifier
                                         .align(Alignment.BottomEnd)
-                                        .padding(end = 16.dp, bottom = 16.dp)
+                                        .padding(
+                                            end = 16.dp,
+                                            bottom = if (uiState.cartItems.isNotEmpty()) 148.dp else 16.dp
+                                        )
                                 )
                             }
 
-                            // Confirmation Dialogs
-                            uiState.itemToDeleteConfirmation?.let { item ->
+                            // Admin Confirmation Dialogs
+                            uiState.itemToDeleteConfirmation?.takeIf { !isStaffMode }?.let { item ->
                                 AlertDialog(
                                     onDismissRequest = { viewModel.dismissDeleteDialogs() },
                                     title = { Text("Delete From Item Master?", fontWeight = FontWeight.Bold) },
@@ -1173,7 +1208,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            uiState.itemDeleteWarningMessage?.let { item ->
+                            uiState.itemDeleteWarningMessage?.takeIf { !isStaffMode }?.let { item ->
                                 AlertDialog(
                                     onDismissRequest = { viewModel.dismissDeleteDialogs() },
                                     title = { Text("Cannot Delete Ordered Item") },
@@ -1242,7 +1277,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            if (uiState.showSettingsDialog) {
+                            if (uiState.showSettingsDialog && !isStaffMode) {
                                 SettingsDialog(
                                     currentWebhookUrl = uiState.googleSheetsWebhookUrl,
                                     isFirestoreConnected = uiState.isFirestoreConnected,
@@ -1300,22 +1335,22 @@ class MainActivity : ComponentActivity() {
                                     deviceModel = viewModel.currentDeviceModel,
                                     errorMessage = uiState.accessGateError,
                                     isVerifying = uiState.isVerifyingAccess,
-                                    isStaffApp = isStaffMode,
                                     onVerify = { name, passcode -> viewModel.verifyDeviceAccess(name, passcode) },
                                     onRefreshStatus = { viewModel.refreshDeviceAccessStatus() },
                                     onExitApp = { (context as? android.app.Activity)?.finishAffinity() }
                                 )
                             }
 
-                            if (showAdminUnlockDialog) {
+                            if (showAdminUnlockDialog && isStaffMode) {
                                 AdminUnlockDialog(
                                     onDismiss = { showAdminUnlockDialog = false },
-                                    onUnlock = { passcode ->
-                                        val success = viewModel.elevateToAdmin(passcode)
-                                        if (success) {
-                                            showAdminUnlockDialog = false
+                                    onUnlock = { passcode, onResult ->
+                                        viewModel.elevateToAdmin(passcode) { success, message ->
+                                            if (success) {
+                                                showAdminUnlockDialog = false
+                                            }
+                                            onResult(success, message)
                                         }
-                                        success
                                     }
                                 )
                             }
@@ -1335,7 +1370,8 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            if (uiState.showAccountsUpiDialog) {
+                            if (uiState.showAccountsUpiDialog && !isStaffMode) {
+                                val upiAccounts by viewModel.upiAccounts.collectAsStateWithLifecycle()
                                 AccountsUpiDialog(
                                     upiAccounts = upiAccounts,
                                     onDismiss = { viewModel.closeAccountsUpiDialog() },
@@ -1351,7 +1387,8 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            if (uiState.showAddEditItemDialog) {
+                            if (uiState.showAddEditItemDialog && !isStaffMode) {
+                                val allMenuItems by viewModel.menuItems.collectAsStateWithLifecycle()
                                 val existingCategories = (allMenuItems.map { it.category } + uiState.customCategories).distinct().filter { it.isNotBlank() }
                                 AddEditMenuItemDialog(
                                     itemToEdit = uiState.editingMenuItem,
@@ -1363,7 +1400,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            if (uiState.showAddCategoryDialog) {
+                            if (uiState.showAddCategoryDialog && !isStaffMode) {
                                 com.example.ui.screens.AddCategoryDialog(
                                     onDismiss = { viewModel.dismissAddCategoryDialog() },
                                     onConfirm = { newCategory ->
@@ -1373,6 +1410,7 @@ class MainActivity : ComponentActivity() {
                             }
 
                             uiState.selectedOrderForReceipt?.let { receiptOrder ->
+                                val upiAccounts by viewModel.upiAccounts.collectAsStateWithLifecycle()
                                 OrderReceiptDialog(
                                     orderWithItems = receiptOrder,
                                     upiAccounts = upiAccounts,
@@ -1406,10 +1444,12 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                     onConnectPrinter = { showPrinterDialog = true },
-                                    onCustomizeDesign = {
-                                        viewModel.viewOrderReceipt(null)
-                                        viewModel.selectTab(FiltrTab.RECEIPT_DESIGN)
-                                    },
+                                    onCustomizeDesign = if (!isStaffMode) {
+                                        {
+                                            viewModel.viewOrderReceipt(null)
+                                            viewModel.selectTab(FiltrTab.RECEIPT_DESIGN)
+                                        }
+                                    } else null,
                                     onDismiss = { viewModel.viewOrderReceipt(null) }
                                 )
                             }
@@ -1454,7 +1494,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            if (uiState.showReceiptStoryDialog) {
+                            if (uiState.showReceiptStoryDialog && !isStaffMode) {
                                 // Load photos from Supabase Storage when dialog opens
                                 androidx.compose.runtime.LaunchedEffect(Unit) {
                                     viewModel.loadStoryPhotos()
@@ -1511,5 +1551,18 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         printerService.disconnect()
         printerService.unregister()
+    }
+}
+
+@Composable
+private fun LowStockNotificationEffect(viewModel: MainViewModel) {
+    val context = LocalContext.current
+    val inventoryItems by viewModel.inventoryItems.collectAsStateWithLifecycle()
+    val inventoryUsages by viewModel.inventoryUsages.collectAsStateWithLifecycle()
+
+    LaunchedEffect(inventoryItems, inventoryUsages) {
+        if (inventoryItems.isNotEmpty()) {
+            InventoryNotificationHelper.checkAndNotifyLowStock(context, inventoryItems, inventoryUsages)
+        }
     }
 }

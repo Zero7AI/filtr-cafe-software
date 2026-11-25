@@ -1,6 +1,7 @@
 package com.example.ui.components
 
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -45,9 +47,11 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +63,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -83,28 +90,41 @@ fun ReceiptStoryDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val todayFormatted = remember { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date()) }
 
     var title by remember { mutableStateOf(initialTitle.ifBlank { "Testing of Hazelnut Iced Coffee" }) }
     var date by remember { mutableStateOf(initialDate.ifBlank { todayFormatted }) }
     var caption by remember { mutableStateOf(initialCaption.ifBlank { "Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you." }) }
+    var lastSyncedCaption by remember { mutableStateOf(initialCaption) }
     var imagePath by remember { mutableStateOf(initialImagePath) }
     var enabled by remember { mutableStateOf(isEnabled) }
+
+    LaunchedEffect(initialCaption) {
+        if (initialCaption != lastSyncedCaption && initialCaption.isNotBlank()) {
+            caption = initialCaption
+            lastSyncedCaption = initialCaption
+        }
+    }
 
     // Launcher for uploading to Supabase
     val uploadLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            try {
-                val inputStream = context.contentResolver.openInputStream(uri)
-                val bytes = inputStream?.readBytes()
-                inputStream?.close()
+            scope.launch {
+                val bytes = withContext(Dispatchers.IO) {
+                    try {
+                        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
                 if (bytes != null && bytes.isNotEmpty()) {
                     onUploadPhoto(bytes)
+                } else {
+                    Toast.makeText(context, "Could not read selected image", Toast.LENGTH_SHORT).show()
                 }
-            } catch (e: Exception) {
-                // Ignore
             }
         }
     }
@@ -128,6 +148,7 @@ fun ReceiptStoryDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
+                    .imePadding()
             ) {
                 Text(
                     text = "Manage R&D / testing photos for the Behind The Brew section. A random photo is picked each time you print.",
@@ -252,7 +273,7 @@ fun ReceiptStoryDialog(
                             }
 
                             // Photo thumbnails
-                            items(storyPhotoNames) { fileName ->
+                            items(storyPhotoNames, key = { it }) { fileName ->
                                 Box {
                                     Card(
                                         shape = RoundedCornerShape(8.dp),

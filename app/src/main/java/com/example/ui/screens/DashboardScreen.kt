@@ -41,6 +41,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,65 +73,95 @@ fun DashboardScreen(
 ) {
     val dateFilters = listOf("TODAY", "YESTERDAY", "THIS_WEEK", "THIS_MONTH", "ALL_TIME")
 
-    // Filter orders based on date filter
-    val todayStart = Calendar.getInstance().apply {
-        set(Calendar.HOUR_OF_DAY, 0)
-        set(Calendar.MINUTE, 0)
-        set(Calendar.SECOND, 0)
-        set(Calendar.MILLISECOND, 0)
-    }.timeInMillis
+    // Filter orders based on date filter with midnight rollover awareness
+    var todayStart by remember {
+        mutableStateOf(
+            Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+        )
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val nowMs = System.currentTimeMillis()
+            val nextMidnight = Calendar.getInstance().apply {
+                timeInMillis = nowMs
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+                add(Calendar.DAY_OF_YEAR, 1)
+            }.timeInMillis
+            kotlinx.coroutines.delay((nextMidnight - nowMs).coerceAtLeast(1000L))
+            todayStart = nextMidnight
+        }
+    }
 
-    val filteredOrders = ordersList.filter { orderWithItems ->
-        val orderTime = orderWithItems.order.timestamp
-        val now = Calendar.getInstance()
+    val filteredOrders = remember(
+        ordersList,
+        state.dashboardDateFilter,
+        state.customStartDateMs,
+        state.customEndDateMs,
+        todayStart
+    ) {
+        ordersList.filter { orderWithItems ->
+            val orderTime = orderWithItems.order.timestamp
 
-        when (state.dashboardDateFilter) {
-            "TODAY" -> orderTime >= todayStart
-            "YESTERDAY" -> {
-                val yesterdayStart = Calendar.getInstance().apply {
-                    add(Calendar.DAY_OF_YEAR, -1)
-                    set(Calendar.HOUR_OF_DAY, 0)
-                    set(Calendar.MINUTE, 0)
-                    set(Calendar.SECOND, 0)
-                    set(Calendar.MILLISECOND, 0)
-                }.timeInMillis
-                orderTime >= yesterdayStart && orderTime < todayStart
+            when (state.dashboardDateFilter) {
+                "TODAY" -> orderTime >= todayStart
+                "YESTERDAY" -> {
+                    val yesterdayStart = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -1)
+                    }.timeInMillis
+                    orderTime >= yesterdayStart && orderTime < todayStart
+                }
+                "THIS_WEEK" -> {
+                    val weekStart = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -6)
+                    }.timeInMillis
+                    orderTime >= weekStart
+                }
+                "THIS_MONTH" -> {
+                    val monthStart = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        set(Calendar.DAY_OF_MONTH, 1)
+                    }.timeInMillis
+                    orderTime >= monthStart
+                }
+                "CUSTOM" -> {
+                    val start = state.customStartDateMs ?: 0L
+                    val end = state.customEndDateMs ?: Long.MAX_VALUE
+                    orderTime in start..end
+                }
+                else -> true // ALL_TIME
             }
-            "THIS_WEEK" -> {
-                val weekAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -7) }
-                orderTime >= weekAgo.timeInMillis
-            }
-            "THIS_MONTH" -> {
-                val monthAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -30) }
-                orderTime >= monthAgo.timeInMillis
-            }
-            "CUSTOM" -> {
-                val start = state.customStartDateMs ?: 0L
-                val end = state.customEndDateMs ?: Long.MAX_VALUE
-                orderTime in start..end
-            }
-            else -> true // ALL_TIME
         }
     }
 
     // Key metrics calculations
-    val totalRevenue = filteredOrders.sumOf { it.order.totalAmount }
+    val totalRevenue = remember(filteredOrders) { filteredOrders.sumOf { it.order.totalAmount } }
     val totalOrdersCount = filteredOrders.size
-    val paidOrders = filteredOrders.filter { it.order.isPaid }
-    val paidRevenue = paidOrders.sumOf { it.order.totalAmount }
+    val paidOrders = remember(filteredOrders) { filteredOrders.filter { it.order.isPaid } }
+    val paidRevenue = remember(paidOrders) { paidOrders.sumOf { it.order.totalAmount } }
     val pendingRevenue = totalRevenue - paidRevenue
     val avgOrderValue = if (totalOrdersCount > 0) totalRevenue / totalOrdersCount else 0.0
 
     // Top SKUs calculations
-    val itemSalesMap = mutableMapOf<String, Pair<Int, Double>>() // Name -> (Quantity, Revenue)
-    filteredOrders.forEach { orderWithItems ->
-        orderWithItems.items.forEach { item ->
-            val current = itemSalesMap[item.itemName] ?: Pair(0, 0.0)
-            itemSalesMap[item.itemName] = Pair(current.first + item.quantity, current.second + (item.itemPrice * item.quantity))
+    val topSellingItems = remember(filteredOrders) {
+        val itemSalesMap = mutableMapOf<String, Pair<Int, Double>>() // Name -> (Quantity, Revenue)
+        filteredOrders.forEach { orderWithItems ->
+            orderWithItems.items.forEach { item ->
+                val current = itemSalesMap[item.itemName] ?: Pair(0, 0.0)
+                itemSalesMap[item.itemName] = Pair(current.first + item.quantity, current.second + (item.itemPrice * item.quantity))
+            }
         }
+        itemSalesMap.entries.sortedByDescending { it.value.second } // Sort by revenue
     }
-    val topSellingItems = itemSalesMap.entries
-        .sortedByDescending { it.value.second } // Sort by revenue
 
     Column(
         modifier = modifier
@@ -198,7 +229,7 @@ fun DashboardScreen(
                 )
             }
 
-            items(dateFilters) { filter ->
+            items(dateFilters, key = { it }) { filter ->
                 val isSelected = state.dashboardDateFilter == filter
                 val label = when (filter) {
                     "TODAY" -> "Today"
@@ -643,7 +674,14 @@ fun CustomDateRangePickerDialog(
                     set(year, month, dayOfMonth, 23, 59, 59)
                     set(Calendar.MILLISECOND, 999)
                 }
-                endMsState = newEndCal.timeInMillis
+                val clampedEnd = newEndCal.timeInMillis
+                if (clampedEnd < startMsState) {
+                    startMsState = Calendar.getInstance().apply {
+                        set(year, month, dayOfMonth, 0, 0, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                }
+                endMsState = clampedEnd
             },
             c.get(Calendar.YEAR),
             c.get(Calendar.MONTH),

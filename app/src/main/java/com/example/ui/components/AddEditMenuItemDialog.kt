@@ -5,10 +5,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Edit
@@ -23,6 +26,7 @@ import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -49,11 +53,11 @@ fun AddEditMenuItemDialog(
     onSave: (name: String, category: String, price: Double, description: String, isAvailable: Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var name by remember { mutableStateOf(itemToEdit?.name ?: "") }
-    var category by remember { mutableStateOf(itemToEdit?.category ?: "ICED COFFEE") }
-    var priceStr by remember { mutableStateOf(itemToEdit?.price?.let { if (it % 1 == 0.0) it.toLong().toString() else it.toString() } ?: "") }
-    var description by remember { mutableStateOf(itemToEdit?.description ?: "") }
-    var isAvailable by remember { mutableStateOf(itemToEdit?.isAvailable ?: true) }
+    var name by remember(itemToEdit?.id) { mutableStateOf(itemToEdit?.name ?: "") }
+    var category by remember(itemToEdit?.id) { mutableStateOf(itemToEdit?.category ?: "ICED COFFEE") }
+    var priceStr by remember(itemToEdit?.id) { mutableStateOf(itemToEdit?.price?.let { if (it % 1 == 0.0) it.toLong().toString() else it.toString() } ?: "") }
+    var description by remember(itemToEdit?.id) { mutableStateOf(itemToEdit?.description ?: "") }
+    var isAvailable by remember(itemToEdit?.id) { mutableStateOf(itemToEdit?.isAvailable ?: true) }
 
     var categoryExpanded by remember { mutableStateOf(false) }
 
@@ -82,6 +86,8 @@ fun AddEditMenuItemDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .imePadding()
                     .testTag("add_edit_menu_item_dialog")
             ) {
                 OutlinedTextField(
@@ -115,7 +121,7 @@ fun AddEditMenuItemDialog(
                             ExposedDropdownMenuDefaults.TrailingIcon(expanded = categoryExpanded)
                         },
                         modifier = Modifier
-                            .menuAnchor()
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = true)
                             .fillMaxWidth()
                             .testTag("menu_item_category_input"),
                         shape = RoundedCornerShape(10.dp),

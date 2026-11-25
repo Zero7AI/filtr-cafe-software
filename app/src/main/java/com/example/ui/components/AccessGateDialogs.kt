@@ -11,14 +11,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Block
@@ -47,6 +50,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -80,7 +84,6 @@ fun DeviceAccessGateDialog(
     deviceModel: String,
     errorMessage: String,
     isVerifying: Boolean,
-    isStaffApp: Boolean = false,
     onVerify: (operatorName: String, passcode: String) -> Unit,
     onRefreshStatus: () -> Unit,
     onExitApp: () -> Unit
@@ -142,7 +145,10 @@ fun DeviceAccessGateDialog(
         },
         text = {
             Column(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .imePadding(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Surface(
@@ -266,14 +272,15 @@ fun DeviceAccessGateDialog(
 @Composable
 fun AdminUnlockDialog(
     onDismiss: () -> Unit,
-    onUnlock: (adminPasscode: String) -> Boolean
+    onUnlock: (adminPasscode: String, onResult: (success: Boolean, message: String) -> Unit) -> Unit
 ) {
     var passcode by remember { mutableStateOf("") }
     var showPasscode by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
+    var isChecking by remember { mutableStateOf(false) }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isChecking) onDismiss() },
         icon = {
             Box(
                 modifier = Modifier
@@ -300,7 +307,10 @@ fun AdminUnlockDialog(
         },
         text = {
             Column(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .imePadding(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
@@ -315,6 +325,7 @@ fun AdminUnlockDialog(
                         passcode = it
                         errorMessage = ""
                     },
+                    enabled = !isChecking,
                     label = { Text("Admin Passcode") },
                     leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
                     trailingIcon = {
@@ -344,21 +355,34 @@ fun AdminUnlockDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    if (onUnlock(passcode.trim())) {
-                        onDismiss()
-                    } else {
-                        errorMessage = "Incorrect Admin Passcode"
+                    isChecking = true
+                    errorMessage = ""
+                    onUnlock(passcode.trim()) { success, message ->
+                        isChecking = false
+                        if (success) {
+                            onDismiss()
+                        } else {
+                            errorMessage = message.ifBlank { "Incorrect Admin Passcode" }
+                        }
                     }
                 },
-                enabled = passcode.isNotBlank(),
+                enabled = !isChecking && passcode.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(containerColor = ShadcnBlack, contentColor = ShadcnWhite),
                 shape = RoundedCornerShape(10.dp)
             ) {
-                Text("Unlock Admin", fontWeight = FontWeight.Bold)
+                if (isChecking) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = ShadcnWhite
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                Text(if (isChecking) "Verifying..." else "Unlock Admin", fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, enabled = !isChecking) {
                 Text("Cancel", color = Color.Gray)
             }
         },
@@ -379,10 +403,20 @@ fun ActiveDevicesDialog(
     onDismiss: () -> Unit
 ) {
     var showPolicyEditor by remember { mutableStateOf(false) }
-    var adminCode by remember(accessPolicy) { mutableStateOf(accessPolicy.adminPasscode) }
-    var staffCode by remember(accessPolicy) { mutableStateOf(accessPolicy.staffPasscode) }
-    var requireApproval by remember(accessPolicy) { mutableStateOf(accessPolicy.requireOwnerApprovalForAdmin) }
+    var adminCode by remember { mutableStateOf(accessPolicy.adminPasscode) }
+    var staffCode by remember { mutableStateOf(accessPolicy.staffPasscode) }
+    var requireApproval by remember { mutableStateOf(accessPolicy.requireOwnerApprovalForAdmin) }
     var forceReverify by remember { mutableStateOf(false) }
+    var showAdminCode by remember { mutableStateOf(false) }
+    var showStaffCode by remember { mutableStateOf(false) }
+
+    LaunchedEffect(accessPolicy, showPolicyEditor) {
+        if (!showPolicyEditor) {
+            adminCode = accessPolicy.adminPasscode
+            staffCode = accessPolicy.staffPasscode
+            requireApproval = accessPolicy.requireOwnerApprovalForAdmin
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -430,47 +464,75 @@ fun ActiveDevicesDialog(
                 }
 
                 if (showPolicyEditor) {
-                    OutlinedTextField(
-                        value = adminCode,
-                        onValueChange = { adminCode = it },
-                        label = { Text("Admin Passcode") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = staffCode,
-                        onValueChange = { staffCode = it },
-                        label = { Text("Staff Store Passcode") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .imePadding(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text("Require Owner approval for new Admin phones", fontSize = 12.sp, modifier = Modifier.weight(1f))
-                        Switch(checked = requireApproval, onCheckedChange = { requireApproval = it })
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Force all devices to re-enter new passcode", fontSize = 12.sp, modifier = Modifier.weight(1f))
-                        Switch(checked = forceReverify, onCheckedChange = { forceReverify = it })
-                    }
-                    Button(
-                        onClick = {
-                            onSavePolicy(adminCode.trim(), staffCode.trim(), requireApproval, forceReverify)
-                            showPolicyEditor = false
-                        },
-                        enabled = adminCode.isNotBlank() && staffCode.isNotBlank(),
-                        colors = ButtonDefaults.buttonColors(containerColor = ShadcnBlack, contentColor = ShadcnWhite),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Save Access Policy", fontWeight = FontWeight.Bold)
+                        OutlinedTextField(
+                            value = adminCode,
+                            onValueChange = { adminCode = it },
+                            label = { Text("Admin Passcode") },
+                            trailingIcon = {
+                                IconButton(onClick = { showAdminCode = !showAdminCode }) {
+                                    Icon(
+                                        imageVector = if (showAdminCode) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = "Toggle admin passcode visibility"
+                                    )
+                                }
+                            },
+                            visualTransformation = if (showAdminCode) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        OutlinedTextField(
+                            value = staffCode,
+                            onValueChange = { staffCode = it },
+                            label = { Text("Staff Store Passcode") },
+                            trailingIcon = {
+                                IconButton(onClick = { showStaffCode = !showStaffCode }) {
+                                    Icon(
+                                        imageVector = if (showStaffCode) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = "Toggle staff passcode visibility"
+                                    )
+                                }
+                            },
+                            visualTransformation = if (showStaffCode) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Require Owner approval for new Admin phones", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                            Switch(checked = requireApproval, onCheckedChange = { requireApproval = it })
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Force all devices to re-enter new passcode", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                            Switch(checked = forceReverify, onCheckedChange = { forceReverify = it })
+                        }
+                        Button(
+                            onClick = {
+                                onSavePolicy(adminCode.trim(), staffCode.trim(), requireApproval, forceReverify)
+                                showPolicyEditor = false
+                            },
+                            enabled = adminCode.isNotBlank() && staffCode.isNotBlank(),
+                            colors = ButtonDefaults.buttonColors(containerColor = ShadcnBlack, contentColor = ShadcnWhite),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Save Access Policy", fontWeight = FontWeight.Bold)
+                        }
                     }
                 } else {
                     if (devices.isEmpty()) {

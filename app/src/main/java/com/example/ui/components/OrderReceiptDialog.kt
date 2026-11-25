@@ -116,52 +116,70 @@ fun OrderReceiptDialog(
 ) {
     val context = LocalContext.current
     val order = orderWithItems.order
-    val dateStr = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()).format(Date(order.timestamp))
+    val dateStr = remember(order.timestamp) {
+        SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()).format(Date(order.timestamp))
+    }
 
     var selectedUpiAccount by remember(upiAccounts) {
         mutableStateOf(upiAccounts.firstOrNull { it.isDefault } ?: upiAccounts.firstOrNull())
     }
 
-    val activeVpa = selectedUpiAccount?.vpa ?: ""
-    val activePayeeName = selectedUpiAccount?.payeeName ?: "FILTR Coffee"
+    val activeVpa = selectedUpiAccount?.vpa.orEmpty().trim()
+    val activePayeeName = selectedUpiAccount?.payeeName?.takeIf { it.isNotBlank() } ?: "FILTR Coffee"
 
     val qrBitmap = remember(activeVpa, activePayeeName, order.totalAmount, order.orderId) {
-        generateUpiQrBitmap(
-            vpa = activeVpa,
-            payeeName = activePayeeName,
-            amount = order.totalAmount,
-            orderId = order.orderId,
-            sizePx = 600
-        )
+        if (activeVpa.isNotBlank()) {
+            generateUpiQrBitmap(
+                vpa = activeVpa,
+                payeeName = activePayeeName,
+                amount = order.totalAmount,
+                orderId = order.orderId,
+                sizePx = 600
+            )
+        } else {
+            null
+        }
     }
 
-    val upiPaymentUrl = "upi://pay?pa=${activeVpa}&pn=${URLEncoder.encode(activePayeeName, "UTF-8")}&am=${String.format(Locale.US, "%.2f", order.totalAmount)}&cu=INR&tn=${URLEncoder.encode("Order ${order.orderId}", "UTF-8")}"
-
-    val receiptText = buildString {
-        appendLine("===============================")
-        appendLine("          FILTR COFFEE         ")
-        appendLine("      Authentic Brew & Bites   ")
-        appendLine("===============================")
-        appendLine("Order ID  : ${order.orderId}")
-        appendLine("Date      : $dateStr")
-        appendLine("Customer  : ${order.customerName}")
-        if (order.contactNumber.isNotBlank()) appendLine("Phone     : ${order.contactNumber}")
-        appendLine("-------------------------------")
-        // Group items by name to consolidate duplicates
-        val groupedItems = orderWithItems.items.groupBy { it.itemName }.map { (name, items) ->
+    val groupedItems = remember(orderWithItems.items) {
+        orderWithItems.items.groupBy { it.itemName }.map { (name, items) ->
             Triple(name, items.sumOf { it.quantity }, items.sumOf { it.subtotal })
         }
-        groupedItems.forEach { (name, qty, subtotal) ->
-            appendLine("${qty}x ${name.take(18).padEnd(18)} ₹${subtotal}")
+    }
+
+    val upiPaymentUrl = remember(activeVpa, activePayeeName, order.totalAmount, order.orderId) {
+        if (activeVpa.isNotBlank()) {
+            "upi://pay?pa=${activeVpa}&pn=${URLEncoder.encode(activePayeeName, "UTF-8")}&am=${String.format(Locale.US, "%.2f", order.totalAmount)}&cu=INR&tn=${URLEncoder.encode("Order ${order.orderId}", "UTF-8")}"
+        } else {
+            ""
         }
-        appendLine("-------------------------------")
-        appendLine("TOTAL AMOUNT : ₹${order.totalAmount}")
-        appendLine("Payment      : ${if (order.isPaid) "PAID" else "PENDING"}")
-        appendLine("UPI Payment  : $upiPaymentUrl")
-        appendLine("Status       : ${if (order.isDelivered) "DELIVERED" else "IN PROGRESS"}")
-        appendLine("===============================")
-        appendLine("    Thank you for visiting!    ")
-        appendLine("===============================")
+    }
+
+    val receiptText = remember(order, dateStr, groupedItems, upiPaymentUrl) {
+        buildString {
+            appendLine("===============================")
+            appendLine("          FILTR COFFEE         ")
+            appendLine("      Authentic Brew & Bites   ")
+            appendLine("===============================")
+            appendLine("Order ID  : ${order.orderId}")
+            appendLine("Date      : $dateStr")
+            appendLine("Customer  : ${order.customerName}")
+            if (order.contactNumber.isNotBlank()) appendLine("Phone     : ${order.contactNumber}")
+            appendLine("-------------------------------")
+            groupedItems.forEach { (name, qty, subtotal) ->
+                appendLine("${qty}x ${name.take(18).padEnd(18)} ₹${subtotal}")
+            }
+            appendLine("-------------------------------")
+            appendLine("TOTAL AMOUNT : ₹${order.totalAmount}")
+            appendLine("Payment      : ${if (order.isPaid) "PAID" else "PENDING"}")
+            if (upiPaymentUrl.isNotBlank()) {
+                appendLine("UPI Payment  : $upiPaymentUrl")
+            }
+            appendLine("Status       : ${if (order.isDelivered) "DELIVERED" else "IN PROGRESS"}")
+            appendLine("===============================")
+            appendLine("    Thank you for visiting!    ")
+            appendLine("===============================")
+        }
     }
 
     AlertDialog(
@@ -281,10 +299,6 @@ fun OrderReceiptDialog(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        // Group items by name to consolidate duplicates
-                        val groupedItems = orderWithItems.items.groupBy { it.itemName }.map { (name, items) ->
-                            Triple(name, items.sumOf { it.quantity }, items.sumOf { it.subtotal })
-                        }
                         groupedItems.forEach { (name, qty, subtotal) ->
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -327,44 +341,44 @@ fun OrderReceiptDialog(
                         )
                     }
 
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = Color(0xFFE4E4E7))
+                    if (activeVpa.isNotBlank() && qrBitmap != null) {
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = Color(0xFFE4E4E7))
 
-                    // DYNAMIC UPI QR CODE SECTION
-                    Surface(
-                        color = Color.White,
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, Color(0xFFE4E4E7)),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                            .testTag("dynamic_upi_qr_section")
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                        // DYNAMIC UPI QR CODE SECTION
+                        Surface(
+                            color = Color.White,
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Color(0xFFE4E4E7)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .testTag("dynamic_upi_qr_section")
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.Center,
-                                modifier = Modifier.padding(bottom = 6.dp)
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.QrCode,
-                                    contentDescription = null,
-                                    tint = Color(0xFF09090B),
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "SCAN TO PAY (UPI)",
-                                    fontWeight = FontWeight.Black,
-                                    fontSize = 12.sp,
-                                    letterSpacing = 1.sp,
-                                    color = Color(0xFF09090B)
-                                )
-                            }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center,
+                                    modifier = Modifier.padding(bottom = 6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.QrCode,
+                                        contentDescription = null,
+                                        tint = Color(0xFF09090B),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "SCAN TO PAY (UPI)",
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 12.sp,
+                                        letterSpacing = 1.sp,
+                                        color = Color(0xFF09090B)
+                                    )
+                                }
 
-                            if (qrBitmap != null) {
                                 Surface(
                                     color = Color.White,
                                     shape = RoundedCornerShape(8.dp),
@@ -381,47 +395,47 @@ fun OrderReceiptDialog(
                                             .size(224.dp)
                                     )
                                 }
-                            }
 
-                            Text(
-                                text = "Amount: ₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 14.sp,
-                                color = Color(0xFF09090B)
-                            )
+                                Text(
+                                    text = "Amount: ₹${String.format(Locale.US, "%.2f", order.totalAmount)}",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp,
+                                    color = Color(0xFF09090B)
+                                )
 
-                            Text(
-                                text = "UPI ID: $activeVpa",
-                                fontSize = 11.sp,
-                                color = Color(0xFF2563EB),
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(top = 2.dp)
-                            )
+                                Text(
+                                    text = "UPI ID: $activeVpa",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFF2563EB),
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
 
-                            // If multiple UPI accounts exist, allow switching between them
-                            if (upiAccounts.size > 1) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    upiAccounts.forEach { acc ->
-                                        val isSel = acc.id == selectedUpiAccount?.id
-                                        Surface(
-                                            color = if (isSel) Color(0xFF09090B) else Color(0xFFF4F4F5),
-                                            shape = RoundedCornerShape(6.dp),
-                                            modifier = Modifier
-                                                .weight(1f)
-                                                .clickable { selectedUpiAccount = acc }
-                                        ) {
-                                            Text(
-                                                text = acc.vpa.split("@").firstOrNull() ?: acc.vpa,
-                                                color = if (isSel) Color.White else Color(0xFF09090B),
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                textAlign = TextAlign.Center,
-                                                modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp)
-                                            )
+                                // If multiple UPI accounts exist, allow switching between them
+                                if (upiAccounts.size > 1) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        upiAccounts.forEach { acc ->
+                                            val isSel = acc.id == selectedUpiAccount?.id
+                                            Surface(
+                                                color = if (isSel) Color(0xFF09090B) else Color(0xFFF4F4F5),
+                                                shape = RoundedCornerShape(6.dp),
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .clickable { selectedUpiAccount = acc }
+                                            ) {
+                                                Text(
+                                                    text = acc.vpa.split("@").firstOrNull() ?: acc.vpa,
+                                                    color = if (isSel) Color.White else Color(0xFF09090B),
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    textAlign = TextAlign.Center,
+                                                    modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp)
+                                                )
+                                            }
                                         }
                                     }
                                 }

@@ -36,6 +36,8 @@ import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryOrderWithItems
 import com.example.ui.BillingUiState
+import com.example.ui.InventoryOrderItemInput
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -56,14 +58,15 @@ fun InventoryOrderScreen(
     onDeleteOrder: (String) -> Unit,
     onConfirmDeleteOrder: (String) -> Unit,
     onDismissDeleteOrder: () -> Unit,
-    onSaveOrder: (supplierName: String, notes: String, items: List<Triple<String, Double, Double>>) -> Unit,
+    onSaveOrder: (supplierName: String, notes: String, items: List<InventoryOrderItemInput>) -> Unit,
     onDismissAddOrder: () -> Unit,
     onSaveInventoryItem: (name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double) -> Unit,
     onEditInventoryItem: (InventoryItemEntity?) -> Unit,
     onDeleteInventoryItem: (InventoryItemEntity) -> Unit,
     onDismissInventoryMaster: () -> Unit,
     onDismissAddInventoryItem: () -> Unit,
-    onSearchQueryChanged: (String) -> Unit
+    onSearchQueryChanged: (String) -> Unit,
+    onUpdateInventoryItem: (InventoryItemEntity) -> Unit = {}
 ) {
     // Date filter state
     var dateFilter by remember { mutableStateOf("THIS_MONTH") } // TODAY, YESTERDAY, LAST_7_DAYS, THIS_MONTH, ALL_TIME, CUSTOM
@@ -73,7 +76,24 @@ fun InventoryOrderScreen(
     var isSupplierBreakdownExpanded by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
 
-    val todayStart = remember {
+    var dayBoundaryTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val nowCal = Calendar.getInstance()
+            val nextMidnight = Calendar.getInstance().apply {
+                add(Calendar.DAY_OF_YEAR, 1)
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 1)
+                set(Calendar.MILLISECOND, 0)
+            }
+            val delayMs = (nextMidnight.timeInMillis - nowCal.timeInMillis).coerceAtLeast(1_000L)
+            delay(delayMs)
+            dayBoundaryTick++
+        }
+    }
+
+    val todayStart = remember(dayBoundaryTick) {
         Calendar.getInstance().apply {
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
@@ -83,28 +103,31 @@ fun InventoryOrderScreen(
     }
 
     // Filter orders based on the selected date or date range
-    val dateFilteredOrders = remember(inventoryOrders, dateFilter, customStartMs, customEndMs) {
+    val dateFilteredOrders = remember(inventoryOrders, dateFilter, customStartMs, customEndMs, todayStart) {
         inventoryOrders.filter { orderWithItems ->
             val orderTime = orderWithItems.order.timestamp
             when (dateFilter) {
                 "TODAY" -> orderTime >= todayStart
                 "YESTERDAY" -> {
                     val yesterdayStart = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
                         add(Calendar.DAY_OF_YEAR, -1)
-                        set(Calendar.HOUR_OF_DAY, 0)
-                        set(Calendar.MINUTE, 0)
-                        set(Calendar.SECOND, 0)
-                        set(Calendar.MILLISECOND, 0)
                     }.timeInMillis
                     orderTime in yesterdayStart until todayStart
                 }
                 "LAST_7_DAYS" -> {
-                    val weekAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -7) }
-                    orderTime >= weekAgo.timeInMillis
+                    val weekAgo = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -6)
+                    }.timeInMillis
+                    orderTime >= weekAgo
                 }
                 "THIS_MONTH" -> {
-                    val monthAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -30) }
-                    orderTime >= monthAgo.timeInMillis
+                    val thirtyDaysAgo = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -29)
+                    }.timeInMillis
+                    orderTime >= thirtyDaysAgo
                 }
                 "CUSTOM" -> {
                     val start = customStartMs ?: 0L
@@ -407,7 +430,7 @@ fun InventoryOrderScreen(
                     "ALL_TIME" to "All Time"
                 )
 
-                items(presetFilters) { (filter, label) ->
+                items(presetFilters, key = { it.first }) { (filter, label) ->
                     val isSelected = dateFilter == filter
                     FilterChip(
                         selected = isSelected,
@@ -603,6 +626,7 @@ fun InventoryOrderScreen(
             },
             onSearchQueryChanged = onSearchQueryChanged,
             onSaveInventoryItem = onSaveInventoryItem,
+            onUpdateInventoryItem = onUpdateInventoryItem,
             onEditInventoryItem = onEditInventoryItem,
             onDeleteInventoryItem = onDeleteInventoryItem,
             onDismiss = onDismissInventoryMaster
@@ -925,12 +949,18 @@ fun InventoryOrderCard(
 fun AddInventoryOrderDialog(
     inventoryItems: List<InventoryItemEntity>,
     onDismiss: () -> Unit,
-    onSave: (supplierName: String, notes: String, items: List<Triple<String, Double, Double>>) -> Unit
+    onSave: (supplierName: String, notes: String, items: List<InventoryOrderItemInput>) -> Unit
 ) {
     var supplierName by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     
-    data class OrderRow(var name: String = "", var qty: String = "", var unit: String = "kg", var rate: String = "")
+    data class OrderRow(
+        val rowId: String = UUID.randomUUID().toString(),
+        var name: String = "",
+        var qty: String = "",
+        var unit: String = "kg",
+        var rate: String = ""
+    )
     var rows by remember { mutableStateOf(listOf(OrderRow())) }
 
     val unitOptions = listOf("kg", "L", "g", "ml", "pcs", "pack")
@@ -940,7 +970,7 @@ fun AddInventoryOrderDialog(
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Surface(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().imePadding(),
             color = DarkBackground
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -989,6 +1019,7 @@ fun AddInventoryOrderDialog(
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     rows.forEachIndexed { index, row ->
+                        key(row.rowId) {
                         val rowQty = row.qty.toDoubleOrNull() ?: 0.0
                         val rowRate = row.rate.toDoubleOrNull() ?: 0.0
                         val rowSubtotal = rowQty * rowRate
@@ -1051,7 +1082,7 @@ fun AddInventoryOrderDialog(
                                             itemNameExpanded = true
                                         },
                                         label = { Text("Item Name", color = TextGray) },
-                                        modifier = Modifier.fillMaxWidth().menuAnchor(),
+                                        modifier = Modifier.fillMaxWidth().menuAnchor(MenuAnchorType.PrimaryEditable),
                                         colors = OutlinedTextFieldDefaults.colors(
                                             focusedBorderColor = AmberAccent,
                                             unfocusedBorderColor = SurfaceVariantColor,
@@ -1135,7 +1166,7 @@ fun AddInventoryOrderDialog(
                                             readOnly = true,
                                             label = { Text("Unit", color = TextGray) },
                                             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = unitExpanded) },
-                                            modifier = Modifier.menuAnchor(),
+                                            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable),
                                             colors = OutlinedTextFieldDefaults.colors(
                                                 focusedBorderColor = AmberAccent,
                                                 unfocusedBorderColor = SurfaceVariantColor,
@@ -1183,6 +1214,7 @@ fun AddInventoryOrderDialog(
                                     )
                                 }
                             }
+                        }
                         }
                     }
                     
@@ -1237,19 +1269,28 @@ fun AddInventoryOrderDialog(
                             TextButton(onClick = onDismiss) {
                                 Text("Cancel", color = Color.White)
                             }
+                            val hasValidRow = rows.any {
+                                it.name.isNotBlank() && (it.qty.toDoubleOrNull() ?: 0.0) > 0.0
+                            }
                             Button(
                                 onClick = {
                                     val mappedItems = rows.mapNotNull { row ->
-                                        if (row.name.isNotBlank()) {
-                                            val q = row.qty.toDoubleOrNull() ?: 0.0
-                                            val r = row.rate.toDoubleOrNull() ?: 0.0
-                                            Triple(row.name.trim(), q, r)
+                                        val q = row.qty.toDoubleOrNull() ?: 0.0
+                                        val r = (row.rate.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+                                        if (row.name.isNotBlank() && q > 0.0) {
+                                            InventoryOrderItemInput(
+                                                itemName = row.name.trim(),
+                                                quantity = q,
+                                                unit = row.unit,
+                                                unitPrice = r
+                                            )
                                         } else null
                                     }
                                     if (mappedItems.isNotEmpty()) {
                                         onSave(supplierName.trim(), notes.trim(), mappedItems)
                                     }
                                 },
+                                enabled = hasValidRow,
                                 colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = DarkBackground),
                                 shape = RoundedCornerShape(8.dp)
                             ) {
@@ -1272,7 +1313,8 @@ fun InventoryMasterDialog(
     onSaveInventoryItem: (name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double) -> Unit,
     onEditInventoryItem: (InventoryItemEntity?) -> Unit,
     onDeleteInventoryItem: (InventoryItemEntity) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onUpdateInventoryItem: (InventoryItemEntity) -> Unit = {}
 ) {
     // We are simulating an inner dialog if edit item is active
     var itemToEdit by remember { mutableStateOf<InventoryItemEntity?>(null) }
@@ -1352,7 +1394,7 @@ fun InventoryMasterDialog(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxSize()
                     ) {
-                        items(inventoryItems) { item ->
+                        items(inventoryItems, key = { it.id }) { item ->
                             Card(
                                 shape = RoundedCornerShape(12.dp),
                                 colors = CardDefaults.cardColors(containerColor = SurfaceColor),
@@ -1407,10 +1449,11 @@ fun InventoryMasterDialog(
     
     // Inline Add/Edit Dialog
     if (showEditDialog) {
-        var name by remember { mutableStateOf(itemToEdit?.name ?: "") }
-        var quantity by remember { mutableStateOf(itemToEdit?.standardQuantity?.toString() ?: "") }
-        var unit by remember { mutableStateOf(itemToEdit?.unit ?: "kg") }
-        var defaultPrice by remember { mutableStateOf(itemToEdit?.defaultPrice?.toString() ?: "") }
+        var name by remember(itemToEdit?.id, showEditDialog) { mutableStateOf(itemToEdit?.name ?: "") }
+        var category by remember(itemToEdit?.id, showEditDialog) { mutableStateOf(itemToEdit?.category ?: "") }
+        var quantity by remember(itemToEdit?.id, showEditDialog) { mutableStateOf(itemToEdit?.standardQuantity?.toString() ?: "") }
+        var unit by remember(itemToEdit?.id, showEditDialog) { mutableStateOf(itemToEdit?.unit ?: "kg") }
+        var defaultPrice by remember(itemToEdit?.id, showEditDialog) { mutableStateOf(itemToEdit?.defaultPrice?.toString() ?: "") }
         
         AlertDialog(
             onDismissRequest = { showEditDialog = false },
@@ -1419,11 +1462,33 @@ fun InventoryMasterDialog(
             textContentColor = Color.White,
             title = { Text(if (itemToEdit == null) "Add Inventory Item" else "Edit Inventory Item") },
             text = {
-                Column {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .imePadding()
+                ) {
                     OutlinedTextField(
                         value = name,
                         onValueChange = { name = it },
                         label = { Text("Name", color = TextGray) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AmberAccent,
+                            unfocusedBorderColor = SurfaceVariantColor,
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = category,
+                        onValueChange = { category = it },
+                        label = { Text("Category", color = TextGray) },
+                        placeholder = { Text("e.g. Dairy, Coffee, Cups", color = TextGray) },
+                        singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = AmberAccent,
@@ -1461,7 +1526,7 @@ fun InventoryMasterDialog(
                             readOnly = true,
                             label = { Text("Unit", color = TextGray) },
                             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = unitExpanded) },
-                            modifier = Modifier.fillMaxWidth().menuAnchor(),
+                            modifier = Modifier.fillMaxWidth().menuAnchor(MenuAnchorType.PrimaryNotEditable),
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = AmberAccent,
                                 unfocusedBorderColor = SurfaceVariantColor,
@@ -1505,15 +1570,33 @@ fun InventoryMasterDialog(
             confirmButton = {
                 Button(
                     onClick = {
-                        onSaveInventoryItem(
-                            name, 
-                            itemToEdit?.category ?: "", 
-                            unit, 
-                            defaultPrice.toDoubleOrNull() ?: 0.0,
-                            (quantity.toDoubleOrNull() ?: 1.0).coerceAtLeast(0.001)
-                        )
+                        val cleanName = name.trim()
+                        if (cleanName.isBlank()) return@Button
+                        val parsedPrice = (defaultPrice.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+                        val parsedStdQty = (quantity.toDoubleOrNull() ?: 1.0).coerceAtLeast(0.001)
+                        val existing = itemToEdit
+                        if (existing != null) {
+                            onUpdateInventoryItem(
+                                existing.copy(
+                                    name = cleanName,
+                                    category = category.trim(),
+                                    unit = unit,
+                                    defaultPrice = parsedPrice,
+                                    standardQuantity = parsedStdQty
+                                )
+                            )
+                        } else {
+                            onSaveInventoryItem(
+                                cleanName,
+                                category.trim(),
+                                unit,
+                                parsedPrice,
+                                parsedStdQty
+                            )
+                        }
                         showEditDialog = false
                     },
+                    enabled = name.isNotBlank(),
                     colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = DarkBackground)
                 ) {
                     Text("Save", fontWeight = FontWeight.Bold)

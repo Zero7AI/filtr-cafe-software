@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -15,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.entity.InventoryItemEntity
@@ -22,6 +24,7 @@ import com.example.data.entity.InventoryUsageEntity
 import com.example.data.entity.OrderWithItems
 import com.example.data.entity.calculatePacksAndCost
 import com.example.ui.BillingUiState
+import kotlinx.coroutines.delay
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -45,9 +48,25 @@ fun InventoryUsageScreen(
     var customStartMs by remember { mutableStateOf<Long?>(null) }
     var customEndMs by remember { mutableStateOf<Long?>(null) }
 
-    // Date range filtering
-    val now = Calendar.getInstance()
-    val todayStart = remember {
+    // Date range filtering with midnight boundary refresh
+    var dayBoundaryTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val nowCal = Calendar.getInstance()
+            val nextMidnight = Calendar.getInstance().apply {
+                add(Calendar.DAY_OF_YEAR, 1)
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 1)
+                set(Calendar.MILLISECOND, 0)
+            }
+            val delayMs = (nextMidnight.timeInMillis - nowCal.timeInMillis).coerceAtLeast(1_000L)
+            delay(delayMs)
+            dayBoundaryTick++
+        }
+    }
+
+    val todayStart = remember(dayBoundaryTick) {
         Calendar.getInstance().apply {
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
@@ -56,29 +75,32 @@ fun InventoryUsageScreen(
         }.timeInMillis
     }
 
-    val yesterdayStart = remember {
+    val yesterdayStart = remember(todayStart) {
         Calendar.getInstance().apply {
+            timeInMillis = todayStart
             add(Calendar.DAY_OF_YEAR, -1)
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
         }.timeInMillis
     }
 
-    val filteredOrders = remember(ordersList, usageDateFilter, customStartMs, customEndMs) {
+    val filteredOrders = remember(ordersList, usageDateFilter, customStartMs, customEndMs, todayStart, yesterdayStart) {
         ordersList.filter { orderWithItems ->
             val orderTime = orderWithItems.order.timestamp
             when (usageDateFilter) {
                 "TODAY" -> orderTime >= todayStart
                 "YESTERDAY" -> orderTime in yesterdayStart until todayStart
                 "LAST_7_DAYS" -> {
-                    val weekAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -7) }
-                    orderTime >= weekAgo.timeInMillis
+                    val weekAgo = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -6)
+                    }.timeInMillis
+                    orderTime >= weekAgo
                 }
                 "THIS_MONTH" -> {
-                    val monthAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -30) }
-                    orderTime >= monthAgo.timeInMillis
+                    val thirtyDaysAgo = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -29)
+                    }.timeInMillis
+                    orderTime >= thirtyDaysAgo
                 }
                 "CUSTOM" -> {
                     val start = customStartMs ?: 0L
@@ -96,7 +118,10 @@ fun InventoryUsageScreen(
 
         filteredOrders.forEach { orderWithItems ->
             orderWithItems.items.forEach { orderItem ->
-                val recipeUsages = usages.filter { it.menuItemId == orderItem.menuItemId }
+                val recipeUsages = usages.filter {
+                    (orderItem.menuItemId > 0 && it.menuItemId == orderItem.menuItemId) ||
+                        it.menuItemName.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
+                }
                 if (recipeUsages.isNotEmpty()) {
                     recipeUsages.forEach { usage ->
                         val current = rawUsageMap[usage.inventoryItemId]?.first ?: 0.0
@@ -104,11 +129,9 @@ fun InventoryUsageScreen(
                         rawUsageMap[usage.inventoryItemId] = Pair(current + consumed, usage.unit)
                     }
                 } else {
-                    // Direct item fallback
+                    // Exact-name fallback for direct inventory items without recipe mapping
                     val directItem = inventoryItems.find {
-                        it.name.equals(orderItem.itemName, ignoreCase = true) ||
-                                orderItem.itemName.contains(it.name, ignoreCase = true) ||
-                                it.name.contains(orderItem.itemName, ignoreCase = true)
+                        it.name.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
                     }
                     if (directItem != null) {
                         val current = rawUsageMap[directItem.id]?.first ?: 0.0
@@ -222,7 +245,7 @@ fun InventoryUsageScreen(
                 "THIS_MONTH" to "30 Days"
             )
 
-            items(filters) { (key, label) ->
+            items(filters, key = { it.first }) { (key, label) ->
                 val isSelected = usageDateFilter == key
                 FilterChip(
                     selected = isSelected,
@@ -319,7 +342,10 @@ fun InventoryUsageScreen(
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Row(
+                                            modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
                                             Icon(
                                                 imageVector = Icons.Default.Circle,
                                                 contentDescription = null,
@@ -331,28 +357,47 @@ fun InventoryUsageScreen(
                                                 text = alert.item.name,
                                                 color = Color.White,
                                                 fontSize = 13.sp,
-                                                fontWeight = FontWeight.Bold
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                         }
 
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
                                             Text(
-                                                text = "${formatDouble(alert.item.currentStock)} ${alert.item.unit} stock",
+                                                text = "${formatDouble(alert.item.currentStock)} ${alert.item.unit}",
                                                 color = TextGray,
                                                 fontSize = 12.sp
                                             )
-                                            Spacer(modifier = Modifier.width(8.dp))
                                             Surface(
                                                 color = RedDanger.copy(alpha = 0.25f),
                                                 shape = RoundedCornerShape(6.dp)
                                             ) {
                                                 Text(
-                                                    text = "Only ~${alert.ordersRemaining} orders left",
+                                                    text = "~${alert.ordersRemaining} left",
                                                     color = Color(0xFFFCA5A5),
                                                     fontSize = 11.sp,
                                                     fontWeight = FontWeight.Bold,
                                                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                                 )
+                                            }
+                                            if (onOpenAddStockDialog != null) {
+                                                Surface(
+                                                    color = EmeraldSuccess.copy(alpha = 0.2f),
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    modifier = Modifier.clickable { onOpenAddStockDialog(alert.item) }
+                                                ) {
+                                                    Text(
+                                                        text = "+ Stock",
+                                                        color = EmeraldSuccess,
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -497,7 +542,7 @@ fun InventoryUsageScreen(
                     }
                 }
             } else {
-                items(consumedItems) { record ->
+                items(consumedItems, key = { it.item.id }) { record ->
                     val sharePercent = if (totalConsumedCost > 0) (record.cost / totalConsumedCost) * 100 else 0.0
 
                     Card(
@@ -562,12 +607,32 @@ fun InventoryUsageScreen(
                                     )
                                 }
 
-                                Text(
-                                    text = "≈ ${formatDouble(record.packsUsed)} packs",
-                                    color = TextGray,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = "≈ ${formatDouble(record.packsUsed)} packs",
+                                        color = TextGray,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    if (onOpenAddStockDialog != null) {
+                                        Surface(
+                                            color = AmberAccent.copy(alpha = 0.16f),
+                                            shape = RoundedCornerShape(6.dp),
+                                            modifier = Modifier.clickable { onOpenAddStockDialog(record.item) }
+                                        ) {
+                                            Text(
+                                                text = "Restock",
+                                                color = AmberAccent,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -612,7 +677,7 @@ private fun formatDouble(value: Double): String {
 }
 
 private fun formatCurrency(value: Double): String {
-    val format = NumberFormat.getCurrencyInstance(Locale("en", "IN"))
+    val format = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
     format.maximumFractionDigits = 2
     return format.format(value)
 }

@@ -80,38 +80,58 @@ fun InventoriesScreen(
     var isSupplierBreakdownExpanded by remember { mutableStateOf(false) }
     var stockFilter by remember { mutableStateOf("ALL") } // ALL, USED, LOW_STOCK
 
-    val todayStart = remember {
-        Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
+    var todayStart by remember {
+        mutableStateOf(
+            Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+        )
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val nowMs = System.currentTimeMillis()
+            val nextMidnight = Calendar.getInstance().apply {
+                timeInMillis = nowMs
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+                add(Calendar.DAY_OF_YEAR, 1)
+            }.timeInMillis
+            kotlinx.coroutines.delay((nextMidnight - nowMs).coerceAtLeast(1000L))
+            todayStart = nextMidnight
+        }
     }
 
     // Filter orders based on the selected date or date range
-    val filteredOrders = remember(ordersList, dateFilter, customStartMs, customEndMs) {
+    val filteredOrders = remember(ordersList, dateFilter, customStartMs, customEndMs, todayStart) {
         ordersList.filter { orderWithItems ->
             val orderTime = orderWithItems.order.timestamp
             when (dateFilter) {
                 "TODAY" -> orderTime >= todayStart
                 "YESTERDAY" -> {
                     val yesterdayStart = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
                         add(Calendar.DAY_OF_YEAR, -1)
-                        set(Calendar.HOUR_OF_DAY, 0)
-                        set(Calendar.MINUTE, 0)
-                        set(Calendar.SECOND, 0)
-                        set(Calendar.MILLISECOND, 0)
                     }.timeInMillis
                     orderTime in yesterdayStart until todayStart
                 }
                 "LAST_7_DAYS" -> {
-                    val weekAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -7) }
-                    orderTime >= weekAgo.timeInMillis
+                    val weekAgo = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        add(Calendar.DAY_OF_YEAR, -6)
+                    }.timeInMillis
+                    orderTime >= weekAgo
                 }
                 "THIS_MONTH" -> {
-                    val monthAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -30) }
-                    orderTime >= monthAgo.timeInMillis
+                    val monthStart = Calendar.getInstance().apply {
+                        timeInMillis = todayStart
+                        set(Calendar.DAY_OF_MONTH, 1)
+                    }.timeInMillis
+                    orderTime >= monthStart
                 }
                 "CUSTOM" -> {
                     val start = customStartMs ?: 0L
@@ -176,7 +196,10 @@ fun InventoriesScreen(
 
         filteredOrders.forEach { orderWithItems ->
             orderWithItems.items.forEach { orderItem ->
-                val recipeUsages = usages.filter { it.menuItemId == orderItem.menuItemId }
+                val recipeUsages = usages.filter {
+                    (orderItem.menuItemId != 0 && it.menuItemId == orderItem.menuItemId) ||
+                        it.menuItemName.equals(orderItem.itemName.trim(), ignoreCase = true)
+                }
                 if (recipeUsages.isNotEmpty()) {
                     recipeUsages.forEach { usage ->
                         val current = rawUsageMap[usage.inventoryItemId]?.first ?: 0.0
@@ -184,11 +207,9 @@ fun InventoriesScreen(
                         rawUsageMap[usage.inventoryItemId] = Pair(current + consumed, usage.unit)
                     }
                 } else {
-                    // Fallback for direct items (e.g. Fries, Peri peri, Ice cream, Water bottles)
+                    // Fallback for direct items matched strictly by exact name
                     val directItem = inventoryItems.find {
-                        it.name.equals(orderItem.itemName, ignoreCase = true) ||
-                        orderItem.itemName.contains(it.name, ignoreCase = true) ||
-                        it.name.contains(orderItem.itemName, ignoreCase = true)
+                        it.name.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
                     }
                     if (directItem != null) {
                         val current = rawUsageMap[directItem.id]?.first ?: 0.0
@@ -388,7 +409,7 @@ fun InventoriesScreen(
                 "ALL_TIME" to "All Time"
             )
 
-            items(presetFilters) { (filter, label) ->
+            items(presetFilters, key = { it.first }) { (filter, label) ->
                 val isSelected = dateFilter == filter
                 FilterChip(
                     selected = isSelected,
@@ -934,7 +955,7 @@ fun InventoriesScreen(
                 }
             } else {
                 // Stock Items List
-                items(displayInventoryItems) { item ->
+                items(displayInventoryItems, key = { it.id }) { item ->
                     val consumptionRecord = itemConsumptionMap[item.id]
                     val packsConsumed = consumptionRecord?.totalPacksUsed ?: 0.0
                     val dailyBurnPacks = if (periodDays > 0) packsConsumed / periodDays else 0.0
@@ -1065,9 +1086,19 @@ fun InventoryItemCard(
                     val currentStockStr = formatDouble(item.currentStock)
                     val totalQtyStr = formatDouble(item.standardQuantity * item.currentStock)
                     val costStr = formatCurrency(item.currentStock * item.defaultPrice)
+                    val unitLower = item.unit.trim().lowercase()
+                    val isPackUnit = unitLower in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle")
+                    val stockSummaryText = when {
+                        isPackUnit && item.standardQuantity > 1.0 ->
+                            "${stdQtyStr}g × $currentStockStr ${item.unit} = ${totalQtyStr}g    $costStr"
+                        isPackUnit ->
+                            "$currentStockStr ${item.unit}    $costStr"
+                        else ->
+                            "$stdQtyStr ${item.unit} × $currentStockStr packs = $totalQtyStr ${item.unit}    $costStr"
+                    }
 
                     Text(
-                        text = "$stdQtyStr ${item.unit} × $currentStockStr packs = $totalQtyStr ${item.unit}    $costStr",
+                        text = stockSummaryText,
                         color = Color.White,
                         fontSize = 13.sp
                     )
@@ -1115,7 +1146,7 @@ fun InventoryItemCard(
 
                 Row {
                     if (isEditing) {
-                        var stockText by remember { mutableStateOf(formatDouble(item.currentStock)) }
+                        var stockText by remember(item.id, item.currentStock) { mutableStateOf(formatDouble(item.currentStock)) }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedTextField(
                                 value = stockText,
@@ -1264,7 +1295,7 @@ private fun formatDouble(value: Double): String {
 }
 
 private fun formatCurrency(value: Double): String {
-    val format = NumberFormat.getCurrencyInstance(Locale("en", "IN"))
+    val format = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
     format.maximumFractionDigits = 0
     return format.format(value)
 }

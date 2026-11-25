@@ -107,7 +107,7 @@ fun MenuMasterScreen(
                 .padding(12.dp)
                 .testTag("menu_master_screen")
         ) {
-            // Header Row with Title, Sync Item Master and Reload Default Menu
+            var showRestoreConfirmDialog by remember { mutableStateOf(false) }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -127,15 +127,15 @@ fun MenuMasterScreen(
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                         modifier = Modifier.testTag("sync_item_master_button")
                     ) {
-                        Text("Sync Item Master", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text("Sync Master", fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                     }
                     Button(
-                        onClick = onRestoreDefaultMenu,
+                        onClick = { showRestoreConfirmDialog = true },
                         colors = ButtonDefaults.buttonColors(containerColor = CoffeeBrownPrimary),
                         shape = RoundedCornerShape(12.dp),
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                     ) {
-                        Text("Reload Default", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text("Reload Default", fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                     }
                 }
             }
@@ -192,7 +192,7 @@ fun MenuMasterScreen(
                     }
                 }
 
-                items(categories) { category ->
+                items(categories, key = { it }) { category ->
                     val isSelected = state.selectedCategory.equals(category, ignoreCase = true)
                     FilterChip(
                         selected = isSelected,
@@ -223,6 +223,7 @@ fun MenuMasterScreen(
             } else {
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(bottom = 84.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
                     itemsIndexed(uniqueMenuItems, key = { _, item -> item.id }) { index, menuItem ->
@@ -261,6 +262,32 @@ fun MenuMasterScreen(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(text = "Add Item", fontWeight = FontWeight.Bold)
             }
+        }
+
+        if (showRestoreConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showRestoreConfirmDialog = false },
+                title = { Text("Reload Default Menu?", fontWeight = FontWeight.Bold) },
+                text = {
+                    Text("This restores the default FILTR menu items and prices. Custom edits to default items may be overwritten.")
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showRestoreConfirmDialog = false
+                            onRestoreDefaultMenu()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = CoffeeBrownPrimary)
+                    ) {
+                        Text("Reload Default", fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRestoreConfirmDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
         }
 
         // Set Position Dialog

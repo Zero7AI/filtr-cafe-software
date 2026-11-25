@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -421,7 +422,7 @@ fun BillingScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     contentPadding = PaddingValues(horizontal = 4.dp)
                 ) {
-                    items(categories) { category ->
+                    items(categories, key = { it }) { category ->
                         val isSelected = state.selectedCategory == category
                         FilterChip(
                             selected = isSelected,
@@ -469,8 +470,13 @@ fun BillingScreen(
                         .fillMaxSize()
                         .testTag("menu_grid")
                 ) {
-                    items(menuItems) { menuItem ->
-                        val qty = state.cartItems[menuItem] ?: 0
+                    items(menuItems, key = { "${it.id}_${it.name}" }) { menuItem ->
+                        val qty = remember(state.cartItems, menuItem.id, menuItem.name) {
+                            state.cartItems.entries.firstOrNull { (k, _) ->
+                                if (k.id != 0 && menuItem.id != 0) k.id == menuItem.id
+                                else k.id == menuItem.id && k.name.trim().equals(menuItem.name.trim(), ignoreCase = true)
+                            }?.value ?: 0
+                        }
                         MenuItemCard(
                             menuItem = menuItem,
                             quantityInCart = qty,
@@ -490,6 +496,7 @@ fun BillingScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
+                .imePadding()
                 .padding(if (isCompactScreen) 8.dp else 12.dp)
         ) {
             Surface(
@@ -706,7 +713,7 @@ fun CartPreviewDialog(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(cartItems.entries.toList(), key = { it.key.id }) { (item, qty) ->
+                        items(cartItems.entries.toList(), key = { "${it.key.id}_${it.key.name.trim().lowercase()}" }) { (item, qty) ->
                             Surface(
                                 color = Color(0xFFF4F4F5),
                                 shape = RoundedCornerShape(12.dp),
@@ -937,6 +944,3 @@ fun MenuItemCard(
         }
     }
 }
-
-@Composable
-private fun SurfaceColor(): Color = MaterialTheme.colorScheme.surface

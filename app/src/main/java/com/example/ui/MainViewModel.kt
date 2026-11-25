@@ -36,6 +36,7 @@ import java.util.Locale
 import com.example.data.entity.ChecklistCompletionEntity
 import com.example.data.entity.ChecklistTaskEntity
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -43,6 +44,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -50,6 +52,20 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+val STAFF_ALLOWED_TABS: Set<FiltrTab> = setOf(
+    FiltrTab.BILLING,
+    FiltrTab.ORDERS,
+    FiltrTab.CHECKLIST,
+    FiltrTab.MANUAL_INVENTORY
+)
+
+data class InventoryOrderItemInput(
+    val itemName: String,
+    val quantity: Double,
+    val unit: String = "kg",
+    val unitPrice: Double
+)
 
 enum class FiltrTab {
     BILLING,
@@ -132,9 +148,9 @@ data class BillingUiState(
     val itemDeleteWarningMessage: MenuItemEntity? = null,
     val orderToDeleteConfirmation: String? = null,
     val inventoryItemToDeleteConfirmation: InventoryItemEntity? = null,
-    val isSyncingSheets: Boolean = false,
-    val lastSyncTime: String = "",
     val isDeletingOrder: Boolean = false,
+    val manualInventoryDraftCounts: Map<Int, Double> = emptyMap(),
+    val manualInventoryDraftNotes: String = "",
     val snackbarMessage: String? = null,
     val isFirestoreConnected: Boolean = false,
     val isSupabaseConnected: Boolean = false,
@@ -297,6 +313,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private val initialRole = prefs.getString("authenticated_role", "STAFF") ?: "STAFF"
     private val _uiState = MutableStateFlow(
         BillingUiState(
             googleSheetsWebhookUrl = prefs.getString("sheets_webhook_url", "") ?: "",
@@ -318,7 +335,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             customCategories = loadCustomCategories(),
             deviceAccessStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED",
             operatorName = prefs.getString("device_operator_name", "") ?: "",
-            currentRole = prefs.getString("authenticated_role", "STAFF") ?: "STAFF"
+            currentRole = initialRole,
+            accessPolicyConfig = sanitizedPolicyForRole(SupabaseService.AccessPolicyConfig(), initialRole)
         )
     )
     val uiState: StateFlow<BillingUiState> = _uiState.asStateFlow()
@@ -347,66 +365,93 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val fixedCosts: StateFlow<List<FixedCostEntity>> = repository.allFixedCosts
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    private fun currentFormattedDateKey(): String =
+        SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+
+    private fun currentFormattedDisplayDate(): String =
+        SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date())
+
+    private val _activeDateKey = MutableStateFlow(currentFormattedDateKey())
+
     val todayDateKey: String
-        get() = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        get() = currentFormattedDateKey()
 
-    val checklistSections: StateFlow<List<ChecklistSectionUiModel>> = combine(
-        repository.allChecklistTasks,
-        repository.getChecklistCompletionsForDate(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())),
-        _uiState.map { it.collapsedChecklistSectionIds }.distinctUntilChanged()
-    ) { tasks: List<ChecklistTaskEntity>, completions: List<ChecklistCompletionEntity>, collapsedSectionIds: Set<String> ->
-        val completionMap = completions.associateBy { it.taskId }
-        val sectionOrder = listOf("01_OPENING", "02_CLEANING", "03_ROUTINE", "04_CLOSING", "05_GENERAL")
-        val sectionNames = mapOf(
-            "01_OPENING" to "01. Opening & Daily Preparation",
-            "02_CLEANING" to "02. Cleaning & Store Hygiene",
-            "03_ROUTINE" to "03. Routine Store Checks",
-            "04_CLOSING" to "04. Closing Checklist",
-            "05_GENERAL" to "05. General Tasks"
-        )
-        
-        val grouped = tasks.groupBy { it.sectionId }
-        val allSections = (sectionOrder + grouped.keys).distinct()
-        
-        allSections.mapNotNull { secId ->
-            val sectionTasks = grouped[secId] ?: emptyList()
-            if (sectionTasks.isEmpty() && secId !in listOf("01_OPENING", "02_CLEANING", "03_ROUTINE", "04_CLOSING")) {
-                null
-            } else {
-                val items = sectionTasks.sortedBy { it.orderIndex }.map { task ->
-                    ChecklistItemUiModel(
-                        task = task,
-                        completion = completionMap[task.id]
-                    )
-                }
-                val secName = sectionTasks.firstOrNull()?.sectionName ?: (sectionNames[secId] ?: secId)
-                ChecklistSectionUiModel(
-                    sectionId = secId,
-                    sectionName = secName,
-                    items = items,
-                    isExpanded = secId !in collapsedSectionIds
-                )
-            }
+    private fun refreshDateKeyIfNeeded() {
+        val current = currentFormattedDateKey()
+        if (_activeDateKey.value != current) {
+            _activeDateKey.value = current
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }
 
-    val checklistStats: StateFlow<ChecklistOverallStats> = checklistSections.map { sections ->
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val checklistSections: StateFlow<List<ChecklistSectionUiModel>> = _activeDateKey
+        .flatMapLatest { dateKey ->
+            combine(
+                repository.allChecklistTasks,
+                repository.getChecklistCompletionsForDate(dateKey),
+                _uiState.map { it.collapsedChecklistSectionIds }.distinctUntilChanged()
+            ) { tasks: List<ChecklistTaskEntity>, completions: List<ChecklistCompletionEntity>, collapsedSectionIds: Set<String> ->
+                val completionMap = completions.associateBy { it.taskId }
+                val sectionOrder = listOf("01_OPENING", "02_CLEANING", "03_ROUTINE", "04_CLOSING", "05_GENERAL")
+                val sectionNames = mapOf(
+                    "01_OPENING" to "01. Opening & Daily Preparation",
+                    "02_CLEANING" to "02. Cleaning & Store Hygiene",
+                    "03_ROUTINE" to "03. Routine Store Checks",
+                    "04_CLOSING" to "04. Closing Checklist",
+                    "05_GENERAL" to "05. General Tasks"
+                )
+
+                val grouped = tasks.groupBy { it.sectionId }
+                val allSections = (sectionOrder + grouped.keys).distinct()
+
+                allSections.mapNotNull { secId ->
+                    val sectionTasks = grouped[secId] ?: emptyList()
+                    if (sectionTasks.isEmpty() && secId !in listOf("01_OPENING", "02_CLEANING", "03_ROUTINE", "04_CLOSING")) {
+                        null
+                    } else {
+                        val items = sectionTasks.sortedBy { it.orderIndex }.map { task ->
+                            ChecklistItemUiModel(
+                                task = task,
+                                completion = completionMap[task.id]
+                            )
+                        }
+                        val secName = sectionTasks.firstOrNull()?.sectionName ?: (sectionNames[secId] ?: secId)
+                        ChecklistSectionUiModel(
+                            sectionId = secId,
+                            sectionName = secName,
+                            items = items,
+                            isExpanded = secId !in collapsedSectionIds
+                        )
+                    }
+                }
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val checklistStats: StateFlow<ChecklistOverallStats> = combine(
+        checklistSections,
+        _activeDateKey
+    ) { sections, activeDateKey ->
         val total = sections.sumOf { it.totalCount }
         val completed = sections.sumOf { it.completedCount }
         val pending = total - completed
         val pct = if (total == 0) 0 else (completed * 100) / total
-        val dateFmt = SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date())
+        val formatted = try {
+            val parsed = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(activeDateKey)
+            if (parsed != null) SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(parsed) else currentFormattedDisplayDate()
+        } catch (_: Exception) {
+            currentFormattedDisplayDate()
+        }
         ChecklistOverallStats(
-            dateKey = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()),
-            formattedDate = dateFmt,
+            dateKey = activeDateKey,
+            formattedDate = formatted,
             totalCount = total,
             completedCount = completed,
             pendingCount = pending,
             percentage = pct
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ChecklistOverallStats(
-        dateKey = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()),
-        formattedDate = SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date()),
+        dateKey = currentFormattedDateKey(),
+        formattedDate = currentFormattedDisplayDate(),
         totalCount = 0,
         completedCount = 0,
         pendingCount = 0,
@@ -414,11 +459,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ))
 
     private var customerSearchJob: Job? = null
+    private val connectivityManager =
+        application.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
     init {
         // Monitor network connectivity in real-time
-        val connectivityManager = application.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        val networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
                 _uiState.update { it.copy(isNetworkAvailable = true) }
                 // Trigger immediate background sync of any pending orders to Supabase & Sheets when connection restored
@@ -446,21 +493,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(isNetworkAvailable = false) }
             }
         }
+        networkCallback = callback
         val networkRequest = android.net.NetworkRequest.Builder()
             .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
-        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+        connectivityManager.registerNetworkCallback(networkRequest, callback)
 
         // Set initial network state
         val activeNetwork = connectivityManager.activeNetwork
         val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
         val isConnected = capabilities?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
         _uiState.update { it.copy(isNetworkAvailable = isConnected) }
-
-        // Proactively deduplicate local menu items to clean up any legacy duplicates
-        viewModelScope.launch(Dispatchers.IO) {
-            repository.deduplicateMenuItems()
-        }
 
         // Global continuous sync between Room Menu Items and Voice Engine MenuCatalog
         viewModelScope.launch {
@@ -492,13 +535,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        viewModelScope.launch {
-            repository.deduplicateMenuItems()
-            // One-time check only at startup (not reactive to prevent infinite loop)
-            val items = menuItems.first()
-            val hasLegacyItems = items.any { it.name.contains("South Indian", ignoreCase = true) || it.name.contains("Masala Chai", ignoreCase = true) }
-            if (items.isEmpty() || hasLegacyItems) {
-                repository.resetMenuToFiltrDefault()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                repository.deduplicateMenuItems()
+                // One-time check only at startup (not reactive to prevent infinite loop)
+                val items = menuItems.first()
+                val hasLegacyItems = items.any { it.name.contains("South Indian", ignoreCase = true) || it.name.contains("Masala Chai", ignoreCase = true) }
+                if (items.isEmpty() || hasLegacyItems) {
+                    repository.resetMenuToFiltrDefault()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Menu startup initialization failed: ${e.message}")
             }
         }
 
@@ -506,6 +553,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 kotlinx.coroutines.delay(60 * 1000L) // 1 minute background check across all devices
+                refreshDateKeyIfNeeded()
                 try {
                     repository.syncPendingOrdersToSupabase()
                 } catch (e: Exception) {
@@ -520,7 +568,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     Log.w("MainViewModel", "Background Sheets sync failed, will retry: ${e.message}")
                 }
                 try {
-                    repository.reconcileChecklistFromCloud(todayDateKey)
+                    repository.reconcileChecklistFromCloud(_activeDateKey.value)
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
@@ -618,29 +666,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    override fun onCleared() {
+        super.onCleared()
+        networkCallback?.let { cb ->
+            try {
+                connectivityManager.unregisterNetworkCallback(cb)
+            } catch (_: Exception) {
+            }
+        }
+        networkCallback = null
+    }
+
     fun restoreDefaultMenu() {
+        if (!requireAdmin("Restoring default menu")) return
         viewModelScope.launch {
-            repository.resetMenuToFiltrDefault()
-            _uiState.update { it.copy(snackbarMessage = "FILTR Menu restored to defaults!") }
+            try {
+                repository.resetMenuToFiltrDefault()
+                _uiState.update { it.copy(snackbarMessage = "FILTR Menu restored to defaults!") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to restore menu: ${e.message}") }
+            }
         }
     }
 
     val filteredMenuItems: StateFlow<List<MenuItemEntity>> = combine(
         menuItems,
-        _uiState
-    ) { items, state ->
+        _uiState.map { Triple(it.selectedCategory, it.searchQuery, it.customItemOrder) }.distinctUntilChanged()
+    ) { items, (selectedCategory, searchQuery, customItemOrder) ->
         val filtered = items.distinctBy { it.name.trim().lowercase() }.filter { item ->
-            val matchesCategory = state.selectedCategory == "All" || item.category.equals(state.selectedCategory, ignoreCase = true)
-            val matchesSearch = state.searchQuery.isBlank() ||
-                    item.name.lowercase().contains(state.searchQuery.lowercase()) ||
-                    item.category.lowercase().contains(state.searchQuery.lowercase())
+            val matchesCategory = selectedCategory == "All" || item.category.equals(selectedCategory, ignoreCase = true)
+            val matchesSearch = searchQuery.isBlank() ||
+                    item.name.lowercase().contains(searchQuery.lowercase()) ||
+                    item.category.lowercase().contains(searchQuery.lowercase())
             matchesCategory && matchesSearch
         }
 
-        if (state.customItemOrder.isEmpty()) {
+        if (customItemOrder.isEmpty()) {
             filtered
         } else {
-            val orderMap = state.customItemOrder.withIndex().associate { it.value.lowercase().trim() to it.index }
+            val orderMap = customItemOrder.withIndex().associate { it.value.lowercase().trim() to it.index }
             filtered.sortedWith(
                 compareBy<MenuItemEntity> {
                     orderMap[it.name.lowercase().trim()] ?: (10000 + it.id)
@@ -650,6 +714,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     fun saveCustomItemOrder(newOrder: List<String>) {
+        if (!requireAdmin("Reordering menu items")) return
         val distinctOrder = newOrder.map { it.trim() }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
         prefs.edit().putString("menu_custom_item_order", JSONArray(distinctOrder).toString()).apply()
         _uiState.update { it.copy(customItemOrder = distinctOrder) }
@@ -663,6 +728,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun moveMenuItem(item: MenuItemEntity, targetPosition: Int, categoryItems: List<MenuItemEntity>) {
+        if (!requireAdmin("Reordering menu items")) return
         val currentCategoryItems = categoryItems.toMutableList()
         val currentIndex = currentCategoryItems.indexOfFirst { it.name.trim().equals(item.name.trim(), ignoreCase = true) }
         if (currentIndex == -1 || targetPosition !in currentCategoryItems.indices || currentIndex == targetPosition) return
@@ -681,6 +747,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun moveMenuItemUp(item: MenuItemEntity, categoryItems: List<MenuItemEntity>) {
+        if (!requireAdmin("Reordering menu items")) return
         val index = categoryItems.indexOfFirst { it.name.trim().equals(item.name.trim(), ignoreCase = true) }
         if (index > 0) {
             moveMenuItem(item, index - 1, categoryItems)
@@ -688,6 +755,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun moveMenuItemDown(item: MenuItemEntity, categoryItems: List<MenuItemEntity>) {
+        if (!requireAdmin("Reordering menu items")) return
         val index = categoryItems.indexOfFirst { it.name.trim().equals(item.name.trim(), ignoreCase = true) }
         if (index != -1 && index < categoryItems.size - 1) {
             moveMenuItem(item, index + 1, categoryItems)
@@ -695,6 +763,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addCustomCategory(categoryName: String) {
+        if (!requireAdmin("Adding menu categories")) return
         val clean = categoryName.trim().uppercase()
         if (clean.isBlank()) return
         val current = _uiState.value.customCategories
@@ -722,6 +791,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAddCategoryDialog() {
+        if (!requireAdmin("Adding menu categories")) return
         _uiState.update { it.copy(showAddCategoryDialog = true) }
     }
 
@@ -749,9 +819,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return true
     }
 
+    private fun requireAdmin(actionLabel: String = "This action"): Boolean {
+        if (!ensureAppAllowed()) return false
+        if (_uiState.value.currentRole != "ADMIN") {
+            _uiState.update {
+                it.copy(snackbarMessage = "$actionLabel requires Admin access")
+            }
+            return false
+        }
+        return true
+    }
+
+    private fun sanitizedPolicyForRole(
+        policy: SupabaseService.AccessPolicyConfig,
+        role: String
+    ): SupabaseService.AccessPolicyConfig {
+        return if (role == "ADMIN") {
+            policy
+        } else {
+            policy.copy(adminPasscode = "", staffPasscode = "")
+        }
+    }
+
+    private fun BillingUiState.resetRestrictedStateForRole(role: String): BillingUiState {
+        if (role == "ADMIN" && deviceAccessStatus == "ACTIVE") return this
+        val safeTab = if (currentTab in STAFF_ALLOWED_TABS) currentTab else FiltrTab.BILLING
+        return copy(
+            currentTab = safeTab,
+            showSettingsDialog = false,
+            showAddEditItemDialog = false,
+            editingMenuItem = null,
+            itemToDeleteConfirmation = null,
+            itemDeleteWarningMessage = null,
+            inventoryItemToDeleteConfirmation = null,
+            showInventoryMasterDialog = false,
+            showAddInventoryOrderDialog = false,
+            editingInventoryItem = null,
+            showAddInventoryItemDialog = false,
+            inventoryOrderToDelete = null,
+            showUsagePerSkuDialog = false,
+            usageEditingMenuItemId = null,
+            usageEditingMenuItemName = "",
+            editingStockItemId = null,
+            showAddStockDialog = false,
+            addStockItem = null,
+            showAccountsUpiDialog = false,
+            showReceiptStoryDialog = false,
+            showFixedCostDialog = false,
+            editingFixedCostMonthKey = "",
+            showCustomDatePickerDialog = false,
+            showAddCategoryDialog = false,
+            showActiveDevicesDialog = false,
+            registeredDevices = emptyList(),
+            accessPolicyConfig = sanitizedPolicyForRole(accessPolicyConfig, role)
+        )
+    }
+
     // Navigation Tab
     fun selectTab(tab: FiltrTab) {
         if (!ensureAppAllowed()) return
+        if (_uiState.value.currentRole != "ADMIN" && tab !in STAFF_ALLOWED_TABS) {
+            _uiState.update {
+                it.copy(
+                    currentTab = if (it.currentTab in STAFF_ALLOWED_TABS) it.currentTab else FiltrTab.BILLING,
+                    snackbarMessage = "Admin access required for this section"
+                )
+            }
+            return
+        }
         _uiState.update { it.copy(currentTab = tab) }
     }
 
@@ -802,23 +937,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(orderNotes = notes) }
     }
 
+    private fun cartKeyMatches(a: MenuItemEntity, b: MenuItemEntity): Boolean {
+        return if (a.id != 0 && b.id != 0) {
+            a.id == b.id
+        } else {
+            a.id == b.id && a.name.trim().equals(b.name.trim(), ignoreCase = true)
+        }
+    }
+
+    private fun mergeIntoCart(cart: MutableMap<MenuItemEntity, Int>, item: MenuItemEntity, qtyToAdd: Int) {
+        val existingKey = cart.keys.find { cartKeyMatches(it, item) }
+        val targetItem = existingKey ?: item
+        cart[targetItem] = (cart[targetItem] ?: 0) + qtyToAdd
+    }
+
     // Cart Operations
     fun addToCart(item: MenuItemEntity) {
         if (!ensureAppAllowed()) return
         _uiState.update { state ->
-            val existingKey = state.cartItems.keys.find { it.id == item.id }
-            val targetItem = existingKey ?: item
-            val currentQty = state.cartItems[targetItem] ?: 0
-            val updatedMap = state.cartItems.toMutableMap().apply {
-                put(targetItem, currentQty + 1)
-            }
+            val updatedMap = state.cartItems.toMutableMap()
+            mergeIntoCart(updatedMap, item, 1)
             state.copy(cartItems = updatedMap)
         }
     }
 
     fun removeFromCart(item: MenuItemEntity) {
         _uiState.update { state ->
-            val existingKey = state.cartItems.keys.find { it.id == item.id } ?: item
+            val existingKey = state.cartItems.keys.find { cartKeyMatches(it, item) } ?: item
             val currentQty = state.cartItems[existingKey] ?: 0
             val updatedMap = state.cartItems.toMutableMap()
             if (currentQty > 1) {
@@ -873,21 +1018,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         voiceItems: List<com.example.voice.model.VoiceOrderLineItem>,
         notes: String? = null
     ) {
-        val currentMenu = menuItems.value
+        val availableMenu = menuItems.value.filter { it.isAvailable }
         val newCart = _uiState.value.cartItems.toMutableMap()
 
         voiceItems.forEach { vItem ->
-            val entity = currentMenu.find { it.name.trim().equals(vItem.name.trim(), ignoreCase = true) }
-                ?: currentMenu.find { it.name.contains(vItem.name.trim(), ignoreCase = true) }
-                ?: currentMenu.find { vItem.name.trim().contains(it.name, ignoreCase = true) }
+            val cleanName = vItem.name.trim()
+            val entity = availableMenu.find { it.name.trim().equals(cleanName, ignoreCase = true) }
+                ?: availableMenu.find { it.name.contains(cleanName, ignoreCase = true) }
+                ?: availableMenu.find { cleanName.contains(it.name.trim(), ignoreCase = true) }
                 ?: MenuItemEntity(
                     id = 0,
-                    name = vItem.name,
+                    name = cleanName.ifBlank { vItem.name },
                     category = "Voice Order",
                     price = vItem.unitPrice,
                     isAvailable = true
                 )
-            newCart[entity] = (newCart[entity] ?: 0) + vItem.quantity
+            mergeIntoCart(newCart, entity, vItem.quantity)
         }
 
         _uiState.update {
@@ -915,19 +1061,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isPlacingOrder = true) }
 
             try {
-                val currentMenu = menuItems.value
+                val availableMenu = menuItems.value.filter { it.isAvailable }
                 val cartMap = mutableMapOf<MenuItemEntity, Int>()
 
                 voiceItems.forEach { vItem ->
-                    val entity = currentMenu.find { it.name.equals(vItem.name, ignoreCase = true) }
+                    val cleanName = vItem.name.trim()
+                    val entity = availableMenu.find { it.name.trim().equals(cleanName, ignoreCase = true) }
                         ?: MenuItemEntity(
                             id = 0,
-                            name = vItem.name,
+                            name = cleanName.ifBlank { vItem.name },
                             category = "Voice Order",
                             price = vItem.unitPrice,
                             isAvailable = true
                         )
-                    cartMap[entity] = (cartMap[entity] ?: 0) + vItem.quantity
+                    mergeIntoCart(cartMap, entity, vItem.quantity)
                 }
 
                 if (cartMap.isEmpty()) {
@@ -1053,58 +1200,73 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Order Actions
     fun toggleOrderItemCompletedStatus(orderId: String, itemId: Int, currentCompletedQty: Int, targetUnitIndex: Int, totalQty: Int) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val newCompletedQty = if (targetUnitIndex <= currentCompletedQty) {
-                targetUnitIndex - 1
-            } else {
-                targetUnitIndex
-            }
-            val safeQty = newCompletedQty.coerceIn(0, totalQty)
-            val updatedOrder = repository.updateOrderItemCompletedQuantity(orderId, itemId, safeQty)
+            try {
+                val newCompletedQty = if (targetUnitIndex <= currentCompletedQty) {
+                    targetUnitIndex - 1
+                } else {
+                    targetUnitIndex
+                }
+                val safeQty = newCompletedQty.coerceIn(0, totalQty)
+                val updatedOrder = repository.updateOrderItemCompletedQuantity(orderId, itemId, safeQty)
 
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isNotBlank() && updatedOrder != null) {
-                repository.syncOrderToGoogleSheets(url, updatedOrder)
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isNotBlank() && updatedOrder != null) {
+                    repository.syncOrderToGoogleSheets(url, updatedOrder)
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update item status: ${e.message}") }
             }
         }
     }
 
     fun toggleOrderMadeStatus(orderWithItems: OrderWithItems) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val newStatus = !orderWithItems.order.isMade
-            repository.updateOrderMadeStatus(orderWithItems.order.orderId, newStatus)
-            _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} marked as ${if (newStatus) "Made" else "In Progress"}") }
+            try {
+                val newStatus = !orderWithItems.order.isMade
+                repository.updateOrderMadeStatus(orderWithItems.order.orderId, newStatus)
+                _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} marked as ${if (newStatus) "Made" else "In Progress"}") }
 
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isNotBlank()) {
-                val updatedOrder = orderWithItems.copy(
-                    order = orderWithItems.order.copy(isMade = newStatus)
-                )
-                repository.syncOrderToGoogleSheets(url, updatedOrder)
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isNotBlank()) {
+                    val updatedOrder = orderWithItems.copy(
+                        order = orderWithItems.order.copy(isMade = newStatus)
+                    )
+                    repository.syncOrderToGoogleSheets(url, updatedOrder)
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update order status: ${e.message}") }
             }
         }
     }
 
     fun setOrderPaymentMode(orderWithItems: OrderWithItems, paymentMode: String) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val isPaid = paymentMode == "CASH" || paymentMode == "UPI"
-            val safeMode = if (isPaid) paymentMode else "UNPAID"
-            repository.updateOrderPaidStatus(orderWithItems.order.orderId, isPaid, safeMode)
-            
-            val msg = if (isPaid) {
-                "Order #${orderWithItems.order.orderId} marked as Paid via $safeMode"
-            } else {
-                "Order #${orderWithItems.order.orderId} marked as Unpaid"
-            }
-            _uiState.update { it.copy(snackbarMessage = msg) }
+            try {
+                val isPaid = paymentMode == "CASH" || paymentMode == "UPI"
+                val safeMode = if (isPaid) paymentMode else "UNPAID"
+                repository.updateOrderPaidStatus(orderWithItems.order.orderId, isPaid, safeMode)
 
-            // Auto sync to Google Sheets if Webhook URL present
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isNotBlank()) {
-                val updatedOrder = orderWithItems.copy(
-                    order = orderWithItems.order.copy(isPaid = isPaid, paymentMode = safeMode)
-                )
-                repository.syncOrderToGoogleSheets(url, updatedOrder)
+                val msg = if (isPaid) {
+                    "Order #${orderWithItems.order.orderId} marked as Paid via $safeMode"
+                } else {
+                    "Order #${orderWithItems.order.orderId} marked as Unpaid"
+                }
+                _uiState.update { it.copy(snackbarMessage = msg) }
+
+                // Auto sync to Google Sheets if Webhook URL present
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isNotBlank()) {
+                    val updatedOrder = orderWithItems.copy(
+                        order = orderWithItems.order.copy(isPaid = isPaid, paymentMode = safeMode)
+                    )
+                    repository.syncOrderToGoogleSheets(url, updatedOrder)
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update payment: ${e.message}") }
             }
         }
     }
@@ -1118,26 +1280,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleOrderDeliveredStatus(orderWithItems: OrderWithItems) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val newStatus = !orderWithItems.order.isDelivered
-            repository.updateOrderDeliveredStatus(orderWithItems.order.orderId, newStatus)
-            _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} marked as ${if (newStatus) "Delivered" else "Pending Delivery"}") }
+            try {
+                val newStatus = !orderWithItems.order.isDelivered
+                repository.updateOrderDeliveredStatus(orderWithItems.order.orderId, newStatus)
+                _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} marked as ${if (newStatus) "Delivered" else "Pending Delivery"}") }
 
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isNotBlank()) {
-                val updatedOrder = orderWithItems.copy(
-                    order = orderWithItems.order.copy(isDelivered = newStatus)
-                )
-                repository.syncOrderToGoogleSheets(url, updatedOrder)
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isNotBlank()) {
+                    val updatedOrder = orderWithItems.copy(
+                        order = orderWithItems.order.copy(isDelivered = newStatus)
+                    )
+                    repository.syncOrderToGoogleSheets(url, updatedOrder)
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update delivery status: ${e.message}") }
             }
         }
     }
 
     fun updateOrderItems(orderWithItems: OrderWithItems, updatedItems: List<OrderItemEntity>) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            repository.updateOrderWithItems(orderWithItems, updatedItems, url)
-            _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} updated successfully!") }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                repository.updateOrderWithItems(orderWithItems, updatedItems, url)
+                _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} updated successfully!") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update order: ${e.message}") }
+            }
         }
     }
 
@@ -1148,51 +1320,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         contactNumber: String,
         notes: String = orderWithItems.order.notes
     ) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            val updatedOrderEntity = orderWithItems.order.copy(
-                customerName = customerName.trim().ifBlank { "Walk-in Customer" },
-                contactNumber = contactNumber.trim(),
-                notes = notes.trim()
-            )
-            val updatedOrder = OrderWithItems(updatedOrderEntity, orderWithItems.items)
-            repository.updateOrderWithItems(updatedOrder, updatedItems, url)
-            _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} updated successfully!") }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                val updatedOrderEntity = orderWithItems.order.copy(
+                    customerName = customerName.trim().ifBlank { "Walk-in Customer" },
+                    contactNumber = contactNumber.trim(),
+                    notes = notes.trim()
+                )
+                val updatedOrder = OrderWithItems(updatedOrderEntity, orderWithItems.items)
+                repository.updateOrderWithItems(updatedOrder, updatedItems, url)
+                _uiState.update { it.copy(snackbarMessage = "Order #${orderWithItems.order.orderId} updated successfully!") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update order: ${e.message}") }
+            }
         }
     }
 
     fun syncOrderToSheets(orderWithItems: OrderWithItems) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isBlank()) {
-                _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
-                return@launch
-            }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isBlank()) {
+                    if (_uiState.value.currentRole == "ADMIN") {
+                        _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
+                    } else {
+                        _uiState.update { it.copy(snackbarMessage = "Google Sheets sync URL not configured yet.") }
+                    }
+                    return@launch
+                }
 
-            _uiState.update { it.copy(snackbarMessage = "Syncing order #${orderWithItems.order.orderId} to Google Sheets...") }
-            val result = repository.syncOrderToGoogleSheets(url, orderWithItems)
-            if (result.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = "Synced order #${orderWithItems.order.orderId} to Google Sheets!") }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                _uiState.update { it.copy(snackbarMessage = "Syncing order #${orderWithItems.order.orderId} to Google Sheets...") }
+                val result = repository.syncOrderToGoogleSheets(url, orderWithItems)
+                if (result.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Synced order #${orderWithItems.order.orderId} to Google Sheets!") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${e.message}") }
             }
         }
     }
 
     fun syncPendingOrdersToSheets() {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isBlank()) {
-                _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
-                return@launch
-            }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isBlank()) {
+                    if (_uiState.value.currentRole == "ADMIN") {
+                        _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
+                    } else {
+                        _uiState.update { it.copy(snackbarMessage = "Google Sheets sync URL not configured yet.") }
+                    }
+                    return@launch
+                }
 
-            _uiState.update { it.copy(snackbarMessage = "Syncing unsynced / offline orders to Google Sheets...") }
-            val result = repository.syncPendingOrdersToGoogleSheets(url)
-            if (result.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = result.getOrNull() ?: "Pending orders synced successfully!") }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                _uiState.update { it.copy(snackbarMessage = "Syncing unsynced / offline orders to Google Sheets...") }
+                val result = repository.syncPendingOrdersToGoogleSheets(url)
+                if (result.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = result.getOrNull() ?: "Pending orders synced successfully!") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${e.message}") }
             }
         }
     }
@@ -1205,54 +1400,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun syncAllOrdersToSheets() {
+        if (!requireAdmin("Syncing all orders to Google Sheets")) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isBlank()) {
-                _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
-                return@launch
-            }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isBlank()) {
+                    _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
+                    return@launch
+                }
 
-            val todayMs = System.currentTimeMillis()
-            val dayOrders = ordersList.value.filter { isSameDay(it.order.timestamp, todayMs) }
+                val todayMs = System.currentTimeMillis()
+                val dayOrders = ordersList.value.filter { isSameDay(it.order.timestamp, todayMs) }
 
-            if (dayOrders.isEmpty()) {
-                _uiState.update { it.copy(snackbarMessage = "No orders found for today to sync.") }
-                return@launch
-            }
+                if (dayOrders.isEmpty()) {
+                    _uiState.update { it.copy(snackbarMessage = "No orders found for today to sync.") }
+                    return@launch
+                }
 
-            _uiState.update { it.copy(snackbarMessage = "Syncing today's ${dayOrders.size} order(s) to Google Sheets...") }
-            val result = repository.syncAllOrdersToGoogleSheets(url, dayOrders)
-            if (result.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = "Today's ${dayOrders.size} order(s) synced successfully to Google Sheets!") }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                _uiState.update { it.copy(snackbarMessage = "Syncing today's ${dayOrders.size} order(s) to Google Sheets...") }
+                val result = repository.syncAllOrdersToGoogleSheets(url, dayOrders)
+                if (result.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Today's ${dayOrders.size} order(s) synced successfully to Google Sheets!") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${e.message}") }
             }
         }
     }
 
     fun syncItemMasterToSheets() {
+        if (!requireAdmin("Syncing Item Master")) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isBlank()) {
-                _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
-                return@launch
-            }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isBlank()) {
+                    _uiState.update { it.copy(showSettingsDialog = true, snackbarMessage = "Please configure Google Sheets Webhook URL first.") }
+                    return@launch
+                }
 
-            _uiState.update { it.copy(snackbarMessage = "Syncing Item Master to Google Sheets...") }
-            val result = repository.syncItemMasterToGoogleSheets(url, menuItems.value)
-            if (result.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = "Item Master synced successfully to Google Sheets!") }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                _uiState.update { it.copy(snackbarMessage = "Syncing Item Master to Google Sheets...") }
+                val result = repository.syncItemMasterToGoogleSheets(url, menuItems.value)
+                if (result.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Item Master synced successfully to Google Sheets!") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Sync failed: ${result.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Sync failed: ${e.message}") }
             }
         }
     }
 
     fun deleteOrder(orderId: String) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            repository.deleteOrder(orderId, url)
-            _uiState.update { it.copy(snackbarMessage = "Order #$orderId deleted") }
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                repository.deleteOrder(orderId, url)
+                _uiState.update { it.copy(snackbarMessage = "Order #$orderId deleted") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to delete order: ${e.message}") }
+            }
         }
     }
 
@@ -1271,6 +1481,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun processVoiceAudio(audioBytes: ByteArray, mimeType: String = "audio/m4a", durationMs: Long = 0L) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -1282,93 +1493,112 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
-            val items = menuItems.value
-            val result = repository.parseVoiceAudio(audioBytes, mimeType, items)
+            try {
+                val items = menuItems.value
+                val result = repository.parseVoiceAudio(audioBytes, mimeType, items)
 
-            // Asynchronously dispatch voice telemetry (audio file + diagnostic JSON) to Supabase Storage voice-orders bucket
-            val timestamp = System.currentTimeMillis()
-            val timeString = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date(timestamp))
-            val baseFileName = "voice_order_${timeString}_${timestamp % 1000}"
+                // Asynchronously dispatch voice telemetry (audio file + diagnostic JSON) to Supabase Storage voice-orders bucket
+                val timestamp = System.currentTimeMillis()
+                val timeString = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(timestamp))
+                val baseFileName = "voice_order_${timeString}_${timestamp % 1000}"
 
-            viewModelScope.launch(Dispatchers.IO) {
-                try {
-                    val supabase = SupabaseService.getInstance()
-                    val audioFileName = "$baseFileName.m4a"
-                    val audioUploadResult = supabase.uploadVoiceOrderAudio(audioFileName, audioBytes)
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        val supabase = SupabaseService.getInstance()
+                        val audioFileName = "$baseFileName.m4a"
+                        val audioUploadResult = supabase.uploadVoiceOrderAudio(audioFileName, audioBytes)
 
-                    val isSuccess = result.isSuccess && result.getOrNull() != null
-                    val parsedOrder = result.getOrNull()
-                    val diagJson = org.json.JSONObject().apply {
-                        put("timestamp", timestamp)
-                        put("formattedTime", timeString)
-                        put("durationMs", durationMs)
-                        put("fileSizeBytes", audioBytes.size)
-                        put("mimeType", mimeType)
-                        put("isSuccess", isSuccess)
-                        put("audioUploaded", audioUploadResult.isSuccess)
-                        put("audioUrl", audioUploadResult.getOrNull() ?: "")
-                        put("rawTranscript", parsedOrder?.rawTranscript ?: "")
-                        put("parsedCustomerName", parsedOrder?.customerName ?: "")
-                        put("parsedContactNumber", parsedOrder?.contactNumber ?: "")
-                        put("parsedNotes", parsedOrder?.notes ?: "")
-                        val itemsArray = org.json.JSONArray()
-                        parsedOrder?.items?.forEach { item ->
-                            val itemObj = org.json.JSONObject().apply {
-                                put("name", item.menuItemName)
-                                put("quantity", item.quantity)
+                        val isSuccess = result.isSuccess && result.getOrNull() != null
+                        val parsedOrder = result.getOrNull()
+                        val diagJson = JSONObject().apply {
+                            put("timestamp", timestamp)
+                            put("formattedTime", timeString)
+                            put("durationMs", durationMs)
+                            put("fileSizeBytes", audioBytes.size)
+                            put("mimeType", mimeType)
+                            put("isSuccess", isSuccess)
+                            put("audioUploaded", audioUploadResult.isSuccess)
+                            put("audioUrl", audioUploadResult.getOrNull() ?: "")
+                            put("rawTranscript", parsedOrder?.rawTranscript ?: "")
+                            put("parsedCustomerName", parsedOrder?.customerName ?: "")
+                            put("parsedContactNumber", parsedOrder?.contactNumber ?: "")
+                            put("parsedNotes", parsedOrder?.notes ?: "")
+                            val itemsArray = JSONArray()
+                            parsedOrder?.items?.forEach { item ->
+                                val itemObj = JSONObject().apply {
+                                    put("name", item.menuItemName)
+                                    put("quantity", item.quantity)
+                                }
+                                itemsArray.put(itemObj)
                             }
-                            itemsArray.put(itemObj)
-                        }
-                        put("items", itemsArray)
-                        if (result.isFailure) {
-                            put("errorMessage", result.exceptionOrNull()?.message ?: "Unknown error")
-                        }
-                    }.toString(2)
+                            put("items", itemsArray)
+                            if (result.isFailure) {
+                                put("errorMessage", result.exceptionOrNull()?.message ?: "Unknown error")
+                            }
+                        }.toString(2)
 
-                    val diagFileName = "$baseFileName.json"
-                    supabase.uploadVoiceOrderDiagnostics(diagFileName, diagJson)
-                    Log.d("MainViewModel", "Voice telemetry uploaded successfully: $baseFileName")
-                } catch (e: Exception) {
-                    Log.w("MainViewModel", "Failed to upload voice telemetry: ${e.message}")
-                }
-            }
-
-            if (result.isSuccess && result.getOrNull() != null) {
-                val parsedOrder = result.getOrNull() ?: return@launch
-                val allMenu = menuItems.value
-                val newCart = mutableMapOf<MenuItemEntity, Int>()
-
-                parsedOrder.items.forEach { parsedItem ->
-                    val menuObj = allMenu.find { it.name.trim().equals(parsedItem.menuItemName.trim(), ignoreCase = true) }
-                        ?: allMenu.find { it.name.lowercase().contains(parsedItem.menuItemName.lowercase()) || parsedItem.menuItemName.lowercase().contains(it.name.lowercase()) }
-
-                    if (menuObj != null) {
-                        val currentQty = newCart[menuObj] ?: 0
-                        newCart[menuObj] = currentQty + parsedItem.quantity
+                        val diagFileName = "$baseFileName.json"
+                        supabase.uploadVoiceOrderDiagnostics(diagFileName, diagJson)
+                        Log.d("MainViewModel", "Voice telemetry uploaded successfully: $baseFileName")
+                    } catch (e: Exception) {
+                        Log.w("MainViewModel", "Failed to upload voice telemetry: ${e.message}")
                     }
                 }
 
-                val custName = if (parsedOrder.customerName != "Walk-in Customer" && parsedOrder.customerName.isNotBlank()) parsedOrder.customerName else "Walk-in Customer"
-                val contact = parsedOrder.contactNumber
+                if (result.isSuccess && result.getOrNull() != null) {
+                    val parsedOrder = result.getOrNull() ?: return@launch
+                    val availableMenu = menuItems.value.filter { it.isAvailable }
+                    val newCart = mutableMapOf<MenuItemEntity, Int>()
 
-                _uiState.update { state ->
-                    state.copy(
-                        isParsingVoice = false,
-                        parsedVoiceOrder = parsedOrder,
-                        showVoiceOrderReviewDialog = true,
-                        customerName = if (custName.isNotBlank()) custName else state.customerName,
-                        contactNumber = if (contact.isNotBlank()) contact else state.contactNumber,
-                        orderNotes = if (parsedOrder.notes.isNotBlank()) parsedOrder.notes else state.orderNotes,
-                        cartItems = if (newCart.isNotEmpty()) newCart else state.cartItems,
-                        snackbarMessage = "✨ Voice Order Parsed! ${newCart.values.sum()} items added for $custName"
-                    )
+                    parsedOrder.items.forEach { parsedItem ->
+                        val cleanName = parsedItem.menuItemName.trim()
+                        val menuObj = availableMenu.find { it.name.trim().equals(cleanName, ignoreCase = true) }
+                            ?: availableMenu.find {
+                                it.name.lowercase().contains(cleanName.lowercase()) ||
+                                    cleanName.lowercase().contains(it.name.lowercase())
+                            }
+
+                        if (menuObj != null) {
+                            mergeIntoCart(newCart, menuObj, parsedItem.quantity)
+                        }
+                    }
+
+                    val hasSpokenCustomer = parsedOrder.customerName.isNotBlank() &&
+                        !parsedOrder.customerName.trim().equals("Walk-in Customer", ignoreCase = true)
+                    val contact = parsedOrder.contactNumber
+
+                    _uiState.update { state ->
+                        val updatedCustomer = if (hasSpokenCustomer && newCart.isNotEmpty()) {
+                            parsedOrder.customerName.trim()
+                        } else {
+                            state.customerName
+                        }
+                        state.copy(
+                            isParsingVoice = false,
+                            parsedVoiceOrder = parsedOrder,
+                            showVoiceOrderReviewDialog = true,
+                            customerName = updatedCustomer,
+                            contactNumber = if (contact.isNotBlank() && newCart.isNotEmpty()) contact else state.contactNumber,
+                            orderNotes = if (parsedOrder.notes.isNotBlank() && newCart.isNotEmpty()) parsedOrder.notes else state.orderNotes,
+                            cartItems = if (newCart.isNotEmpty()) newCart else state.cartItems,
+                            snackbarMessage = "✨ Voice Order Parsed! ${newCart.values.sum()} items matched" +
+                                if (hasSpokenCustomer) " for ${parsedOrder.customerName.trim()}" else ""
+                        )
+                    }
+                } else {
+                    val errMsg = result.exceptionOrNull()?.message ?: "Could not parse voice recording. Please try speaking clearly."
+                    _uiState.update {
+                        it.copy(
+                            isParsingVoice = false,
+                            snackbarMessage = errMsg
+                        )
+                    }
                 }
-            } else {
-                val errMsg = result.exceptionOrNull()?.message ?: "Could not parse voice recording. Please try speaking clearly."
+            } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
                         isParsingVoice = false,
-                        snackbarMessage = errMsg
+                        snackbarMessage = "Voice parsing failed: ${e.message ?: "Unknown error"}"
                     )
                 }
             }
@@ -1376,6 +1606,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun processVoiceTranscript(transcript: String) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -1387,23 +1618,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
-            val items = menuItems.value
-            val result = repository.parseVoiceOrder(transcript, items)
+            try {
+                val items = menuItems.value
+                val result = repository.parseVoiceOrder(transcript, items)
 
-            if (result.isSuccess) {
-                val parsedOrder = result.getOrNull()
-                _uiState.update {
-                    it.copy(
-                        isParsingVoice = false,
-                        parsedVoiceOrder = parsedOrder,
-                        showVoiceOrderReviewDialog = true
-                    )
+                if (result.isSuccess) {
+                    val parsedOrder = result.getOrNull()
+                    _uiState.update {
+                        it.copy(
+                            isParsingVoice = false,
+                            parsedVoiceOrder = parsedOrder,
+                            showVoiceOrderReviewDialog = true
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isParsingVoice = false,
+                            snackbarMessage = "Could not parse voice order. Please try speaking again."
+                        )
+                    }
                 }
-            } else {
+            } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
                         isParsingVoice = false,
-                        snackbarMessage = "Could not parse voice order. Please try speaking again."
+                        snackbarMessage = "Voice parsing failed: ${e.message ?: "Unknown error"}"
                     )
                 }
             }
@@ -1422,32 +1662,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyVoiceOrderToCart(parsedOrder: ParsedVoiceOrder) {
-        val allMenu = menuItems.value
+        val availableMenu = menuItems.value.filter { it.isAvailable }
         val newCart = _uiState.value.cartItems.toMutableMap()
 
         parsedOrder.items.forEach { parsedItem ->
-            val menuObj = allMenu.find { it.name.trim().equals(parsedItem.menuItemName.trim(), ignoreCase = true) }
-                ?: allMenu.find { it.name.contains(parsedItem.menuItemName.trim(), ignoreCase = true) }
-                ?: allMenu.find { parsedItem.menuItemName.trim().contains(it.name, ignoreCase = true) }
+            val cleanName = parsedItem.menuItemName.trim()
+            val menuObj = availableMenu.find { it.name.trim().equals(cleanName, ignoreCase = true) }
+                ?: availableMenu.find { it.name.contains(cleanName, ignoreCase = true) }
+                ?: availableMenu.find { cleanName.contains(it.name.trim(), ignoreCase = true) }
             if (menuObj != null) {
-                val currentQty = newCart[menuObj] ?: 0
-                newCart[menuObj] = currentQty + parsedItem.quantity
+                mergeIntoCart(newCart, menuObj, parsedItem.quantity)
             } else {
                 val fallbackItem = MenuItemEntity(
                     id = 0,
-                    name = parsedItem.menuItemName,
+                    name = cleanName.ifBlank { parsedItem.menuItemName },
                     category = "VOICE",
                     price = 0.0,
                     description = ""
                 )
-                val currentQty = newCart[fallbackItem] ?: 0
-                newCart[fallbackItem] = currentQty + parsedItem.quantity
+                mergeIntoCart(newCart, fallbackItem, parsedItem.quantity)
             }
         }
 
+        val hasSpokenCustomer = parsedOrder.customerName.isNotBlank() &&
+            !parsedOrder.customerName.trim().equals("Walk-in Customer", ignoreCase = true)
+
         _uiState.update {
             it.copy(
-                customerName = if (parsedOrder.customerName != "Walk-in Customer" && parsedOrder.customerName.isNotBlank()) parsedOrder.customerName else it.customerName,
+                customerName = if (hasSpokenCustomer) parsedOrder.customerName.trim() else it.customerName,
                 contactNumber = if (parsedOrder.contactNumber.isNotBlank()) parsedOrder.contactNumber else it.contactNumber,
                 orderNotes = if (parsedOrder.notes.isNotBlank()) parsedOrder.notes else it.orderNotes,
                 cartItems = newCart,
@@ -1470,6 +1712,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Item Master (Menu) Actions
     fun openAddEditItemDialog(item: MenuItemEntity? = null) {
+        if (!requireAdmin("Editing menu items")) return
         _uiState.update {
             it.copy(
                 showAddEditItemDialog = true,
@@ -1488,64 +1731,70 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveMenuItem(name: String, category: String, price: Double, description: String, isAvailable: Boolean) {
+        if (!requireAdmin("Saving menu items")) return
         viewModelScope.launch {
-            val editing = _uiState.value.editingMenuItem
-            val existingMatchingItem = if (editing == null) {
-                menuItems.value.find { it.name.trim().equals(name.trim(), ignoreCase = true) }
-            } else null
+            try {
+                val editing = _uiState.value.editingMenuItem
+                val existingMatchingItem = if (editing == null) {
+                    menuItems.value.find { it.name.trim().equals(name.trim(), ignoreCase = true) }
+                } else null
 
-            val targetItem = editing ?: existingMatchingItem
-            val cleanName = name.trim()
-            val cleanCat = category.trim().uppercase()
+                val targetItem = editing ?: existingMatchingItem
+                val cleanName = name.trim()
+                val cleanCat = category.trim().uppercase()
 
-            if (targetItem != null) {
-                val oldName = targetItem.name.trim()
-                repository.updateMenuItem(
-                    targetItem.copy(
-                        name = cleanName,
-                        category = cleanCat,
-                        price = price,
-                        description = description.trim(),
-                        isAvailable = isAvailable
+                if (targetItem != null) {
+                    val oldName = targetItem.name.trim()
+                    repository.updateMenuItem(
+                        targetItem.copy(
+                            name = cleanName,
+                            category = cleanCat,
+                            price = price,
+                            description = description.trim(),
+                            isAvailable = isAvailable
+                        )
                     )
-                )
-                if (!oldName.equals(cleanName, ignoreCase = true)) {
-                    val currentOrder = _uiState.value.customItemOrder.toMutableList()
-                    val idx = currentOrder.indexOfFirst { it.equals(oldName, ignoreCase = true) }
-                    if (idx != -1) {
-                        currentOrder[idx] = cleanName
-                        saveCustomItemOrder(currentOrder)
+                    if (!oldName.equals(cleanName, ignoreCase = true)) {
+                        val currentOrder = _uiState.value.customItemOrder.toMutableList()
+                        val idx = currentOrder.indexOfFirst { it.equals(oldName, ignoreCase = true) }
+                        if (idx != -1) {
+                            currentOrder[idx] = cleanName
+                            saveCustomItemOrder(currentOrder)
+                        }
                     }
-                }
-                _uiState.update { it.copy(snackbarMessage = "Updated $cleanName") }
-            } else {
-                repository.addMenuItem(
-                    MenuItemEntity(
-                        name = cleanName,
-                        category = cleanCat,
-                        price = price,
-                        description = description.trim(),
-                        isAvailable = isAvailable
+                    _uiState.update { it.copy(snackbarMessage = "Updated $cleanName") }
+                } else {
+                    repository.addMenuItem(
+                        MenuItemEntity(
+                            name = cleanName,
+                            category = cleanCat,
+                            price = price,
+                            description = description.trim(),
+                            isAvailable = isAvailable
+                        )
                     )
-                )
-                val currentOrder = _uiState.value.customItemOrder
-                if (!currentOrder.any { it.equals(cleanName, ignoreCase = true) }) {
-                    saveCustomItemOrder(currentOrder + cleanName)
+                    val currentOrder = _uiState.value.customItemOrder
+                    if (!currentOrder.any { it.equals(cleanName, ignoreCase = true) }) {
+                        saveCustomItemOrder(currentOrder + cleanName)
+                    }
+                    _uiState.update { it.copy(snackbarMessage = "Added $cleanName to Menu") }
                 }
-                _uiState.update { it.copy(snackbarMessage = "Added $cleanName to Menu") }
-            }
 
-            // If category is not in default or custom list, auto-add to customCategories
-            val defaultCats = listOf("ALL", "ICED COFFEE", "FRAPPE", "FRIES", "SANDWICH")
-            if (cleanCat.isNotBlank() && cleanCat !in defaultCats && cleanCat !in _uiState.value.customCategories) {
-                addCustomCategory(cleanCat)
-            }
+                // If category is not in default or custom list, auto-add to customCategories
+                val defaultCats = listOf("ALL", "ICED COFFEE", "FRAPPE", "FRIES", "SANDWICH")
+                if (cleanCat.isNotBlank() && cleanCat !in defaultCats && cleanCat !in _uiState.value.customCategories) {
+                    addCustomCategory(cleanCat)
+                }
 
-            dismissAddEditItemDialog()
+                dismissAddEditItemDialog()
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save menu item: ${e.message}") }
+            }
         }
     }
 
     fun setDashboardDateFilter(filter: String) {
+        if (!requireAdmin("Dashboard analytics")) return
         _uiState.update { it.copy(dashboardDateFilter = filter) }
 
         val startMs: Long
@@ -1588,7 +1837,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             "THIS_WEEK" -> {
                 val calStart = Calendar.getInstance().apply {
-                    add(Calendar.DAY_OF_YEAR, -7)
+                    add(Calendar.DAY_OF_YEAR, -6)
                     set(Calendar.HOUR_OF_DAY, 0)
                     set(Calendar.MINUTE, 0)
                     set(Calendar.SECOND, 0)
@@ -1647,6 +1896,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Accounts / UPI Dialog Management
     fun openAccountsUpiDialog() {
+        if (!requireAdmin("UPI account management")) return
         _uiState.update { it.copy(showAccountsUpiDialog = true) }
     }
 
@@ -1655,31 +1905,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addUpiAccount(vpa: String, payeeName: String, isDefault: Boolean) {
-        if (_uiState.value.currentRole != "ADMIN") return
+        if (!requireAdmin("Adding UPI account")) return
         viewModelScope.launch {
-            repository.addUpiAccount(vpa, payeeName, isDefault)
-            _uiState.update { it.copy(snackbarMessage = "UPI ID added successfully!") }
+            try {
+                repository.addUpiAccount(vpa, payeeName, isDefault)
+                _uiState.update { it.copy(snackbarMessage = "UPI ID added successfully!") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to add UPI ID: ${e.message}") }
+            }
         }
     }
 
     fun deleteUpiAccount(account: com.example.data.entity.UpiAccountEntity) {
-        if (_uiState.value.currentRole != "ADMIN") return
+        if (!requireAdmin("Deleting UPI account")) return
         viewModelScope.launch {
-            repository.deleteUpiAccount(account)
-            _uiState.update { it.copy(snackbarMessage = "UPI ID removed.") }
+            try {
+                repository.deleteUpiAccount(account)
+                _uiState.update { it.copy(snackbarMessage = "UPI ID removed.") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to remove UPI ID: ${e.message}") }
+            }
         }
     }
 
     fun setDefaultUpiAccount(accountId: Int) {
-        if (_uiState.value.currentRole != "ADMIN") return
+        if (!requireAdmin("Setting default UPI account")) return
         viewModelScope.launch {
-            repository.setDefaultUpiAccount(accountId)
-            _uiState.update { it.copy(snackbarMessage = "Default UPI ID updated.") }
+            try {
+                repository.setDefaultUpiAccount(accountId)
+                _uiState.update { it.copy(snackbarMessage = "Default UPI ID updated.") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update default UPI ID: ${e.message}") }
+            }
         }
     }
 
     // Delete Menu Item
     fun requestDeleteMenuItem(item: MenuItemEntity) {
+        if (!requireAdmin("Deleting menu items")) return
         _uiState.update {
             it.copy(
                 itemToDeleteConfirmation = item,
@@ -1701,38 +1964,72 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun confirmDeleteMenuItem(item: MenuItemEntity) {
+        if (!requireAdmin("Deleting menu items")) return
         viewModelScope.launch {
-            repository.deleteMenuItem(item)
-            val currentOrder = _uiState.value.customItemOrder
-            val newOrder = currentOrder.filterNot { it.equals(item.name.trim(), ignoreCase = true) }
-            saveCustomItemOrder(newOrder)
-            _uiState.update {
-                it.copy(
-                    itemToDeleteConfirmation = null,
-                    itemDeleteWarningMessage = null,
-                    snackbarMessage = "Removed '${item.name}' from Item Master"
-                )
+            try {
+                val hasOrderHistory = withContext(Dispatchers.IO) {
+                    repository.hasOrderHistoryForMenuItem(item)
+                }
+                if (hasOrderHistory) {
+                    _uiState.update {
+                        it.copy(
+                            itemToDeleteConfirmation = null,
+                            itemDeleteWarningMessage = item
+                        )
+                    }
+                    return@launch
+                }
+                repository.deleteMenuItem(item)
+                val currentOrder = _uiState.value.customItemOrder
+                val newOrder = currentOrder.filterNot { it.equals(item.name.trim(), ignoreCase = true) }
+                saveCustomItemOrder(newOrder)
+                _uiState.update {
+                    it.copy(
+                        itemToDeleteConfirmation = null,
+                        itemDeleteWarningMessage = null,
+                        snackbarMessage = "Removed '${item.name}' from Item Master"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        itemToDeleteConfirmation = null,
+                        snackbarMessage = "Failed to delete item: ${e.message}"
+                    )
+                }
             }
         }
     }
 
     fun markItemUnavailable(item: MenuItemEntity) {
+        if (!requireAdmin("Updating item availability")) return
         viewModelScope.launch {
-            repository.updateMenuItem(item.copy(isAvailable = false))
-            _uiState.update {
-                it.copy(
-                    itemDeleteWarningMessage = null,
-                    snackbarMessage = "'${item.name}' marked as Unavailable to preserve order records"
-                )
+            try {
+                repository.updateMenuItem(item.copy(isAvailable = false))
+                _uiState.update {
+                    it.copy(
+                        itemDeleteWarningMessage = null,
+                        snackbarMessage = "'${item.name}' marked as Unavailable to preserve order records"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        itemDeleteWarningMessage = null,
+                        snackbarMessage = "Failed to update item: ${e.message}"
+                    )
+                }
             }
         }
     }
 
     fun requestDeleteOrder(orderId: String) {
+        if (!ensureAppAllowed()) return
         _uiState.update { it.copy(orderToDeleteConfirmation = orderId) }
     }
 
     fun confirmDeleteOrder(orderId: String) {
+        if (!ensureAppAllowed()) return
         if (_uiState.value.isDeletingOrder) return
         _uiState.update { it.copy(isDeletingOrder = true) }
         viewModelScope.launch {
@@ -1746,13 +2043,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         snackbarMessage = "Order #$orderId deleted. Syncing to Sheets..."
                     )
                 }
-                // Re-sync today's orders to Sheets — Firebase/Room is source of truth
-                // This reads from Room (in-memory), NOT Firebase — zero extra Firebase reads
-                // The syncAll handler removes orders from sheet that aren't in the list
-                // datePrefix ensures only that day's rows are cleaned (preserves historical data)
+                // Re-sync today's orders to Sheets, explicitly excluding the deleted orderId
+                // in case Room's stateIn emission hasn't flushed yet.
                 if (url.isNotBlank()) {
                     val todayMs = System.currentTimeMillis()
-                    val todayOrders = ordersList.value.filter { isSameDay(it.order.timestamp, todayMs) }
+                    val todayOrders = ordersList.value.filter {
+                        it.order.orderId != orderId && isSameDay(it.order.timestamp, todayMs)
+                    }
                     // Extract date prefix from orderId (e.g., "20260806" from "FLT-20260806-1001")
                     val datePrefix = orderId.split("-").getOrNull(1) ?: SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
                     val result = repository.syncAllOrdersToGoogleSheets(url, todayOrders, datePrefix)
@@ -1773,6 +2070,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openCustomDatePicker() {
+        if (!requireAdmin("Analytics date selection")) return
         _uiState.update { it.copy(showCustomDatePickerDialog = true) }
     }
 
@@ -1781,20 +2079,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setCustomDateRange(startMs: Long, endMs: Long) {
+        if (!requireAdmin("Analytics date selection")) return
+        val safeStart = minOf(startMs, endMs)
+        val safeEnd = maxOf(startMs, endMs)
         _uiState.update {
             it.copy(
                 dashboardDateFilter = "CUSTOM",
-                customStartDateMs = startMs,
-                customEndDateMs = endMs,
+                customStartDateMs = safeStart,
+                customEndDateMs = safeEnd,
                 showCustomDatePickerDialog = false,
                 snackbarMessage = "Fetching orders for selected range..."
             )
         }
 
         // Backfill any missing orders from Firestore for this date range
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
-                val backfilled = repository.backfillOrdersForDateRange(startMs, endMs)
+                val backfilled = repository.backfillOrdersForDateRange(safeStart, safeEnd)
                 if (backfilled > 0) {
                     _uiState.update {
                         it.copy(snackbarMessage = "$backfilled new orders synced from Firebase for selected range")
@@ -1812,25 +2113,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        syncDateRangeAnalyticsToSheets(startMs, endMs)
+        syncDateRangeAnalyticsToSheets(safeStart, safeEnd)
     }
 
     fun syncDateRangeAnalyticsToSheets(startMs: Long, endMs: Long) {
+        if (!requireAdmin("Syncing analytics")) return
         viewModelScope.launch {
-            val url = _uiState.value.googleSheetsWebhookUrl
-            if (url.isBlank()) return@launch
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isBlank()) return@launch
 
-            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-            val startStr = sdf.format(Date(startMs))
-            val endStr = sdf.format(Date(endMs))
+                val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+                val startStr = sdf.format(Date(startMs))
+                val endStr = sdf.format(Date(endMs))
 
-            val filteredOrders = ordersList.value.filter { orderWithItems ->
-                orderWithItems.order.timestamp in startMs..endMs
-            }
+                val filteredOrders = ordersList.value.filter { orderWithItems ->
+                    orderWithItems.order.timestamp in startMs..endMs
+                }
 
-            val result = repository.syncDateRangeAnalyticsToGoogleSheets(url, startStr, endStr, filteredOrders)
-            if (result.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = "Range analytics & calculations synced to Google Sheets!") }
+                val result = repository.syncDateRangeAnalyticsToGoogleSheets(url, startStr, endStr, filteredOrders)
+                if (result.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Range analytics & calculations synced to Google Sheets!") }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Sheets range analytics sync failed: ${e.message}")
             }
         }
     }
@@ -1841,6 +2147,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // Settings & Webhook
     fun openSettingsDialog() {
+        if (!requireAdmin("Settings")) return
         _uiState.update { it.copy(showSettingsDialog = true) }
     }
 
@@ -1925,6 +2232,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ==================== RECEIPT STORY & PHOTO ====================
 
     fun openReceiptStoryDialog() {
+        if (!requireAdmin("Receipt Story customization")) return
         _uiState.update { it.copy(showReceiptStoryDialog = true) }
     }
 
@@ -1939,6 +2247,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         imagePath: String,
         isEnabled: Boolean
     ) {
+        if (!requireAdmin("Receipt Story customization")) return
         prefs.edit()
             .putString("receipt_story_title", title)
             .putString("receipt_story_date", date)
@@ -1961,16 +2270,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun generateReceiptStoryNote(title: String, date: String) {
+        if (!requireAdmin("Generating receipt story note")) return
         viewModelScope.launch {
             _uiState.update { it.copy(isGeneratingStoryNote = true) }
-            val result = repository.generateStoryNote(title, date)
-            val note = result.getOrDefault("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
-            _uiState.update {
-                it.copy(
-                    receiptStoryCaption = note,
-                    isGeneratingStoryNote = false,
-                    snackbarMessage = "AI note generated!"
-                )
+            try {
+                val result = repository.generateStoryNote(title, date)
+                val note = result.getOrDefault("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
+                _uiState.update {
+                    it.copy(
+                        receiptStoryCaption = note,
+                        isGeneratingStoryNote = false,
+                        snackbarMessage = "AI note generated!"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isGeneratingStoryNote = false,
+                        snackbarMessage = "AI note generation failed: ${e.message}"
+                    )
+                }
             }
         }
     }
@@ -2069,6 +2388,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateStoryPhotoMetadata(fileName: String, title: String, date: String, caption: String) {
+        if (!requireAdmin("Receipt Story customization")) return
         val currentMap = _uiState.value.storyPhotoMetadataMap.toMutableMap()
         currentMap[fileName] = StoryPhotoMetadata(
             fileName = fileName,
@@ -2094,6 +2414,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         footerLine3: String,
         isStoryEnabled: Boolean
     ) {
+        if (!requireAdmin("Receipt design customization")) return
         prefs.edit()
             .putString("receipt_tagline", tagline)
             .putString("receipt_header_subtitle", headerSubtitle)
@@ -2127,35 +2448,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun uploadStoryPhoto(imageBytes: ByteArray, title: String = "", date: String = "", caption: String = "") {
+        if (!requireAdmin("Uploading story photo")) return
         viewModelScope.launch {
             _uiState.update { it.copy(isUploadingStoryPhoto = true) }
-            val fileName = "story_${System.currentTimeMillis()}.jpg"
-            val result = repository.uploadStoryPhoto(fileName, imageBytes)
-            if (result.isSuccess) {
-                val currentMap = _uiState.value.storyPhotoMetadataMap.toMutableMap()
-                currentMap[fileName] = StoryPhotoMetadata(
-                    fileName = fileName,
-                    title = title.ifBlank { "FILTR Moment" },
-                    date = date,
-                    caption = caption
-                )
-                saveStoryPhotoMetadataMap(currentMap)
-                val listResult = repository.listStoryPhotos()
-                val photos = listResult.getOrDefault(emptyList())
-                _uiState.update {
-                    it.copy(
-                        storyPhotoNames = photos,
-                        storyPhotoMetadataMap = currentMap,
-                        selectedStoryPhotoName = fileName,
-                        isUploadingStoryPhoto = false,
-                        snackbarMessage = "Photo uploaded and saved!"
+            try {
+                val fileName = "story_${System.currentTimeMillis()}.jpg"
+                val result = repository.uploadStoryPhoto(fileName, imageBytes)
+                if (result.isSuccess) {
+                    val currentMap = _uiState.value.storyPhotoMetadataMap.toMutableMap()
+                    currentMap[fileName] = StoryPhotoMetadata(
+                        fileName = fileName,
+                        title = title.ifBlank { "FILTR Moment" },
+                        date = date,
+                        caption = caption
                     )
+                    saveStoryPhotoMetadataMap(currentMap)
+                    val listResult = repository.listStoryPhotos()
+                    val photos = listResult.getOrDefault(emptyList())
+                    _uiState.update {
+                        it.copy(
+                            storyPhotoNames = photos,
+                            storyPhotoMetadataMap = currentMap,
+                            selectedStoryPhotoName = fileName,
+                            isUploadingStoryPhoto = false,
+                            snackbarMessage = "Photo uploaded and saved!"
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isUploadingStoryPhoto = false,
+                            snackbarMessage = "Upload failed: ${result.exceptionOrNull()?.message}"
+                        )
+                    }
                 }
-            } else {
+            } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
                         isUploadingStoryPhoto = false,
-                        snackbarMessage = "Upload failed: ${result.exceptionOrNull()?.message}"
+                        snackbarMessage = "Upload failed: ${e.message}"
                     )
                 }
             }
@@ -2163,71 +2494,113 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteStoryPhotoByName(fileName: String) {
+        if (!requireAdmin("Deleting story photo")) return
         viewModelScope.launch {
-            val result = repository.deleteStoryPhoto(fileName)
-            if (result.isSuccess) {
-                val currentMap = _uiState.value.storyPhotoMetadataMap.toMutableMap()
-                currentMap.remove(fileName)
-                saveStoryPhotoMetadataMap(currentMap)
-                _uiState.update {
-                    it.copy(
-                        storyPhotoNames = it.storyPhotoNames.filter { name -> name != fileName },
-                        storyPhotoMetadataMap = currentMap,
-                        selectedStoryPhotoName = if (it.selectedStoryPhotoName == fileName) null else it.selectedStoryPhotoName,
-                        snackbarMessage = "Photo deleted"
-                    )
+            try {
+                val result = repository.deleteStoryPhoto(fileName)
+                if (result.isSuccess) {
+                    val currentMap = _uiState.value.storyPhotoMetadataMap.toMutableMap()
+                    currentMap.remove(fileName)
+                    saveStoryPhotoMetadataMap(currentMap)
+                    _uiState.update {
+                        it.copy(
+                            storyPhotoNames = it.storyPhotoNames.filter { name -> name != fileName },
+                            storyPhotoMetadataMap = currentMap,
+                            selectedStoryPhotoName = if (it.selectedStoryPhotoName == fileName) null else it.selectedStoryPhotoName,
+                            snackbarMessage = "Photo deleted"
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(snackbarMessage = "Delete failed: ${result.exceptionOrNull()?.message}")
+                    }
                 }
-            } else {
+            } catch (e: Exception) {
                 _uiState.update {
-                    it.copy(snackbarMessage = "Delete failed: ${result.exceptionOrNull()?.message}")
+                    it.copy(snackbarMessage = "Delete failed: ${e.message}")
                 }
             }
         }
     }
 
+    private fun computeInSampleSize(width: Int, height: Int, maxDim: Int): Int {
+        var inSampleSize = 1
+        while (width / inSampleSize > maxDim || height / inSampleSize > maxDim) {
+            inSampleSize *= 2
+        }
+        return inSampleSize.coerceAtLeast(1)
+    }
+
+    private fun decodeSampledBitmapFromFile(path: String, maxDim: Int = 512): android.graphics.Bitmap? {
+        return try {
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(path, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val opts = android.graphics.BitmapFactory.Options().apply {
+                inSampleSize = computeInSampleSize(bounds.outWidth, bounds.outHeight, maxDim)
+            }
+            android.graphics.BitmapFactory.decodeFile(path, opts)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun decodeSampledBitmapFromBytes(bytes: ByteArray, maxDim: Int = 512): android.graphics.Bitmap? {
+        return try {
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val opts = android.graphics.BitmapFactory.Options().apply {
+                inSampleSize = computeInSampleSize(bounds.outWidth, bounds.outHeight, maxDim)
+            }
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /**
      * Get a random story photo bitmap and metadata for printing.
-     * Downloads a random photo from the Supabase Storage bucket.
+     * Downloads a random photo from the Supabase Storage bucket on IO thread with downsampling.
      */
-    suspend fun getRandomStoryPhotoForPrint(): StoryPhotoPrintData? {
-        val photos = _uiState.value.storyPhotoNames
+    suspend fun getRandomStoryPhotoForPrint(): StoryPhotoPrintData? = withContext(Dispatchers.IO) {
+        val state = _uiState.value
+        val photos = state.storyPhotoNames
         if (photos.isEmpty()) {
-            val localPath = _uiState.value.receiptStoryImagePath
+            val localPath = state.receiptStoryImagePath
             if (localPath.isNotBlank()) {
-                val bitmap = try {
-                    android.graphics.BitmapFactory.decodeFile(localPath)
-                } catch (e: Exception) {
-                    null
-                }
-                return if (bitmap != null) {
+                val bitmap = decodeSampledBitmapFromFile(localPath)
+                return@withContext if (bitmap != null) {
                     StoryPhotoPrintData(
                         bitmap = bitmap,
-                        title = _uiState.value.receiptStoryTitle,
-                        date = _uiState.value.receiptStoryDate,
-                        caption = _uiState.value.receiptStoryCaption
+                        title = state.receiptStoryTitle,
+                        date = state.receiptStoryDate,
+                        caption = state.receiptStoryCaption
                     )
                 } else null
             }
-            return null
+            return@withContext null
         }
 
         val randomFileName = photos.random()
-        val result = repository.downloadStoryPhoto(randomFileName)
+        val result = try {
+            repository.downloadStoryPhoto(randomFileName)
+        } catch (_: Exception) {
+            Result.failure(Exception("Download failed"))
+        }
         val bitmap = if (result.isSuccess) {
             val bytes = result.getOrNull()
-            if (bytes != null) {
-                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            } else null
+            if (bytes != null) decodeSampledBitmapFromBytes(bytes) else null
         } else null
 
-        if (bitmap == null) return null
+        if (bitmap == null) return@withContext null
 
-        val meta = _uiState.value.storyPhotoMetadataMap[randomFileName]
-        val title = meta?.title?.ifBlank { null } ?: _uiState.value.receiptStoryTitle
-        val date = meta?.date?.ifBlank { null } ?: _uiState.value.receiptStoryDate
-        val caption = meta?.caption?.ifBlank { null } ?: _uiState.value.receiptStoryCaption
+        val meta = state.storyPhotoMetadataMap[randomFileName]
+        val title = meta?.title?.ifBlank { null } ?: state.receiptStoryTitle
+        val date = meta?.date?.ifBlank { null } ?: state.receiptStoryDate
+        val caption = meta?.caption?.ifBlank { null } ?: state.receiptStoryCaption
 
-        return StoryPhotoPrintData(
+        StoryPhotoPrintData(
             bitmap = bitmap,
             title = title,
             date = date,
@@ -2242,6 +2615,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ==================== INVENTORY ====================
 
     fun openInventoryMasterDialog() {
+        if (!requireAdmin("Inventory Master")) return
         _uiState.update { it.copy(showInventoryMasterDialog = true) }
     }
 
@@ -2250,6 +2624,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAddInventoryItemDialog(item: InventoryItemEntity? = null) {
+        if (!requireAdmin("Inventory Master")) return
         _uiState.update { it.copy(showAddInventoryItemDialog = true, editingInventoryItem = item) }
     }
 
@@ -2257,30 +2632,110 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(showAddInventoryItemDialog = false, editingInventoryItem = null) }
     }
 
-    fun saveInventoryItem(name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double = 1.0) {
+    fun saveInventoryItem(
+        name: String,
+        category: String,
+        unit: String,
+        defaultPrice: Double,
+        standardQuantity: Double = 1.0,
+        initialStock: Double = 0.0
+    ) {
+        if (!ensureAppAllowed()) return
+        val cleanName = name.trim()
+        if (cleanName.isBlank()) {
+            _uiState.update { it.copy(snackbarMessage = "Item name cannot be empty") }
+            return
+        }
         viewModelScope.launch {
-            val editing = _uiState.value.editingInventoryItem
-            if (editing != null) {
-                repository.updateInventoryItem(editing.copy(name = name, category = category, unit = unit, defaultPrice = defaultPrice, standardQuantity = standardQuantity))
-                _uiState.update { it.copy(snackbarMessage = "Inventory item updated", showAddInventoryItemDialog = false, editingInventoryItem = null) }
-            } else {
-                repository.addInventoryItem(InventoryItemEntity(name = name, category = category, unit = unit, defaultPrice = defaultPrice, standardQuantity = standardQuantity))
-                _uiState.update { it.copy(snackbarMessage = "Inventory item added", showAddInventoryItemDialog = false) }
+            try {
+                val editing = _uiState.value.editingInventoryItem
+                if (editing != null) {
+                    repository.updateInventoryItem(
+                        editing.copy(
+                            name = cleanName,
+                            category = category.trim(),
+                            unit = unit.trim().ifBlank { "kg" },
+                            defaultPrice = defaultPrice,
+                            standardQuantity = standardQuantity.coerceAtLeast(1.0)
+                        )
+                    )
+                    _uiState.update { it.copy(snackbarMessage = "Inventory item updated", showAddInventoryItemDialog = false, editingInventoryItem = null) }
+                } else {
+                    repository.addInventoryItem(
+                        InventoryItemEntity(
+                            name = cleanName,
+                            category = category.trim(),
+                            unit = unit.trim().ifBlank { "kg" },
+                            defaultPrice = defaultPrice,
+                            standardQuantity = standardQuantity.coerceAtLeast(1.0),
+                            currentStock = initialStock.coerceAtLeast(0.0)
+                        )
+                    )
+                    _uiState.update { it.copy(snackbarMessage = "Inventory item added", showAddInventoryItemDialog = false) }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save inventory item: ${e.message}") }
             }
         }
     }
 
     fun updateInventoryItem(item: InventoryItemEntity) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            repository.updateInventoryItem(item)
-            _uiState.update { it.copy(snackbarMessage = "\"${item.name}\" updated successfully") }
+            try {
+                repository.updateInventoryItem(item)
+                _uiState.update { it.copy(snackbarMessage = "\"${item.name}\" updated successfully") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update item: ${e.message}") }
+            }
         }
     }
 
-    fun deleteInventoryItem(item: InventoryItemEntity) {
+    fun updateInventoryItemWithStock(item: InventoryItemEntity, newCount: Double) {
+        if (!ensureAppAllowed()) return
+        val rounded = Math.round(newCount.coerceAtLeast(0.0) * 100.0) / 100.0
         viewModelScope.launch {
-            repository.deleteInventoryItem(item)
-            _uiState.update { it.copy(snackbarMessage = "\"${item.name}\" removed from inventory master") }
+            try {
+                val updated = item.copy(currentStock = rounded)
+                repository.updateInventoryItem(updated)
+                repository.updateStock(updated.id, rounded)
+                _uiState.update { state ->
+                    state.copy(
+                        manualInventoryDraftCounts = state.manualInventoryDraftCounts - updated.id,
+                        snackbarMessage = "\"${updated.name}\" updated (${updated.unit})"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update item: ${e.message}") }
+            }
+        }
+    }
+
+    fun updateManualInventoryDraftCount(itemId: Int, newCount: Double) {
+        val rounded = Math.round(newCount.coerceAtLeast(0.0) * 100.0) / 100.0
+        _uiState.update { state ->
+            state.copy(manualInventoryDraftCounts = state.manualInventoryDraftCounts + (itemId to rounded))
+        }
+    }
+
+    fun updateManualInventoryDraftNotes(notes: String) {
+        _uiState.update { it.copy(manualInventoryDraftNotes = notes) }
+    }
+
+    fun deleteInventoryItem(item: InventoryItemEntity) {
+        if (!requireAdmin("Deleting inventory items")) return
+        viewModelScope.launch {
+            try {
+                repository.deleteInventoryItem(item)
+                _uiState.update { state ->
+                    state.copy(
+                        manualInventoryDraftCounts = state.manualInventoryDraftCounts - item.id,
+                        snackbarMessage = "\"${item.name}\" removed from inventory master"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to delete inventory item: ${e.message}") }
+            }
         }
     }
 
@@ -2289,64 +2744,77 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         staffNotes: String,
         onComplete: (Boolean) -> Unit = {}
     ) {
+        if (!ensureAppAllowed()) {
+            onComplete(false)
+            return
+        }
         viewModelScope.launch {
             try {
-                // Update Room DB current stock for items
-                for ((itemId, stock) in stockMap) {
-                    repository.updateStock(itemId, stock)
-                }
+                val currentState = _uiState.value
+                val allItems = inventoryItems.value
+                val activeIds = allItems.filter { it.isActive }.map { it.id }.toSet()
+                val validStockMap = stockMap.filterKeys { it in activeIds }
 
-                // Format a daily closing log
-                val sdf = SimpleDateFormat("yyyyMMdd", Locale.US)
-                val timeSdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-                val todayStr = sdf.format(Date())
-                val nowStr = timeSdf.format(Date())
-                val deviceName = _uiState.value.operatorName.ifBlank { currentDeviceModel.ifBlank { "Staff Terminal" } }
-
-                val auditObj = JSONObject().apply {
-                    put("date", todayStr)
-                    put("timestamp", nowStr)
-                    put("device", deviceName)
-                    put("role", _uiState.value.currentRole)
-                    put("notes", staffNotes.trim())
-                    val itemsArr = JSONArray()
-                    val allItems = inventoryItems.value
-                    for ((itemId, stock) in stockMap) {
-                        val itm = allItems.find { it.id == itemId }
-                        if (itm != null) {
-                            itemsArr.put(JSONObject().apply {
-                                put("id", itemId)
-                                put("name", itm.name)
-                                put("category", itm.category)
-                                put("unit", itm.unit)
-                                put("closingStock", stock)
-                            })
-                        }
+                withContext(Dispatchers.IO) {
+                    // Update Room DB current stock for active items
+                    for ((itemId, stock) in validStockMap) {
+                        repository.updateStock(itemId, stock.coerceAtLeast(0.0))
                     }
-                    put("items", itemsArr)
-                }
 
-                val auditJson = auditObj.toString()
+                    // Format a daily closing log
+                    val sdf = SimpleDateFormat("yyyyMMdd", Locale.US)
+                    val timeSdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                    val todayStr = sdf.format(Date())
+                    val nowStr = timeSdf.format(Date())
+                    val deviceName = currentState.operatorName.ifBlank { currentDeviceModel.ifBlank { "Staff Terminal" } }
 
-                // Save locally to SharedPreferences for quick recall
-                prefs.edit()
-                    .putString("last_closing_inventory_notes", staffNotes.trim())
-                    .putString("last_closing_inventory_date", todayStr)
-                    .putString("closing_inventory_$todayStr", auditJson)
-                    .apply()
+                    val auditObj = JSONObject().apply {
+                        put("date", todayStr)
+                        put("timestamp", nowStr)
+                        put("device", deviceName)
+                        put("role", currentState.currentRole)
+                        put("notes", staffNotes.trim())
+                        val itemsArr = JSONArray()
+                        for ((itemId, stock) in validStockMap) {
+                            val itm = allItems.find { it.id == itemId }
+                            if (itm != null) {
+                                itemsArr.put(JSONObject().apply {
+                                    put("id", itemId)
+                                    put("name", itm.name)
+                                    put("category", itm.category)
+                                    put("unit", itm.unit)
+                                    put("closingStock", stock.coerceAtLeast(0.0))
+                                })
+                            }
+                        }
+                        put("items", itemsArr)
+                    }
 
-                // Sync to Supabase sync_metadata so admin can see staff closing notes from anywhere
-                try {
-                    SupabaseService.getInstance().saveSyncMetadata(
-                        "closing_inventory_$todayStr",
-                        auditJson
-                    )
-                } catch (e: Exception) {
-                    Log.w("MainViewModel", "Remote closing audit sync failed: ${e.message}")
+                    val auditJson = auditObj.toString()
+
+                    // Save locally to SharedPreferences for quick recall
+                    prefs.edit()
+                        .putString("last_closing_inventory_notes", staffNotes.trim())
+                        .putString("last_closing_inventory_date", todayStr)
+                        .putString("closing_inventory_$todayStr", auditJson)
+                        .apply()
+
+                    // Sync to Supabase sync_metadata so admin can see staff closing notes from anywhere
+                    try {
+                        SupabaseService.getInstance().saveSyncMetadata(
+                            "closing_inventory_$todayStr",
+                            auditJson
+                        )
+                    } catch (e: Exception) {
+                        Log.w("MainViewModel", "Remote closing audit sync failed: ${e.message}")
+                    }
                 }
 
                 _uiState.update {
-                    it.copy(snackbarMessage = "Closing inventory & staff notes saved successfully!")
+                    it.copy(
+                        manualInventoryDraftCounts = emptyMap(),
+                        snackbarMessage = "Closing inventory & staff notes saved successfully!"
+                    )
                 }
                 onComplete(true)
             } catch (e: Exception) {
@@ -2364,6 +2832,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAddInventoryOrderDialog() {
+        if (!requireAdmin("Creating purchase orders")) return
         _uiState.update { it.copy(showAddInventoryOrderDialog = true) }
     }
 
@@ -2374,58 +2843,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun saveInventoryOrder(
         supplierName: String,
         notes: String,
-        items: List<Triple<String, Double, Double>> // (itemName, quantity, unitPrice)
+        items: List<InventoryOrderItemInput>
     ) {
+        if (!requireAdmin("Saving purchase orders")) return
         viewModelScope.launch {
-            val orderId = repository.getNextInventoryOrderId()
-            val totalAmount = items.sumOf { it.second * it.third }
-
-            val orderEntity = InventoryOrderEntity(
-                orderId = orderId,
-                timestamp = System.currentTimeMillis(),
-                supplierName = supplierName,
-                totalAmount = totalAmount,
-                notes = notes
-            )
-
-            // Filter out blank items
-            val validItems = items.filter { it.first.isNotBlank() }
-            if (validItems.isEmpty()) {
-                _uiState.update { it.copy(snackbarMessage = "No valid items to save") }
-                return@launch
-            }
-
-            val orderItems = validItems.map { (name, qty, price) ->
-                InventoryOrderItemEntity(
-                    orderId = orderId,
-                    itemName = name,
-                    quantity = qty,
-                    unitPrice = price,
-                    subtotal = qty * price
-                )
-            }
-
-            // Auto-add new items to inventory master BEFORE creating the order
-            // so that addInventoryOrder can find them and add stock correctly
-            for ((name, _, price) in validItems) {
-                val existing = repository.getInventoryItemByName(name)
-                if (existing == null) {
-                    repository.addInventoryItem(InventoryItemEntity(name = name, defaultPrice = price))
+            try {
+                // Filter out blank names and non-positive quantities
+                val validItems = items.filter { it.itemName.isNotBlank() && it.quantity > 0.0 }
+                if (validItems.isEmpty()) {
+                    _uiState.update { it.copy(snackbarMessage = "Add at least one item with valid quantity") }
+                    return@launch
                 }
-            }
 
-            repository.addInventoryOrder(orderEntity, orderItems)
+                val orderId = repository.getNextInventoryOrderId()
+                val totalAmount = validItems.sumOf { it.quantity * it.unitPrice }
 
-            _uiState.update {
-                it.copy(
-                    showAddInventoryOrderDialog = false,
-                    snackbarMessage = "Inventory order $orderId saved (${validItems.size} items, ₹${"%.0f".format(totalAmount)})"
+                val orderEntity = InventoryOrderEntity(
+                    orderId = orderId,
+                    timestamp = System.currentTimeMillis(),
+                    supplierName = supplierName.trim(),
+                    totalAmount = totalAmount,
+                    notes = notes.trim()
                 )
+
+                val orderItems = validItems.map { item ->
+                    val cleanName = item.itemName.trim()
+                    val cleanUnit = item.unit.trim().ifBlank { "kg" }
+                    InventoryOrderItemEntity(
+                        orderId = orderId,
+                        itemName = cleanName,
+                        quantity = item.quantity,
+                        unit = cleanUnit,
+                        unitPrice = item.unitPrice,
+                        subtotal = item.quantity * item.unitPrice
+                    )
+                }
+
+                // Auto-add new items to inventory master BEFORE creating the order
+                // so that addInventoryOrder can find them and add stock correctly
+                for (item in validItems) {
+                    val cleanName = item.itemName.trim()
+                    val existing = repository.getInventoryItemByName(cleanName)
+                    if (existing == null) {
+                        repository.addInventoryItem(
+                            InventoryItemEntity(
+                                name = cleanName,
+                                unit = item.unit.trim().ifBlank { "kg" },
+                                defaultPrice = item.unitPrice
+                            )
+                        )
+                    }
+                }
+
+                repository.addInventoryOrder(orderEntity, orderItems)
+
+                _uiState.update {
+                    it.copy(
+                        showAddInventoryOrderDialog = false,
+                        snackbarMessage = "Inventory order $orderId saved (${validItems.size} items, ₹${"%.0f".format(totalAmount)})"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save inventory order: ${e.message}") }
             }
         }
     }
 
     fun requestDeleteInventoryOrder(orderId: String) {
+        if (!requireAdmin("Deleting purchase orders")) return
         _uiState.update { it.copy(inventoryOrderToDelete = orderId) }
     }
 
@@ -2434,22 +2919,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun confirmDeleteInventoryOrder(orderId: String) {
+        if (!requireAdmin("Deleting purchase orders")) return
         viewModelScope.launch {
-            repository.deleteInventoryOrder(orderId)
-            _uiState.update { it.copy(inventoryOrderToDelete = null, snackbarMessage = "Inventory order $orderId deleted") }
+            try {
+                repository.deleteInventoryOrder(orderId)
+                _uiState.update { it.copy(inventoryOrderToDelete = null, snackbarMessage = "Inventory order $orderId deleted") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(inventoryOrderToDelete = null, snackbarMessage = "Failed to delete order: ${e.message}") }
+            }
         }
     }
 
     // ==================== INVENTORIES (STOCK) ====================
 
     fun updateStockLevel(itemId: Int, newStock: Double) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch {
-            repository.updateStock(itemId, newStock)
-            _uiState.update { it.copy(editingStockItemId = null, snackbarMessage = "Stock updated") }
+            try {
+                repository.updateStock(itemId, newStock.coerceAtLeast(0.0))
+                _uiState.update { state ->
+                    state.copy(
+                        editingStockItemId = null,
+                        manualInventoryDraftCounts = state.manualInventoryDraftCounts - itemId,
+                        snackbarMessage = "Stock updated"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update stock: ${e.message}") }
+            }
         }
     }
 
     fun startEditingStock(itemId: Int) {
+        if (!requireAdmin("Editing inventory stock")) return
         _uiState.update { it.copy(editingStockItemId = itemId) }
     }
 
@@ -2458,6 +2960,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAddStockDialog(item: InventoryItemEntity) {
+        if (!requireAdmin("Adding stock packs")) return
         _uiState.update { it.copy(showAddStockDialog = true, addStockItem = item) }
     }
 
@@ -2466,15 +2969,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addStockPacks(itemId: Int, packsToAdd: Double) {
+        if (!requireAdmin("Adding stock packs")) return
+        if (packsToAdd <= 0.0) return
         viewModelScope.launch {
-            repository.addStock(itemId, packsToAdd)
-            _uiState.update { it.copy(showAddStockDialog = false, addStockItem = null, snackbarMessage = "Stock added: +$packsToAdd packs") }
+            try {
+                repository.addStock(itemId, packsToAdd)
+                _uiState.update { it.copy(showAddStockDialog = false, addStockItem = null, snackbarMessage = "Stock added: +$packsToAdd packs") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to add stock: ${e.message}") }
+            }
         }
     }
 
     // ==================== INVENTORY USAGE (RECIPES) ====================
 
     fun openUsagePerSkuDialog(menuItemId: Int, menuItemName: String) {
+        if (!requireAdmin("Editing recipes")) return
         _uiState.update { it.copy(showUsagePerSkuDialog = true, usageEditingMenuItemId = menuItemId, usageEditingMenuItemName = menuItemName) }
     }
 
@@ -2483,67 +2993,130 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveUsage(menuItemId: Int, menuItemName: String, inventoryItemId: Int, inventoryItemName: String, quantityUsed: Double, unit: String) {
+        if (!requireAdmin("Saving recipes")) return
         viewModelScope.launch {
-            // Check for existing usage to avoid duplicates
-            val existing = repository.getUsageForMenuAndInventoryItem(menuItemId, inventoryItemId)
-            if (existing != null) {
-                // Update existing record instead of creating duplicate
-                repository.updateUsage(existing.copy(quantityUsed = quantityUsed, unit = unit, inventoryItemName = inventoryItemName, menuItemName = menuItemName))
-                _uiState.update { it.copy(snackbarMessage = "$inventoryItemName usage updated for $menuItemName") }
-            } else {
-                // Create new record
-                repository.saveUsage(
-                    InventoryUsageEntity(
-                        menuItemId = menuItemId,
-                        menuItemName = menuItemName,
-                        inventoryItemId = inventoryItemId,
-                        inventoryItemName = inventoryItemName,
-                        quantityUsed = quantityUsed,
-                        unit = unit
+            try {
+                // Check for existing usage to avoid duplicates
+                val existing = repository.getUsageForMenuAndInventoryItem(menuItemId, inventoryItemId)
+                if (existing != null) {
+                    // Update existing record instead of creating duplicate
+                    repository.updateUsage(existing.copy(quantityUsed = quantityUsed, unit = unit, inventoryItemName = inventoryItemName, menuItemName = menuItemName))
+                    _uiState.update { it.copy(snackbarMessage = "$inventoryItemName usage updated for $menuItemName") }
+                } else {
+                    // Create new record
+                    repository.saveUsage(
+                        InventoryUsageEntity(
+                            menuItemId = menuItemId,
+                            menuItemName = menuItemName,
+                            inventoryItemId = inventoryItemId,
+                            inventoryItemName = inventoryItemName,
+                            quantityUsed = quantityUsed,
+                            unit = unit
+                        )
                     )
-                )
-                _uiState.update { it.copy(snackbarMessage = "$inventoryItemName usage saved for $menuItemName") }
+                    _uiState.update { it.copy(snackbarMessage = "$inventoryItemName usage saved for $menuItemName") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save recipe usage: ${e.message}") }
             }
         }
     }
 
     fun deleteUsage(usage: InventoryUsageEntity) {
+        if (!requireAdmin("Deleting recipe usage")) return
         viewModelScope.launch {
-            repository.deleteUsage(usage)
-            _uiState.update { it.copy(snackbarMessage = "${usage.inventoryItemName} removed from ${usage.menuItemName} recipe") }
+            try {
+                repository.deleteUsage(usage)
+                _uiState.update { it.copy(snackbarMessage = "${usage.inventoryItemName} removed from ${usage.menuItemName} recipe") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to delete recipe usage: ${e.message}") }
+            }
         }
     }
 
     // ==================== CUSTOMER MANAGEMENT ====================
 
     fun addCustomer(name: String, contact: String) {
+        if (!requireAdmin("Adding customers")) return
         viewModelScope.launch {
-            val result = repository.saveCustomer(name.trim(), contact.trim())
-            if (result.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = "Customer '${name.trim()}' added") }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = result.exceptionOrNull()?.message ?: "Failed to add customer") }
+            try {
+                val result = repository.saveCustomer(name.trim(), contact.trim())
+                if (result.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Customer '${name.trim()}' added") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = result.exceptionOrNull()?.message ?: "Failed to add customer") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to add customer: ${e.message}") }
             }
         }
     }
 
     fun updateExistingCustomer(customer: CustomerEntity) {
+        if (!requireAdmin("Updating customers")) return
         viewModelScope.launch {
-            repository.updateCustomer(customer)
-            _uiState.update { it.copy(snackbarMessage = "Customer '${customer.name}' updated") }
+            try {
+                repository.updateCustomer(customer)
+                _uiState.update { it.copy(snackbarMessage = "Customer '${customer.name}' updated") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update customer: ${e.message}") }
+            }
         }
     }
 
     fun deleteCustomer(customer: CustomerEntity) {
+        if (!requireAdmin("Deleting customers")) return
         viewModelScope.launch {
-            repository.deleteCustomer(customer)
-            _uiState.update { it.copy(snackbarMessage = "Customer '${customer.name}' deleted") }
+            try {
+                repository.deleteCustomer(customer)
+                _uiState.update { it.copy(snackbarMessage = "Customer '${customer.name}' deleted") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to delete customer: ${e.message}") }
+            }
+        }
+    }
+
+    fun settleAllCustomerOrders(
+        customerName: String,
+        pendingOrders: List<OrderWithItems>,
+        paymentMode: String
+    ) {
+        if (!requireAdmin("Settling customer dues")) return
+        if (pendingOrders.isEmpty()) return
+        val safeMode = if (paymentMode == "CASH" || paymentMode == "UPI") paymentMode else "CASH"
+        viewModelScope.launch {
+            var settledCount = 0
+            try {
+                val url = _uiState.value.googleSheetsWebhookUrl
+                for (orderWithItems in pendingOrders) {
+                    repository.updateOrderPaidStatus(orderWithItems.order.orderId, true, safeMode)
+                    settledCount++
+                    if (url.isNotBlank()) {
+                        val updatedOrder = orderWithItems.copy(
+                            order = orderWithItems.order.copy(isPaid = true, paymentMode = safeMode)
+                        )
+                        try {
+                            repository.syncOrderToGoogleSheets(url, updatedOrder)
+                        } catch (syncEx: Exception) {
+                            Log.w(TAG, "Sheets sync skipped for ${orderWithItems.order.orderId}: ${syncEx.message}")
+                        }
+                    }
+                }
+                _uiState.update {
+                    it.copy(snackbarMessage = "Settled $settledCount due order(s) for $customerName via $safeMode")
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(snackbarMessage = "Settled $settledCount order(s); failed on remaining: ${e.message}")
+                }
+            }
         }
     }
 
     // ==================== FIXED COSTS & P&L ====================
 
     fun openFixedCostDialog(monthKey: String = "") {
+        if (!requireAdmin("Managing fixed costs")) return
         val targetMonth = if (monthKey.isNotBlank()) monthKey else {
             SimpleDateFormat("yyyy-MM", Locale.getDefault()).format(Date())
         }
@@ -2560,21 +3133,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveFixedCost(cost: FixedCostEntity) {
+        if (!requireAdmin("Saving fixed costs")) return
         viewModelScope.launch {
-            repository.saveFixedCost(cost)
-            _uiState.update {
-                it.copy(
-                    showFixedCostDialog = false,
-                    snackbarMessage = "Fixed costs for ${cost.monthKey} saved (₹${"%,.0f".format(cost.totalFixedCost)}/mo)"
-                )
+            try {
+                repository.saveFixedCost(cost)
+                _uiState.update {
+                    it.copy(
+                        showFixedCostDialog = false,
+                        snackbarMessage = "Fixed costs for ${cost.monthKey} saved (₹${"%,.0f".format(cost.totalFixedCost)}/mo)"
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save fixed costs: ${e.message}") }
             }
         }
     }
 
     fun deleteFixedCost(monthKey: String) {
+        if (!requireAdmin("Deleting fixed costs")) return
         viewModelScope.launch {
-            repository.deleteFixedCost(monthKey)
-            _uiState.update { it.copy(snackbarMessage = "Fixed costs for $monthKey deleted") }
+            try {
+                repository.deleteFixedCost(monthKey)
+                _uiState.update { it.copy(snackbarMessage = "Fixed costs for $monthKey deleted") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to delete fixed costs: ${e.message}") }
+            }
         }
     }
 
@@ -2583,6 +3166,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastUpdateCheckMs = 0L
 
     fun onActivityResumed() {
+        refreshDateKeyIfNeeded()
         if (_uiState.value.isForceUpdate) {
             _uiState.update { it.copy(showAppUpdateDialog = true) }
             return
@@ -2731,6 +3315,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveGitHubUpdateSettings(owner: String, repo: String, token: String) {
+        if (!requireAdmin("GitHub update settings")) return
         val cleanOwner = owner.trim().ifBlank { GitHubUpdateService.DEFAULT_REPO_OWNER }
         val cleanRepo = repo.trim().ifBlank { GitHubUpdateService.DEFAULT_REPO_NAME }
         val cleanToken = token.trim()
@@ -2756,8 +3341,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ==========================================
 
     fun toggleChecklistTask(taskId: String) {
+        if (!ensureAppAllowed()) return
+        val activeKey = _activeDateKey.value
+        val operator = _uiState.value.operatorName.ifBlank { _uiState.value.currentRole }
         viewModelScope.launch(Dispatchers.IO) {
-            repository.toggleChecklistTask(taskId, todayDateKey, "Staff")
+            try {
+                repository.toggleChecklistTask(taskId, activeKey, operator)
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to update task: ${e.message}") }
+            }
         }
     }
 
@@ -2774,6 +3366,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAddChecklistTaskDialog() {
+        if (!ensureAppAllowed()) return
         _uiState.update { it.copy(showAddChecklistTaskDialog = true) }
     }
 
@@ -2782,43 +3375,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addChecklistTask(title: String, section: String, notes: String = "") {
+        if (!ensureAppAllowed()) return
         if (title.isBlank()) return
         viewModelScope.launch(Dispatchers.IO) {
-            val sectionMap = mapOf(
-                "OPENING" to Pair("01_OPENING", "01. Opening & Daily Preparation"),
-                "01_OPENING" to Pair("01_OPENING", "01. Opening & Daily Preparation"),
-                "CLEANING" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
-                "HYGIENE" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
-                "02_CLEANING" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
-                "ROUTINE" to Pair("03_ROUTINE", "03. Routine Store Checks"),
-                "03_ROUTINE" to Pair("03_ROUTINE", "03. Routine Store Checks"),
-                "CLOSING" to Pair("04_CLOSING", "04. Closing Checklist"),
-                "04_CLOSING" to Pair("04_CLOSING", "04. Closing Checklist"),
-                "GENERAL" to Pair("05_GENERAL", "05. General Tasks"),
-                "05_GENERAL" to Pair("05_GENERAL", "05. General Tasks")
-            )
-            val (secId, secName) = sectionMap[section] ?: Pair(section, section)
-            repository.addChecklistTask(
-                sectionId = secId,
-                sectionName = secName,
-                title = title.trim(),
-                description = notes.trim()
-            )
-            withContext(Dispatchers.Main) {
-                dismissAddChecklistTaskDialog()
+            try {
+                val sectionMap = mapOf(
+                    "OPENING" to Pair("01_OPENING", "01. Opening & Daily Preparation"),
+                    "01_OPENING" to Pair("01_OPENING", "01. Opening & Daily Preparation"),
+                    "CLEANING" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
+                    "HYGIENE" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
+                    "02_CLEANING" to Pair("02_CLEANING", "02. Cleaning & Store Hygiene"),
+                    "ROUTINE" to Pair("03_ROUTINE", "03. Routine Store Checks"),
+                    "03_ROUTINE" to Pair("03_ROUTINE", "03. Routine Store Checks"),
+                    "CLOSING" to Pair("04_CLOSING", "04. Closing Checklist"),
+                    "04_CLOSING" to Pair("04_CLOSING", "04. Closing Checklist"),
+                    "GENERAL" to Pair("05_GENERAL", "05. General Tasks"),
+                    "05_GENERAL" to Pair("05_GENERAL", "05. General Tasks")
+                )
+                val (secId, secName) = sectionMap[section] ?: Pair(section, section)
+                repository.addChecklistTask(
+                    sectionId = secId,
+                    sectionName = secName,
+                    title = title.trim(),
+                    description = notes.trim()
+                )
+                withContext(Dispatchers.Main) {
+                    dismissAddChecklistTaskDialog()
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to add task: ${e.message}") }
             }
         }
     }
 
     fun deleteChecklistTask(task: ChecklistTaskEntity) {
+        if (!ensureAppAllowed()) return
         viewModelScope.launch(Dispatchers.IO) {
-            repository.deleteChecklistTask(task)
+            try {
+                repository.deleteChecklistTask(task)
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to delete task: ${e.message}") }
+            }
         }
     }
 
     fun refreshChecklist() {
+        refreshDateKeyIfNeeded()
+        val activeKey = _activeDateKey.value
         viewModelScope.launch(Dispatchers.IO) {
-            repository.reconcileChecklistFromCloud(todayDateKey)
+            try {
+                repository.reconcileChecklistFromCloud(activeKey)
+            } catch (e: Exception) {
+                Log.w(TAG, "Checklist refresh failed: ${e.message}")
+            }
         }
     }
 
@@ -2852,6 +3461,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (remoteReg != null) {
                 effectiveStatus = when {
                     remoteReg.status == "REVOKED" -> "REVOKED"
+                    remoteReg.status == "PENDING" -> "PENDING"
                     remoteReg.status == "ACTIVE" && localStatus == "PENDING" -> "ACTIVE"
                     else -> localStatus
                 }
@@ -2866,11 +3476,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             _uiState.update {
-                it.copy(
+                val updated = it.copy(
                     deviceAccessStatus = effectiveStatus,
-                    accessPolicyConfig = policy,
+                    accessPolicyConfig = sanitizedPolicyForRole(policy, currentRole),
                     currentRole = currentRole
                 )
+                if (effectiveStatus != "ACTIVE" || currentRole != "ADMIN") {
+                    updated.resetRestrictedStateForRole(currentRole)
+                } else {
+                    updated
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "syncDeviceAccessHeartbeat skipped (offline?): ${e.message}")
@@ -2883,7 +3498,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isVerifyingAccess = true, accessGateError = "") }
             try {
                 val supabase = SupabaseService.getInstance()
-                val policy = supabase.fetchAccessPolicyConfig()
+                val policy = withContext(Dispatchers.IO) { supabase.fetchAccessPolicyConfig() }
                 val cleanCode = passcode.trim()
 
                 val (authenticatedRole, targetStatus) = when {
@@ -2905,19 +3520,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                val remoteReg = supabase.syncDeviceHeartbeat(
-                    deviceId = currentDeviceId,
-                    appRole = authenticatedRole,
-                    operatorName = operatorName.trim(),
-                    deviceModel = currentDeviceModel,
-                    androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
-                    appVersionName = BuildConfig.VERSION_NAME,
-                    appVersionCode = BuildConfig.VERSION_CODE,
-                    localStatus = targetStatus,
-                    passcodeEpoch = policy.passcodeEpoch
-                )
+                val remoteReg = withContext(Dispatchers.IO) {
+                    supabase.syncDeviceHeartbeat(
+                        deviceId = currentDeviceId,
+                        appRole = authenticatedRole,
+                        operatorName = operatorName.trim(),
+                        deviceModel = currentDeviceModel,
+                        androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                        appVersionName = BuildConfig.VERSION_NAME,
+                        appVersionCode = BuildConfig.VERSION_CODE,
+                        localStatus = targetStatus,
+                        passcodeEpoch = policy.passcodeEpoch
+                    )
+                }
 
-                val finalStatus = if (remoteReg?.status == "REVOKED") "REVOKED" else targetStatus
+                val finalStatus = when (remoteReg?.status) {
+                    "REVOKED" -> "REVOKED"
+                    "PENDING" -> "PENDING"
+                    else -> targetStatus
+                }
                 prefs.edit()
                     .putString("device_access_status", finalStatus)
                     .putString("device_operator_name", operatorName.trim())
@@ -2926,14 +3547,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     .apply()
 
                 _uiState.update {
-                    it.copy(
+                    val base = it.copy(
                         isVerifyingAccess = false,
                         deviceAccessStatus = finalStatus,
                         operatorName = operatorName.trim(),
                         currentRole = authenticatedRole,
                         accessGateError = "",
-                        accessPolicyConfig = policy
+                        accessPolicyConfig = sanitizedPolicyForRole(policy, authenticatedRole)
                     )
+                    base.resetRestrictedStateForRole(authenticatedRole)
                 }
             } catch (e: Exception) {
                 _uiState.update {
@@ -2946,36 +3568,96 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun elevateToAdmin(passcode: String): Boolean {
-        val policy = _uiState.value.accessPolicyConfig
-        if (!passcode.trim().equals(policy.adminPasscode.trim(), ignoreCase = false)) {
-            return false
+    fun elevateToAdmin(
+        passcode: String,
+        onResult: (success: Boolean, message: String) -> Unit
+    ) {
+        val cleanCode = passcode.trim()
+        if (cleanCode.isBlank()) {
+            onResult(false, "Please enter the Admin Passcode")
+            return
         }
-        prefs.edit().putString("authenticated_role", "ADMIN").apply()
-        _uiState.update { it.copy(currentRole = "ADMIN", snackbarMessage = "Elevated to Admin Mode") }
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             try {
-                SupabaseService.getInstance().syncDeviceHeartbeat(
-                    deviceId = currentDeviceId,
-                    appRole = "ADMIN",
-                    operatorName = _uiState.value.operatorName,
-                    deviceModel = currentDeviceModel,
-                    androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
-                    appVersionName = BuildConfig.VERSION_NAME,
-                    appVersionCode = BuildConfig.VERSION_CODE,
-                    localStatus = _uiState.value.deviceAccessStatus,
-                    passcodeEpoch = _uiState.value.accessPolicyConfig.passcodeEpoch
-                )
+                val supabase = SupabaseService.getInstance()
+                val policy = withContext(Dispatchers.IO) { supabase.fetchAccessPolicyConfig() }
+
+                if (!cleanCode.equals(policy.adminPasscode.trim(), ignoreCase = false)) {
+                    onResult(false, "Incorrect Admin Passcode")
+                    return@launch
+                }
+
+                val targetStatus = if (policy.requireOwnerApprovalForAdmin) "PENDING" else "ACTIVE"
+                val remoteReg = withContext(Dispatchers.IO) {
+                    supabase.syncDeviceHeartbeat(
+                        deviceId = currentDeviceId,
+                        appRole = "ADMIN",
+                        operatorName = _uiState.value.operatorName,
+                        deviceModel = currentDeviceModel,
+                        androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                        appVersionName = BuildConfig.VERSION_NAME,
+                        appVersionCode = BuildConfig.VERSION_CODE,
+                        localStatus = targetStatus,
+                        passcodeEpoch = policy.passcodeEpoch
+                    )
+                }
+
+                val finalStatus = when (remoteReg?.status) {
+                    "REVOKED" -> "REVOKED"
+                    "PENDING" -> "PENDING"
+                    else -> targetStatus
+                }
+
+                if (finalStatus == "REVOKED") {
+                    prefs.edit()
+                        .putString("device_access_status", "REVOKED")
+                        .putString("authenticated_role", "STAFF")
+                        .apply()
+                    _uiState.update {
+                        it.copy(
+                            deviceAccessStatus = "REVOKED",
+                            currentRole = "STAFF"
+                        ).resetRestrictedStateForRole("STAFF")
+                    }
+                    onResult(false, "Device access has been revoked by Owner")
+                    return@launch
+                }
+
+                prefs.edit()
+                    .putString("authenticated_role", "ADMIN")
+                    .putString("device_access_status", finalStatus)
+                    .putInt("device_passcode_epoch", policy.passcodeEpoch)
+                    .apply()
+
+                _uiState.update {
+                    val next = it.copy(
+                        currentRole = "ADMIN",
+                        deviceAccessStatus = finalStatus,
+                        accessPolicyConfig = sanitizedPolicyForRole(policy, "ADMIN"),
+                        snackbarMessage = if (finalStatus == "ACTIVE") {
+                            "Elevated to Admin Mode"
+                        } else {
+                            "Admin access requires Owner approval — pending confirmation"
+                        }
+                    )
+                    if (finalStatus != "ACTIVE") next.resetRestrictedStateForRole("STAFF") else next
+                }
+                onResult(true, if (finalStatus == "ACTIVE") "Elevated to Admin Mode" else "Pending Owner approval")
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to sync admin elevation heartbeat: ${e.message}")
+                Log.w(TAG, "Admin elevation failed: ${e.message}")
+                onResult(false, "Internet connection required to verify Admin passcode")
             }
         }
-        return true
     }
 
     fun lockToStaffRole() {
         prefs.edit().putString("authenticated_role", "STAFF").apply()
-        _uiState.update { it.copy(currentRole = "STAFF", snackbarMessage = "Locked to Staff Mode") }
+        _uiState.update {
+            it.copy(
+                currentRole = "STAFF",
+                snackbarMessage = "Locked to Staff Mode"
+            ).resetRestrictedStateForRole("STAFF")
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 SupabaseService.getInstance().syncDeviceHeartbeat(
@@ -3004,8 +3686,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 deviceAccessStatus = "UNVERIFIED",
                 currentRole = "STAFF",
+                manualInventoryDraftCounts = emptyMap(),
+                manualInventoryDraftNotes = "",
                 snackbarMessage = "Device signed out"
-            )
+            ).resetRestrictedStateForRole("STAFF")
         }
     }
 
@@ -3020,7 +3704,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openActiveDevicesDialog() {
-        if (_uiState.value.currentRole != "ADMIN") return
+        if (!requireAdmin("Device access management")) return
         _uiState.update { it.copy(showActiveDevicesDialog = true) }
         refreshRegisteredDevices()
     }
@@ -3030,30 +3714,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshRegisteredDevices() {
+        if (!requireAdmin("Device access management")) return
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingDevices = true) }
-            val supabase = SupabaseService.getInstance()
-            val devices = supabase.fetchAllRegisteredDevices()
-            val policy = supabase.fetchAccessPolicyConfig()
-            _uiState.update {
-                it.copy(
-                    isLoadingDevices = false,
-                    registeredDevices = devices,
-                    accessPolicyConfig = policy
-                )
+            try {
+                val supabase = SupabaseService.getInstance()
+                val devices = withContext(Dispatchers.IO) { supabase.fetchAllRegisteredDevices() }
+                val policy = withContext(Dispatchers.IO) { supabase.fetchAccessPolicyConfig() }
+                _uiState.update {
+                    it.copy(
+                        isLoadingDevices = false,
+                        registeredDevices = devices,
+                        accessPolicyConfig = policy
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingDevices = false,
+                        snackbarMessage = "Failed to load devices: ${e.message}"
+                    )
+                }
             }
         }
     }
 
     fun updateRemoteDeviceStatus(registryKey: String, newStatus: String) {
-        if (_uiState.value.currentRole != "ADMIN") return
+        if (!requireAdmin("Updating device status")) return
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingDevices = true) }
-            val res = SupabaseService.getInstance().setDeviceAccessStatus(registryKey, newStatus)
-            if (res.isSuccess) {
-                _uiState.update { it.copy(snackbarMessage = "Device access updated to $newStatus") }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = "Failed: ${res.exceptionOrNull()?.message}") }
+            try {
+                val res = withContext(Dispatchers.IO) {
+                    SupabaseService.getInstance().setDeviceAccessStatus(registryKey, newStatus)
+                }
+                if (res.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Device access updated to $newStatus") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Failed: ${res.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed: ${e.message}") }
             }
             refreshRegisteredDevices()
         }
@@ -3065,31 +3765,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         requireApproval: Boolean,
         forceReverifyAll: Boolean
     ) {
-        if (_uiState.value.currentRole != "ADMIN") return
+        if (!requireAdmin("Saving access policy")) return
         viewModelScope.launch {
-            val current = _uiState.value.accessPolicyConfig
-            val nextEpoch = if (forceReverifyAll) current.passcodeEpoch + 1 else current.passcodeEpoch
-            val updated = SupabaseService.AccessPolicyConfig(
-                adminPasscode = adminPasscode,
-                staffPasscode = staffPasscode,
-                passcodeEpoch = nextEpoch,
-                requireOwnerApprovalForAdmin = requireApproval
-            )
-            val res = SupabaseService.getInstance().saveAccessPolicyConfig(updated)
-            if (res.isSuccess) {
-                // Keep this Admin phone authenticated on the new epoch automatically
-                prefs.edit().putInt("device_passcode_epoch", nextEpoch).apply()
-                _uiState.update {
-                    it.copy(
-                        accessPolicyConfig = updated,
-                        snackbarMessage = if (forceReverifyAll)
-                            "Passcodes saved! All other devices must re-verify."
-                        else
-                            "Access policy saved!"
-                    )
+            try {
+                val current = _uiState.value.accessPolicyConfig
+                val nextEpoch = if (forceReverifyAll) current.passcodeEpoch + 1 else current.passcodeEpoch
+                val updated = SupabaseService.AccessPolicyConfig(
+                    adminPasscode = adminPasscode,
+                    staffPasscode = staffPasscode,
+                    passcodeEpoch = nextEpoch,
+                    requireOwnerApprovalForAdmin = requireApproval
+                )
+                val res = withContext(Dispatchers.IO) {
+                    SupabaseService.getInstance().saveAccessPolicyConfig(updated)
                 }
-            } else {
-                _uiState.update { it.copy(snackbarMessage = "Failed to save policy: ${res.exceptionOrNull()?.message}") }
+                if (res.isSuccess) {
+                    // Keep this Admin phone authenticated on the new epoch automatically
+                    prefs.edit().putInt("device_passcode_epoch", nextEpoch).apply()
+                    _uiState.update {
+                        it.copy(
+                            accessPolicyConfig = updated,
+                            snackbarMessage = if (forceReverifyAll)
+                                "Passcodes saved! All other devices must re-verify."
+                            else
+                                "Access policy saved!"
+                        )
+                    }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Failed to save policy: ${res.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to save policy: ${e.message}") }
             }
         }
     }

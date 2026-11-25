@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <external-cache-path name="external_cache" path="." />
-    <cache-path name="internal_cache" path="." />
-    <files-path name="internal_files" path="." />
+    <cache-path name="updates" path="updates/" />
+    <cache-path name="inventory_reports" path="inventory_reports/" />
 </paths>

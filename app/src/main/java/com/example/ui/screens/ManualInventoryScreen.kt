@@ -50,33 +50,51 @@ import com.example.ui.BillingUiState
 import com.example.ui.theme.CoffeeBrownPrimary
 import com.example.ui.theme.CoffeeOnPrimary
 import com.example.util.InventoryReportGenerator
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ManualInventoryScreen(
     state: BillingUiState,
     inventoryItems: List<InventoryItemEntity>,
-    onSaveClosingInventory: (stockMap: Map<Int, Double>, staffNotes: String) -> Unit,
-    onAddNewInventoryItem: (name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double) -> Unit,
-    onUpdateInventoryItem: (updatedItem: InventoryItemEntity) -> Unit = {},
+    onSaveClosingInventory: (stockMap: Map<Int, Double>, staffNotes: String, onComplete: (Boolean) -> Unit) -> Unit,
+    onAddNewInventoryItem: (name: String, category: String, unit: String, defaultPrice: Double, standardQuantity: Double, initialStock: Double) -> Unit,
+    onUpdateInventoryItem: (updatedItem: InventoryItemEntity, newCount: Double) -> Unit = { _, _ -> },
+    onDraftCountChanged: (Int, Double) -> Unit = { _, _ -> },
+    onDraftNotesChanged: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("ALL") }
-    var staffClosingNotes by remember { mutableStateOf("") }
+    var staffClosingNotes by remember { mutableStateOf(state.manualInventoryDraftNotes) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showSavedListDialog by remember { mutableStateOf(false) }
     var itemToEdit by remember { mutableStateOf<InventoryItemEntity?>(null) }
     var isSaving by remember { mutableStateOf(false) }
+    var dirtyIds by remember { mutableStateOf(emptySet<Int>()) }
 
     // Map of itemId to counted stock
     val stockCounts = remember { mutableStateMapOf<Int, Double>() }
 
-    // Initialize stock counts from inventoryItems
-    LaunchedEffect(inventoryItems) {
-        inventoryItems.forEach { item ->
-            if (!stockCounts.containsKey(item.id)) {
+    // Keep clean items synced with DB updates & prune deleted/inactive items while preserving dirty drafts
+    LaunchedEffect(inventoryItems, state.manualInventoryDraftCounts) {
+        val activeItems = inventoryItems.filter { it.isActive }
+        val activeIds = activeItems.map { it.id }.toSet()
+        stockCounts.keys.toList().forEach { id ->
+            if (id !in activeIds) {
+                stockCounts.remove(id)
+            }
+        }
+        dirtyIds = dirtyIds.intersect(activeIds)
+        activeItems.forEach { item ->
+            val draftVal = state.manualInventoryDraftCounts[item.id]
+            if (draftVal != null) {
+                stockCounts[item.id] = draftVal
+            } else if (item.id !in dirtyIds) {
                 stockCounts[item.id] = item.currentStock.coerceAtLeast(0.0)
             }
         }
@@ -260,7 +278,7 @@ fun ManualInventoryScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     contentPadding = PaddingValues(horizontal = 4.dp)
                 ) {
-                    items(categories) { category ->
+                    items(categories, key = { it }) { category ->
                         val isSelected = selectedCategory.equals(category, ignoreCase = true)
                         FilterChip(
                             selected = isSelected,
@@ -326,12 +344,18 @@ fun ManualInventoryScreen(
                             onIncrement = {
                                 val step = if (item.unit.equals("kg", ignoreCase = true) || item.unit.equals("l", ignoreCase = true)) 0.5 else 1.0
                                 val newCount = (currentCount + step).coerceAtLeast(0.0)
-                                stockCounts[item.id] = Math.round(newCount * 100.0) / 100.0
+                                val rounded = Math.round(newCount * 100.0) / 100.0
+                                stockCounts[item.id] = rounded
+                                dirtyIds = dirtyIds + item.id
+                                onDraftCountChanged(item.id, rounded)
                             },
                             onDecrement = {
                                 val step = if (item.unit.equals("kg", ignoreCase = true) || item.unit.equals("l", ignoreCase = true)) 0.5 else 1.0
                                 val newCount = (currentCount - step).coerceAtLeast(0.0)
-                                stockCounts[item.id] = Math.round(newCount * 100.0) / 100.0
+                                val rounded = Math.round(newCount * 100.0) / 100.0
+                                stockCounts[item.id] = rounded
+                                dirtyIds = dirtyIds + item.id
+                                onDraftCountChanged(item.id, rounded)
                             },
                             onTapCount = {
                                 itemForCustomInput = item
@@ -390,7 +414,10 @@ fun ManualInventoryScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         BasicTextField(
                             value = staffClosingNotes,
-                            onValueChange = { staffClosingNotes = it },
+                            onValueChange = {
+                                staffClosingNotes = it
+                                onDraftNotesChanged(it)
+                            },
                             textStyle = TextStyle(
                                 color = Color.White,
                                 fontSize = 13.sp,
@@ -468,28 +495,35 @@ fun ManualInventoryScreen(
                         // Quick WhatsApp Share Button
                         Button(
                             onClick = {
-                                try {
-                                    val pdfFile = InventoryReportGenerator.generateInventoryPdf(
-                                        context = context,
-                                        items = inventoryItems,
-                                        stockCounts = stockCounts.toMap(),
-                                        staffNotes = staffClosingNotes,
-                                        operatorName = state.operatorName.ifBlank { "Staff" }
-                                    )
-                                    val caption = InventoryReportGenerator.generateInventoryText(
-                                        items = inventoryItems,
-                                        stockCounts = stockCounts.toMap(),
-                                        staffNotes = staffClosingNotes,
-                                        operatorName = state.operatorName.ifBlank { "Staff" }
-                                    )
-                                    InventoryReportGenerator.shareViaWhatsApp(
-                                        context = context,
-                                        file = pdfFile,
-                                        mimeType = "application/pdf",
-                                        caption = caption
-                                    )
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                scope.launch {
+                                    try {
+                                        val snapshotCounts = stockCounts.toMap()
+                                        val opName = state.operatorName.ifBlank { "Staff" }
+                                        val (pdfFile, caption) = withContext(Dispatchers.IO) {
+                                            val file = InventoryReportGenerator.generateInventoryPdf(
+                                                context = context,
+                                                items = inventoryItems,
+                                                stockCounts = snapshotCounts,
+                                                staffNotes = staffClosingNotes,
+                                                operatorName = opName
+                                            )
+                                            val text = InventoryReportGenerator.generateInventoryText(
+                                                items = inventoryItems,
+                                                stockCounts = snapshotCounts,
+                                                staffNotes = staffClosingNotes,
+                                                operatorName = opName
+                                            )
+                                            file to text
+                                        }
+                                        InventoryReportGenerator.shareViaWhatsApp(
+                                            context = context,
+                                            file = pdfFile,
+                                            mimeType = "application/pdf",
+                                            caption = caption
+                                        )
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(
@@ -509,8 +543,12 @@ fun ManualInventoryScreen(
                         Button(
                             onClick = {
                                 isSaving = true
-                                onSaveClosingInventory(stockCounts.toMap(), staffClosingNotes)
-                                isSaving = false
+                                onSaveClosingInventory(stockCounts.toMap(), staffClosingNotes) { success ->
+                                    isSaving = false
+                                    if (success) {
+                                        dirtyIds = emptySet()
+                                    }
+                                }
                             },
                             enabled = !isSaving,
                             colors = ButtonDefaults.buttonColors(
@@ -574,8 +612,11 @@ fun ManualInventoryScreen(
                 confirmButton = {
                     Button(
                         onClick = {
-                            val parsed = customInputValue.toDoubleOrNull() ?: 0.0
-                            stockCounts[item.id] = parsed.coerceAtLeast(0.0)
+                            val parsed = (customInputValue.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+                            val rounded = Math.round(parsed * 100.0) / 100.0
+                            stockCounts[item.id] = rounded
+                            dirtyIds = dirtyIds + item.id
+                            onDraftCountChanged(item.id, rounded)
                             itemForCustomInput = null
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF09090B))
@@ -598,7 +639,7 @@ fun ManualInventoryScreen(
                 categories = dynamicCategories,
                 onDismiss = { showAddDialog = false },
                 onSave = { name, category, unit, defaultPrice, packSize, initialStock ->
-                    onAddNewInventoryItem(name, category, unit, defaultPrice, packSize)
+                    onAddNewInventoryItem(name, category, unit, defaultPrice, packSize, initialStock)
                     showAddDialog = false
                 }
             )
@@ -628,10 +669,14 @@ fun ManualInventoryScreen(
                 currentStockCount = currentCount,
                 onDismiss = { itemToEdit = null },
                 onSave = { updatedItem, newCount ->
-                    onUpdateInventoryItem(updatedItem)
-                    stockCounts[updatedItem.id] = newCount
+                    val rounded = Math.round(newCount.coerceAtLeast(0.0) * 100.0) / 100.0
+                    val persisted = updatedItem.copy(currentStock = rounded)
+                    onUpdateInventoryItem(persisted, rounded)
+                    stockCounts[persisted.id] = rounded
+                    dirtyIds = dirtyIds + persisted.id
+                    onDraftCountChanged(persisted.id, rounded)
                     itemToEdit = null
-                    Toast.makeText(context, "Updated ${updatedItem.name} (${updatedItem.unit})", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Updated ${persisted.name} (${persisted.unit})", Toast.LENGTH_SHORT).show()
                 }
             )
         }
@@ -843,6 +888,7 @@ fun SavedInventoriesListDialog(
     onEditItem: (InventoryItemEntity) -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var listSearchQuery by remember { mutableStateOf("") }
 
     val activeItems = remember(inventoryItems) { inventoryItems.filter { it.isActive } }
@@ -950,7 +996,7 @@ fun SavedInventoriesListDialog(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     grouped.forEach { (category, itemsInCat) ->
-                        item {
+                        item(key = "cat_header_$category") {
                             Surface(
                                 color = Color(0xFFF4F4F5),
                                 shape = RoundedCornerShape(6.dp),
@@ -1057,28 +1103,33 @@ fun SavedInventoriesListDialog(
                 // Share PDF via WhatsApp
                 Button(
                     onClick = {
-                        try {
-                            val pdfFile = InventoryReportGenerator.generateInventoryPdf(
-                                context = context,
-                                items = activeItems,
-                                stockCounts = stockCounts,
-                                staffNotes = staffNotes,
-                                operatorName = operatorName
-                            )
-                            val caption = InventoryReportGenerator.generateInventoryText(
-                                items = activeItems,
-                                stockCounts = stockCounts,
-                                staffNotes = staffNotes,
-                                operatorName = operatorName
-                            )
-                            InventoryReportGenerator.shareViaWhatsApp(
-                                context = context,
-                                file = pdfFile,
-                                mimeType = "application/pdf",
-                                caption = caption
-                            )
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "PDF share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                        scope.launch {
+                            try {
+                                val (pdfFile, caption) = withContext(Dispatchers.IO) {
+                                    val file = InventoryReportGenerator.generateInventoryPdf(
+                                        context = context,
+                                        items = activeItems,
+                                        stockCounts = stockCounts,
+                                        staffNotes = staffNotes,
+                                        operatorName = operatorName
+                                    )
+                                    val text = InventoryReportGenerator.generateInventoryText(
+                                        items = activeItems,
+                                        stockCounts = stockCounts,
+                                        staffNotes = staffNotes,
+                                        operatorName = operatorName
+                                    )
+                                    file to text
+                                }
+                                InventoryReportGenerator.shareViaWhatsApp(
+                                    context = context,
+                                    file = pdfFile,
+                                    mimeType = "application/pdf",
+                                    caption = caption
+                                )
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "PDF share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
@@ -1093,28 +1144,33 @@ fun SavedInventoriesListDialog(
                 // Share Image via WhatsApp
                 Button(
                     onClick = {
-                        try {
-                            val imageFile = InventoryReportGenerator.generateInventoryImage(
-                                context = context,
-                                items = activeItems,
-                                stockCounts = stockCounts,
-                                staffNotes = staffNotes,
-                                operatorName = operatorName
-                            )
-                            val caption = InventoryReportGenerator.generateInventoryText(
-                                items = activeItems,
-                                stockCounts = stockCounts,
-                                staffNotes = staffNotes,
-                                operatorName = operatorName
-                            )
-                            InventoryReportGenerator.shareViaWhatsApp(
-                                context = context,
-                                file = imageFile,
-                                mimeType = "image/png",
-                                caption = caption
-                            )
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "Image share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                        scope.launch {
+                            try {
+                                val (imageFile, caption) = withContext(Dispatchers.IO) {
+                                    val file = InventoryReportGenerator.generateInventoryImage(
+                                        context = context,
+                                        items = activeItems,
+                                        stockCounts = stockCounts,
+                                        staffNotes = staffNotes,
+                                        operatorName = operatorName
+                                    )
+                                    val text = InventoryReportGenerator.generateInventoryText(
+                                        items = activeItems,
+                                        stockCounts = stockCounts,
+                                        staffNotes = staffNotes,
+                                        operatorName = operatorName
+                                    )
+                                    file to text
+                                }
+                                InventoryReportGenerator.shareViaWhatsApp(
+                                    context = context,
+                                    file = imageFile,
+                                    mimeType = "image/png",
+                                    caption = caption
+                                )
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Image share error: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366)),
@@ -1156,6 +1212,8 @@ fun AddInventoryDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .imePadding()
                     .padding(vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -1278,6 +1336,7 @@ fun EditInventoryDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
+                    .imePadding()
             ) {
                 // Item Name
                 OutlinedTextField(
@@ -1302,7 +1361,7 @@ fun EditInventoryDialog(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier.padding(bottom = 8.dp)
                 ) {
-                    items(allCategories) { cat ->
+                    items(allCategories, key = { it }) { cat ->
                         val isSelected = category.equals(cat, ignoreCase = true)
                         FilterChip(
                             selected = isSelected,
@@ -1323,7 +1382,7 @@ fun EditInventoryDialog(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier.padding(bottom = 6.dp)
                 ) {
-                    items(commonUnits) { u ->
+                    items(commonUnits, key = { it }) { u ->
                         val isSelected = unit.equals(u, ignoreCase = true)
                         FilterChip(
                             selected = isSelected,

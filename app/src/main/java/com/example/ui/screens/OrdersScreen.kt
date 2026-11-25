@@ -12,12 +12,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -105,42 +108,69 @@ fun OrdersScreen(
     onOrdersDateRangeSelected: (Long, Long) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
-    val filterOptions = listOf("PENDING", "ALL", "MADE", "UNPAID", "DELIVERED")
+    val filterOptions = remember { listOf("PENDING", "ALL", "MADE", "UNPAID", "DELIVERED") }
     var selectedOrderForPaymentDialog by remember { mutableStateOf<OrderWithItems?>(null) }
     var selectedOrderForEditDialog by remember { mutableStateOf<OrderWithItems?>(null) }
-    val unsyncedCount = ordersList.count { it.order.syncStatus != "SYNCED" }
+    val unsyncedCount = remember(ordersList) { ordersList.count { it.order.syncStatus != "SYNCED" } }
 
-    // Step 1: Filter by date first
-    val now = java.util.Calendar.getInstance()
-    val dateFilteredOrders = when (state.ordersDateFilter) {
-        "TODAY" -> {
-            val todayStart = java.util.Calendar.getInstance().apply {
+    var todayStartMs by remember {
+        mutableStateOf(
+            java.util.Calendar.getInstance().apply {
                 set(java.util.Calendar.HOUR_OF_DAY, 0)
                 set(java.util.Calendar.MINUTE, 0)
                 set(java.util.Calendar.SECOND, 0)
                 set(java.util.Calendar.MILLISECOND, 0)
             }.timeInMillis
-            ordersList.filter { it.order.timestamp >= todayStart }
+        )
+    }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            val nowMs = System.currentTimeMillis()
+            val nextMidnight = java.util.Calendar.getInstance().apply {
+                timeInMillis = nowMs
+                set(java.util.Calendar.HOUR_OF_DAY, 0)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+                add(java.util.Calendar.DAY_OF_YEAR, 1)
+            }.timeInMillis
+            kotlinx.coroutines.delay((nextMidnight - nowMs).coerceAtLeast(1000L))
+            todayStartMs = nextMidnight
         }
-        "CUSTOM" -> {
-            val start = state.ordersCustomStartMs ?: 0L
-            val end = state.ordersCustomEndMs ?: Long.MAX_VALUE
-            ordersList.filter { it.order.timestamp in start..end }
+    }
+
+    // Step 1: Filter by date first
+    val dateFilteredOrders = remember(
+        ordersList,
+        state.ordersDateFilter,
+        state.ordersCustomStartMs,
+        state.ordersCustomEndMs,
+        todayStartMs
+    ) {
+        when (state.ordersDateFilter) {
+            "TODAY" -> ordersList.filter { it.order.timestamp >= todayStartMs }
+            "CUSTOM" -> {
+                val start = state.ordersCustomStartMs ?: 0L
+                val end = state.ordersCustomEndMs ?: Long.MAX_VALUE
+                ordersList.filter { it.order.timestamp in start..end }
+            }
+            else -> ordersList // ALL
         }
-        else -> ordersList // ALL
     }
 
     // Step 2: Then filter by status
-    val statusFilteredOrders = dateFilteredOrders.filter { orderWithItems ->
-        when (state.statusFilter) {
-            "PENDING" -> !orderWithItems.order.isPaid ||
-                !orderWithItems.order.isMade ||
-                !orderWithItems.order.isDelivered ||
-                orderWithItems.items.any { it.completedQuantity < it.quantity }
-            "MADE" -> orderWithItems.order.isMade
-            "UNPAID" -> !orderWithItems.order.isPaid
-            "DELIVERED" -> orderWithItems.order.isDelivered
-            else -> true
+    val statusFilteredOrders = remember(dateFilteredOrders, state.statusFilter) {
+        dateFilteredOrders.filter { orderWithItems ->
+            when (state.statusFilter) {
+                "PENDING" -> !orderWithItems.order.isPaid ||
+                    !orderWithItems.order.isMade ||
+                    !orderWithItems.order.isDelivered ||
+                    orderWithItems.items.any { it.completedQuantity < it.quantity }
+                "MADE" -> orderWithItems.order.isMade
+                "UNPAID" -> !orderWithItems.order.isPaid
+                "DELIVERED" -> orderWithItems.order.isDelivered
+                else -> true
+            }
         }
     }
 
@@ -150,20 +180,22 @@ fun OrdersScreen(
     }
 
     // Total revenue for the date range (independent of status filter) — always shows full day's total
-    val totalDayRevenue = dateFilteredOrders.sumOf { it.order.totalAmount }
+    val totalDayRevenue = remember(dateFilteredOrders) { dateFilteredOrders.sumOf { it.order.totalAmount } }
     // Revenue for just the currently filtered status subset (used for display context)
-    val totalFilteredRevenue = filteredOrders.sumOf { it.order.totalAmount }
+    val totalFilteredRevenue = remember(filteredOrders) { filteredOrders.sumOf { it.order.totalAmount } }
 
     // Date label for the header
-    val dateLabel = when (state.ordersDateFilter) {
-        "TODAY" -> "TODAY"
-        "CUSTOM" -> {
-            val sdf = SimpleDateFormat("dd MMM", Locale.getDefault())
-            val start = state.ordersCustomStartMs
-            val end = state.ordersCustomEndMs
-            if (start != null && end != null) "${sdf.format(Date(start))} - ${sdf.format(Date(end))}" else "CUSTOM"
+    val dateLabel = remember(state.ordersDateFilter, state.ordersCustomStartMs, state.ordersCustomEndMs) {
+        when (state.ordersDateFilter) {
+            "TODAY" -> "TODAY"
+            "CUSTOM" -> {
+                val sdf = SimpleDateFormat("dd MMM", Locale.getDefault())
+                val start = state.ordersCustomStartMs
+                val end = state.ordersCustomEndMs
+                if (start != null && end != null) "${sdf.format(Date(start))} - ${sdf.format(Date(end))}" else "CUSTOM"
+            }
+            else -> "ALL"
         }
-        else -> "ALL"
     }
 
     val config = androidx.compose.ui.platform.LocalConfiguration.current
@@ -427,15 +459,11 @@ fun OrdersScreen(
             contentPadding = PaddingValues(bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            items(filterOptions) { filter ->
+            items(filterOptions, key = { it }) { filter ->
                 val isSelected = state.statusFilter == filter
                 FilterChip(
                     selected = isSelected,
-                    onClick = {
-                        onFilterChanged(filter)
-                        // When ALL is clicked, reset date filter to TODAY
-                        if (filter == "ALL") onOrdersDateFilterChanged("TODAY")
-                    },
+                    onClick = { onFilterChanged(filter) },
                     label = { Text(filter, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium, fontSize = 12.sp) },
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = Color(0xFF09090B),
@@ -448,8 +476,33 @@ fun OrdersScreen(
                 )
             }
 
+            item(key = "date_toggle_chip") {
+                val isAllDates = state.ordersDateFilter == "ALL"
+                FilterChip(
+                    selected = isAllDates,
+                    onClick = {
+                        onOrdersDateFilterChanged(if (isAllDates) "TODAY" else "ALL")
+                    },
+                    label = {
+                        Text(
+                            text = if (isAllDates) "All Dates" else "Today",
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 12.sp
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Color(0xFF09090B),
+                        selectedLabelColor = Color.White,
+                        containerColor = Color(0xFFF4F4F5),
+                        labelColor = Color(0xFF52525B)
+                    ),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.testTag("orders_date_toggle_chip")
+                )
+            }
+
             // Calendar icon for date selection (rightmost)
-            item {
+            item(key = "orders_calendar_button") {
                 Surface(
                     color = if (state.ordersDateFilter == "CUSTOM") Color(0xFF09090B) else Color(0xFFF4F4F5),
                     shape = RoundedCornerShape(20.dp),
@@ -654,7 +707,9 @@ fun OrderCard(
     onViewReceipt: () -> Unit
 ) {
     val order = orderWithItems.order
-    val dateFormatted = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(order.timestamp))
+    val dateFormatted = remember(order.timestamp) {
+        SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(order.timestamp))
+    }
 
     Card(
         shape = RoundedCornerShape(16.dp),
@@ -1043,16 +1098,10 @@ fun EditOrderDialog(
         mutableStateOf(orderWithItems.order.notes)
     }
     var searchQuery by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableStateOf("ALL") }
 
-    val categories = remember(menuItems) {
-        listOf("ALL") + menuItems.map { it.category }.distinct().sorted()
-    }
-
-    val availableMenuItems = remember(menuItems, searchQuery, selectedCategory) {
+    val availableMenuItems = remember(menuItems, searchQuery) {
         menuItems.filter { item ->
             item.isAvailable &&
-            (selectedCategory == "ALL" || item.category.equals(selectedCategory, ignoreCase = true)) &&
             (searchQuery.isBlank() || item.name.contains(searchQuery, ignoreCase = true) || item.category.contains(searchQuery, ignoreCase = true))
         }
     }
@@ -1074,7 +1123,8 @@ fun EditOrderDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(480.dp)
+                    .heightIn(min = 320.dp, max = 540.dp)
+                    .imePadding()
             ) {
                 // Customer Details (Editable)
                 Row(
@@ -1145,7 +1195,10 @@ fun EditOrderDialog(
                             .weight(1f),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(editableItems) { orderItem ->
+                        itemsIndexed(
+                            items = editableItems,
+                            key = { index, item -> "${index}_${item.id}_${item.menuItemId}_${item.itemName}" }
+                        ) { _, orderItem ->
                             Surface(
                                 color = Color(0xFFF8F9FA),
                                 shape = RoundedCornerShape(10.dp),
@@ -1268,7 +1321,7 @@ fun EditOrderDialog(
                         .weight(1f),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    items(availableMenuItems) { menuItem ->
+                    items(availableMenuItems, key = { it.id }) { menuItem ->
                         Surface(
                             color = Color.White,
                             shape = RoundedCornerShape(8.dp),

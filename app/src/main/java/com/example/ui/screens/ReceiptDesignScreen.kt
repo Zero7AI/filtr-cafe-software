@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -15,6 +16,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -34,15 +36,33 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.example.data.entity.StoryPhotoMetadata
 import com.example.ui.BillingUiState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
 private fun compressImageForThermalUpload(context: android.content.Context, uri: Uri): ByteArray? {
+    var originalBitmap: android.graphics.Bitmap? = null
+    var cropped: android.graphics.Bitmap? = null
+    var scaled: android.graphics.Bitmap? = null
     return try {
-        val inputStream = context.contentResolver.openInputStream(uri) ?: return null
-        val originalBitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
-        inputStream.close()
-        if (originalBitmap == null) return null
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            android.graphics.BitmapFactory.decodeStream(stream, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        var inSampleSize = 1
+        while (bounds.outWidth / inSampleSize > 1152 && bounds.outHeight / inSampleSize > 1152) {
+            inSampleSize *= 2
+        }
+        val decodeOpts = android.graphics.BitmapFactory.Options().apply {
+            this.inSampleSize = inSampleSize.coerceAtLeast(1)
+        }
+        originalBitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+            android.graphics.BitmapFactory.decodeStream(stream, null, decodeOpts)
+        } ?: return null
 
         // 7:4 aspect ratio crop, 576 dots width (optimal for both 80mm & 58mm thermal printers)
         val targetWidth = 576
@@ -61,14 +81,18 @@ private fun compressImageForThermalUpload(context: android.content.Context, uri:
         }
         val xOff = ((originalBitmap.width - cropW) / 2).coerceAtLeast(0)
         val yOff = ((originalBitmap.height - cropH) / 2).coerceAtLeast(0)
-        val cropped = android.graphics.Bitmap.createBitmap(originalBitmap, xOff, yOff, cropW, cropH)
-        val scaled = android.graphics.Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
+        cropped = android.graphics.Bitmap.createBitmap(originalBitmap, xOff, yOff, cropW, cropH)
+        scaled = android.graphics.Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
 
         val outStream = java.io.ByteArrayOutputStream()
         scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, outStream)
         outStream.toByteArray()
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         null
+    } finally {
+        if (scaled != null && scaled !== cropped && scaled !== originalBitmap) scaled.recycle()
+        if (cropped != null && cropped !== originalBitmap) cropped.recycle()
+        originalBitmap?.recycle()
     }
 }
 
@@ -87,6 +111,7 @@ fun ReceiptDesignScreen(
     getPhotoUrl: (String) -> String
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val todayFormatted = remember { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date()) }
 
     // Section 2 Text state
@@ -107,9 +132,9 @@ fun ReceiptDesignScreen(
         state.storyPhotoMetadataMap[name] ?: StoryPhotoMetadata(fileName = name, title = "FILTR Story", date = todayFormatted)
     }
 
-    var editTitle by remember(activeMeta?.title) { mutableStateOf(activeMeta?.title ?: state.receiptStoryTitle) }
-    var editDate by remember(activeMeta?.date) { mutableStateOf(activeMeta?.date?.ifBlank { todayFormatted } ?: todayFormatted) }
-    var editCaption by remember(activeMeta?.caption) { mutableStateOf(activeMeta?.caption ?: state.receiptStoryCaption) }
+    var editTitle by remember(selectedPhotoName, activeMeta?.title) { mutableStateOf(activeMeta?.title ?: state.receiptStoryTitle) }
+    var editDate by remember(selectedPhotoName, activeMeta?.date) { mutableStateOf(activeMeta?.date?.ifBlank { todayFormatted } ?: todayFormatted) }
+    var editCaption by remember(selectedPhotoName, activeMeta?.caption) { mutableStateOf(activeMeta?.caption ?: state.receiptStoryCaption) }
     var isGeneratingAiNote by remember { mutableStateOf(false) }
 
     // Upload dialog state
@@ -123,17 +148,19 @@ fun ReceiptDesignScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            try {
-                val compressed = compressImageForThermalUpload(context, uri)
+            scope.launch {
+                val compressed = withContext(Dispatchers.IO) {
+                    compressImageForThermalUpload(context, uri)
+                }
                 if (compressed != null && compressed.isNotEmpty()) {
                     uploadPendingBytes = compressed
                     uploadTitle = "Behind The Brew"
                     uploadDate = todayFormatted
                     uploadCaption = "Crafted fresh with obsession. Every cup tells a story."
                     showUploadDialog = true
+                } else {
+                    Toast.makeText(context, "Could not process selected image", Toast.LENGTH_SHORT).show()
                 }
-            } catch (e: Exception) {
-                // handle error
             }
         }
     }
@@ -166,7 +193,7 @@ fun ReceiptDesignScreen(
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.ArrowBack,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
                             tint = Color.White,
                             modifier = Modifier.size(20.dp)
@@ -367,7 +394,8 @@ fun ReceiptDesignScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(rememberScrollState())
+                        .imePadding(),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
@@ -617,7 +645,7 @@ private fun StoryAndPhotosSection(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         contentPadding = PaddingValues(vertical = 2.dp)
                     ) {
-                        items(state.storyPhotoNames) { fileName ->
+                        items(state.storyPhotoNames, key = { it }) { fileName ->
                             val isSelected = fileName == selectedPhotoName
                             val meta = state.storyPhotoMetadataMap[fileName]
                             val label = meta?.title?.ifBlank { "Behind The Brew" } ?: "Behind The Brew"

@@ -9,13 +9,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
@@ -111,7 +115,9 @@ fun AccountsUpiDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(440.dp)
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState())
+                    .imePadding()
             ) {
                 Text(
                     text = "CONFIGURED UPI ACCOUNTS",
@@ -142,10 +148,10 @@ fun AccountsUpiDialog(
                     LazyColumn(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .weight(1f),
+                            .heightIn(max = 180.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(upiAccounts) { account ->
+                        items(upiAccounts, key = { it.id }) { account ->
                             Surface(
                                 color = if (account.isDefault) Color(0xFFF4F4F5) else Color.White,
                                 shape = RoundedCornerShape(12.dp),
