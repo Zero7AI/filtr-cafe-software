@@ -206,7 +206,7 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
-        private val MIGRATION_13_14 = object : androidx.room.migration.Migration(13, 14) {
+        internal val MIGRATION_13_14 = object : androidx.room.migration.Migration(13, 14) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("""
                     CREATE TABLE IF NOT EXISTS `kitchen_inventory_items` (
@@ -266,7 +266,7 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
-        private val MIGRATION_14_15 = object : androidx.room.migration.Migration(14, 15) {
+        internal val MIGRATION_14_15 = object : androidx.room.migration.Migration(14, 15) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("""
                     CREATE TABLE IF NOT EXISTS `staff_attendance_logs` (
@@ -291,7 +291,7 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
-        private val MIGRATION_15_16 = object : androidx.room.migration.Migration(15, 16) {
+        internal val MIGRATION_15_16 = object : androidx.room.migration.Migration(15, 16) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("""
                     CREATE TABLE IF NOT EXISTS `staff_roster` (
