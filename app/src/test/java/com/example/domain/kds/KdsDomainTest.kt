@@ -155,6 +155,18 @@ class KdsDomainTest {
         assertEquals(1, paidOnlyQueue.size)
         assertEquals("1002", paidOnlyQueue[0].shortOrderNumber)
         assertEquals(1, paidOnlyQueue[0].queuePosition)
+
+        // Today filter excludes older orders before midnight minTimestampMs
+        val todayFilteredQueue = KdsQueueBuilder.buildFifoPendingQueue(
+            orders = listOf(newerPaidOrder, olderOrder),
+            claimsByKey = claims,
+            rosterByNormalizedName = emptyMap(),
+            paidOnlyFilter = false,
+            minTimestampMs = 1_500L
+        )
+        assertEquals(1, todayFilteredQueue.size)
+        assertEquals("1002", todayFilteredQueue[0].shortOrderNumber)
+        assertTrue(KdsQueueBuilder.parseDateKeyStartMillis("2026-11-26") != null)
     }
 
     @Test

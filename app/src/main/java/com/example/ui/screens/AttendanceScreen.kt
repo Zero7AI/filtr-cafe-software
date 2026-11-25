@@ -81,6 +81,7 @@ import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
 import com.example.domain.attendance.formatDayOfWeekShort
+import com.example.domain.kds.KdsBaristaColorPalette
 import com.example.util.LocationSample
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -139,6 +140,7 @@ fun AttendanceScreen(
     onChangeRadiusMeters: (Double) -> Unit,
     staffRoster: List<StaffRosterEntity> = emptyList(),
     teamRollCall: List<TeamRollCallRow> = emptyList(),
+    onDutyStaffKeys: Set<String> = emptySet(),
     selectedCheckInStaffName: String = currentStaffName,
     onSelectCheckInStaff: (String) -> Unit = {},
     onSaveStaffRosterMember: (
@@ -150,6 +152,16 @@ fun AttendanceScreen(
         joinedDateKey: String,
         isActive: Boolean
     ) -> Unit = { _, _, _, _, _, _, _ -> },
+    onSaveStaffRosterMemberWithColor: ((
+        existingId: String?,
+        name: String,
+        roleTitle: String,
+        shiftLabel: String,
+        weeklyOffDayOfWeek: Int,
+        joinedDateKey: String,
+        isActive: Boolean,
+        colorHex: String
+    ) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var isManagerView by remember { mutableStateOf(false) }
@@ -192,6 +204,8 @@ fun AttendanceScreen(
                     locationError = locationError,
                     selectedMonthKey = selectedMonthKey,
                     availableStaffNames = availableStaffNames,
+                    onDutyStaffKeys = onDutyStaffKeys,
+                    staffRosterEmpty = staffRoster.none { it.isActive },
                     selectedCheckInStaffName = selectedCheckInStaffName,
                     personalSummary = personalSummary,
                     todayPersonalLog = todayPersonalLog,
@@ -225,7 +239,30 @@ fun AttendanceScreen(
                     onSelectManagerStaff = onSelectManagerStaff,
                     onSetStoreLocationHere = onSetStoreLocationHere,
                     onChangeRadiusMeters = onChangeRadiusMeters,
-                    onSaveStaffRosterMember = onSaveStaffRosterMember
+                    onSaveStaffRosterMember = { existingId, name, roleTitle, shiftLabel, weeklyOffDayOfWeek, joinedDateKey, isActive, colorHex ->
+                        if (onSaveStaffRosterMemberWithColor != null) {
+                            onSaveStaffRosterMemberWithColor(
+                                existingId,
+                                name,
+                                roleTitle,
+                                shiftLabel,
+                                weeklyOffDayOfWeek,
+                                joinedDateKey,
+                                isActive,
+                                colorHex
+                            )
+                        } else {
+                            onSaveStaffRosterMember(
+                                existingId,
+                                name,
+                                roleTitle,
+                                shiftLabel,
+                                weeklyOffDayOfWeek,
+                                joinedDateKey,
+                                isActive
+                            )
+                        }
+                    }
                 )
             }
 
@@ -401,6 +438,8 @@ private fun StaffAttendanceView(
     locationError: String?,
     selectedMonthKey: String,
     availableStaffNames: List<String>,
+    onDutyStaffKeys: Set<String> = emptySet(),
+    staffRosterEmpty: Boolean = false,
     selectedCheckInStaffName: String,
     personalSummary: MonthlyAttendanceSummary,
     todayPersonalLog: AttendanceLogEntity?,
@@ -428,6 +467,8 @@ private fun StaffAttendanceView(
         geofenceResult = geofenceResult,
         todayPersonalLog = todayPersonalLog,
         availableStaffNames = availableStaffNames,
+        onDutyStaffKeys = onDutyStaffKeys,
+        staffRosterEmpty = staffRosterEmpty,
         selectedCheckInStaffName = selectedCheckInStaffName,
         onSelectCheckInStaff = onSelectCheckInStaff,
         onCheckIn = onCheckIn,
@@ -683,6 +724,8 @@ private fun CheckInOutCard(
     geofenceResult: GeofenceCheckResult?,
     todayPersonalLog: AttendanceLogEntity?,
     availableStaffNames: List<String>,
+    onDutyStaffKeys: Set<String> = emptySet(),
+    staffRosterEmpty: Boolean = false,
     selectedCheckInStaffName: String,
     onSelectCheckInStaff: (String) -> Unit,
     onCheckIn: () -> Unit,
@@ -809,10 +852,14 @@ private fun CheckInOutCard(
                 )
             }
 
-            if (availableStaffNames.size > 1) {
+            if (availableStaffNames.size > 1 || staffRosterEmpty) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(
-                        text = "Checking in as:",
+                        text = if (staffRosterEmpty) {
+                            "Checking in as (add full team in Manager View → Roster & GPS):"
+                        } else {
+                            "Checking in as:"
+                        },
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = AttendanceMuted
@@ -822,16 +869,30 @@ private fun CheckInOutCard(
                     ) {
                         items(availableStaffNames) { staffName ->
                             val isSelected = staffName.equals(selectedCheckInStaffName, ignoreCase = true)
+                            val isOnDuty = AttendanceCalculator.normalizeStaffKey(staffName) in onDutyStaffKeys
                             FilterChip(
                                 selected = isSelected,
                                 onClick = { onSelectCheckInStaff(staffName) },
                                 label = {
-                                    Text(
-                                        text = staffName,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        maxLines = 1
-                                    )
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        if (isOnDuty) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(7.dp)
+                                                    .clip(CircleShape)
+                                                    .background(if (isSelected) Color(0xFF86EFAC) else AttendanceGreen)
+                                            )
+                                        }
+                                        Text(
+                                            text = staffName,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1
+                                        )
+                                    }
                                 },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = AttendanceInk,
@@ -1475,7 +1536,8 @@ private fun ManagerAttendanceView(
         shiftLabel: String,
         weeklyOffDayOfWeek: Int,
         joinedDateKey: String,
-        isActive: Boolean
+        isActive: Boolean,
+        colorHex: String
     ) -> Unit
 ) {
     ManagerSubTabBar(
@@ -1874,7 +1936,8 @@ private fun StaffRosterManagementCard(
         shiftLabel: String,
         weeklyOffDayOfWeek: Int,
         joinedDateKey: String,
-        isActive: Boolean
+        isActive: Boolean,
+        colorHex: String
     ) -> Unit
 ) {
     var showEditorDialog by remember { mutableStateOf(false) }
@@ -1978,6 +2041,17 @@ private fun StaffRosterManagementCard(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
+                                    val dotColor = Color(
+                                        KdsBaristaColorPalette.parseComposeColor(
+                                            KdsBaristaColorPalette.resolveColorHex(member.name, member.colorHex)
+                                        )
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .size(10.dp)
+                                            .clip(CircleShape)
+                                            .background(dotColor)
+                                    )
                                     Text(
                                         text = member.name,
                                         fontSize = 15.sp,
@@ -2037,7 +2111,7 @@ private fun StaffRosterManagementCard(
         StaffRosterEditorDialog(
             existingMember = editingMember,
             onDismiss = { showEditorDialog = false },
-            onSave = { existingId, name, roleTitle, shiftLabel, weeklyOffDayOfWeek, joinedDateKey, isActive ->
+            onSave = { existingId, name, roleTitle, shiftLabel, weeklyOffDayOfWeek, joinedDateKey, isActive, colorHex ->
                 onSaveStaffRosterMember(
                     existingId,
                     name,
@@ -2045,7 +2119,8 @@ private fun StaffRosterManagementCard(
                     shiftLabel,
                     weeklyOffDayOfWeek,
                     joinedDateKey,
-                    isActive
+                    isActive,
+                    colorHex
                 )
                 showEditorDialog = false
             }
@@ -2065,7 +2140,8 @@ private fun StaffRosterEditorDialog(
         shiftLabel: String,
         weeklyOffDayOfWeek: Int,
         joinedDateKey: String,
-        isActive: Boolean
+        isActive: Boolean,
+        colorHex: String
     ) -> Unit
 ) {
     val todayDateKey = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()) }
@@ -2083,6 +2159,12 @@ private fun StaffRosterEditorDialog(
         mutableStateOf(existingMember?.joinedDateKey?.ifBlank { todayDateKey } ?: todayDateKey)
     }
     var isActive by remember(existingMember) { mutableStateOf(existingMember?.isActive ?: true) }
+    var selectedColorHex by remember(existingMember) {
+        mutableStateOf(
+            existingMember?.colorHex?.takeIf { it.isNotBlank() }
+                ?: KdsBaristaColorPalette.resolveColorHex(existingMember?.name.orEmpty())
+        )
+    }
 
     val roleOptions = remember(roleTitle) {
         val base = listOf("Barista", "Kitchen", "Manager", "Helper")
@@ -2212,12 +2294,39 @@ private fun StaffRosterEditorDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = "KDS & Attendance Badge Color",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AttendanceMuted
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        KdsBaristaColorPalette.COLORS.forEach { hex ->
+                            val swatchColor = Color(KdsBaristaColorPalette.parseComposeColor(hex))
+                            val isSelected = selectedColorHex.equals(hex, ignoreCase = true)
+                            Box(
+                                modifier = Modifier
+                                    .size(if (isSelected) 30.dp else 26.dp)
+                                    .clip(CircleShape)
+                                    .background(swatchColor)
+                                    .border(
+                                        width = if (isSelected) 2.5.dp else 1.dp,
+                                        color = if (isSelected) AttendanceInk else Color.White,
+                                        shape = CircleShape
+                                    )
+                                    .clickable { selectedColorHex = hex }
+                            )
+                        }
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "Active Staff Member",
                             fontSize = 14.sp,
@@ -2225,7 +2334,7 @@ private fun StaffRosterEditorDialog(
                             color = AttendanceInk
                         )
                         Text(
-                            text = "Show in Roll Call & Check-in list",
+                            text = "Syncs across Roll Call, Check-In & KDS",
                             fontSize = 12.sp,
                             color = AttendanceMuted
                         )
@@ -2247,7 +2356,8 @@ private fun StaffRosterEditorDialog(
                         shiftLabel,
                         weeklyOffDayOfWeek,
                         trimmedJoined.ifBlank { todayDateKey },
-                        isActive
+                        isActive,
+                        selectedColorHex
                     )
                 },
                 enabled = canSave,

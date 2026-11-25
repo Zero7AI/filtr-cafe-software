@@ -256,4 +256,61 @@ object AttendanceCalculator {
             attendancePercent = attendancePercent
         )
     }
+
+    private val PLACEHOLDER_STAFF_NAMES: Set<String> = setOf(
+        "barista 1",
+        "barista 2",
+        "staff 1",
+        "staff 2",
+        "unassigned device",
+        "staff",
+        "barista"
+    )
+
+    fun isRealStaffName(name: String): Boolean {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return false
+        return trimmed.lowercase(Locale.US) !in PLACEHOLDER_STAFF_NAMES
+    }
+
+    /**
+     * Resolves the canonical selectable staff list shared across Attendance Check-In and KDS.
+     * - Never includes accounting placeholder labels like "Barista 1" / "Barista 2".
+     * - Once active members exist in the Staff Roster, only those active roster members appear.
+     * - Staff who are currently Checked In (On Duty today) are sorted first.
+     */
+    fun resolveSelectableStaffNames(
+        roster: List<StaffRosterEntity>,
+        onDutyNormalizedKeys: Set<String> = emptySet(),
+        fallbackDeviceNames: List<String> = emptyList(),
+        fallbackLogNames: List<String> = emptyList(),
+        loggedInOperatorName: String = ""
+    ): List<String> {
+        val activeRosterNames = roster
+            .asSequence()
+            .filter { it.isActive && isRealStaffName(it.name) }
+            .map { it.name.trim() }
+            .toList()
+
+        val candidates = if (activeRosterNames.isNotEmpty()) {
+            activeRosterNames
+        } else {
+            (fallbackDeviceNames + fallbackLogNames + listOf(loggedInOperatorName))
+                .asSequence()
+                .map { it.trim() }
+                .filter { isRealStaffName(it) }
+                .toList()
+        }
+
+        val sorted = candidates
+            .distinctBy { normalizeStaffKey(it) }
+            .sortedWith(
+                compareByDescending<String> { normalizeStaffKey(it) in onDutyNormalizedKeys }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it }
+            )
+
+        return sorted.ifEmpty {
+            listOf(loggedInOperatorName.trim().takeIf { isRealStaffName(it) } ?: "Staff")
+        }
+    }
 }

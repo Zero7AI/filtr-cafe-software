@@ -1,6 +1,7 @@
 package com.example.domain.attendance
 
 import com.example.data.entity.AttendanceLogEntity
+import com.example.data.entity.StaffRosterEntity
 import com.example.ui.FiltrTab
 import com.example.ui.STAFF_ALLOWED_TABS
 import org.junit.Assert.assertEquals
@@ -231,5 +232,32 @@ class AttendanceDomainTest {
     @Test
     fun `attendance tab is included in staff allowed tabs`() {
         assertTrue(FiltrTab.ATTENDANCE in STAFF_ALLOWED_TABS)
+    }
+
+    @Test
+    fun `staff selector excludes placeholder names and drives strictly from active roster when configured`() {
+        // Before roster is populated: exclude placeholders like "Barista 1" / "Barista 2"
+        val initialNames = AttendanceCalculator.resolveSelectableStaffNames(
+            roster = emptyList(),
+            onDutyNormalizedKeys = emptySet(),
+            fallbackDeviceNames = listOf("Barista 1", "Barista 2", "Abhijeet"),
+            fallbackLogNames = listOf("Staff 1"),
+            loggedInOperatorName = "Abhijeet"
+        )
+        assertEquals(listOf("Abhijeet"), initialNames)
+
+        // Once Admin adds real staff to Roster: only active roster members appear, On-Duty sorted first
+        val roster = listOf(
+            StaffRosterEntity(id = "somesh", name = "Somesh", isActive = true),
+            StaffRosterEntity(id = "kanha", name = "Kanha", isActive = true),
+            StaffRosterEntity(id = "former", name = "Former Staff", isActive = false)
+        )
+        val resolved = AttendanceCalculator.resolveSelectableStaffNames(
+            roster = roster,
+            onDutyNormalizedKeys = setOf(AttendanceCalculator.normalizeStaffKey("Somesh")),
+            fallbackDeviceNames = listOf("Abhijeet", "Barista 1"),
+            loggedInOperatorName = "Abhijeet"
+        )
+        assertEquals(listOf("Somesh", "Kanha"), resolved)
     }
 }

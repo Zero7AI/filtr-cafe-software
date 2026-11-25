@@ -6,6 +6,7 @@ import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
 import com.example.data.entity.StaffRosterEntity
 import com.example.domain.attendance.AttendanceCalculator
+import java.text.SimpleDateFormat
 import java.util.Locale
 import kotlin.math.abs
 
@@ -88,15 +89,30 @@ object KdsQueueBuilder {
         }
     }
 
+    fun parseDateKeyStartMillis(dateKey: String): Long? {
+        val trimmed = dateKey.trim()
+        if (trimmed.length != 10) return null
+        return try {
+            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+                isLenient = false
+            }
+            sdf.parse(trimmed)?.time
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun buildFifoPendingQueue(
         orders: List<OrderWithItems>,
         claimsByKey: Map<String, KdsItemClaimEntity>,
         rosterByNormalizedName: Map<String, StaffRosterEntity>,
-        paidOnlyFilter: Boolean = false
+        paidOnlyFilter: Boolean = false,
+        minTimestampMs: Long? = null
     ): List<KdsQueueUnitItem> {
         val sortedActiveOrders = orders
             .asSequence()
             .filter { !it.order.isMade && !it.order.isDelivered }
+            .filter { minTimestampMs == null || it.order.timestamp >= minTimestampMs }
             .filter { !paidOnlyFilter || it.order.isPaid }
             .sortedWith(compareBy<OrderWithItems> { it.order.timestamp }.thenBy { it.order.orderId })
             .toList()

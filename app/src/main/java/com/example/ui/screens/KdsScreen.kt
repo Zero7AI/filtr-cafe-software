@@ -3,7 +3,6 @@ package com.example.ui.screens
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,6 +27,8 @@ import androidx.compose.material.icons.filled.Coffee
 import androidx.compose.material.icons.filled.LocalCafe
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Receipt
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -41,6 +42,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,9 +62,12 @@ fun KdsScreen(
     staffRoster: List<StaffRosterEntity>,
     activeBaristaName: String,
     paidOnlyFilter: Boolean,
+    todayOnlyFilter: Boolean = true,
+    onDutyStaffKeys: Set<String> = emptySet(),
     isStaffMode: Boolean,
     onSelectBarista: (String) -> Unit,
     onTogglePaidOnlyFilter: (Boolean) -> Unit,
+    onToggleTodayOnlyFilter: (Boolean) -> Unit = {},
     onTapQueueItem: (KdsQueueUnitItem) -> Unit,
     onUnclaimQueueItem: (KdsQueueUnitItem) -> Unit,
     modifier: Modifier = Modifier
@@ -86,144 +91,200 @@ fun KdsScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFFF8FAFC))
+            .background(Color(0xFFFAFAFA))
+            .padding(horizontal = 10.dp, vertical = 6.dp)
             .testTag("kds_screen")
     ) {
-        // Compact Top Bar: Active Barista Selector + FIFO Stats
-        Surface(
-            color = Color.White,
-            tonalElevation = 1.dp,
-            shadowElevation = 2.dp,
+        // Compact Top Summary Card (matches OrdersScreen banner aesthetic)
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF09090B)),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                Surface(
+                    color = activeBaristaColor,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.size(34.dp)
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Icon(
                             imageVector = Icons.Default.LocalCafe,
                             contentDescription = null,
-                            tint = activeBaristaColor,
-                            modifier = Modifier.size(20.dp)
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp)
                         )
-                        Column {
-                            Text(
-                                text = "Live Kitchen Queue (FIFO)",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.ExtraBold,
-                                color = Color(0xFF09090B)
-                            )
-                            Text(
-                                text = "1st tap: Claim & Make • 2nd tap: Mark Made • Long-press: Unclaim",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color(0xFF71717A)
-                            )
-                        }
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        KdsMetricPill(
-                            label = "${queueItems.size} Left",
-                            containerColor = Color(0xFFF4F4F5),
-                            contentColor = Color(0xFF18181B),
-                            tag = "kds_pending_count"
-                        )
-                        if (makingCount > 0) {
-                            KdsMetricPill(
-                                label = "$makingCount Making",
-                                containerColor = activeBaristaColor.copy(alpha = 0.14f),
-                                contentColor = activeBaristaColor,
-                                tag = "kds_making_count"
-                            )
-                        }
                     }
                 }
 
-                // Barista Selector + Paid Filter Row
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    LazyRow(
-                        modifier = Modifier.weight(1f),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        items(items = baristaChoices, key = { it.lowercase(Locale.US) }) { barista ->
-                            val isSelected = barista.equals(activeBaristaName, ignoreCase = true)
-                            val rosterEntry = rosterByNormalized[AttendanceCalculator.normalizeStaffKey(barista)]
-                            val colorHex = KdsBaristaColorPalette.resolveColorHex(
-                                barista,
-                                rosterEntry?.colorHex.orEmpty()
-                            )
-                            val dotColor = Color(KdsBaristaColorPalette.parseComposeColor(colorHex))
+                    Text(
+                        text = "LIVE KDS QUEUE (FIFO)",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Black,
+                        color = Color.White,
+                        letterSpacing = 0.4.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "1st tap Make • 2nd tap Done • Hold Unclaim",
+                        fontSize = 11.sp,
+                        color = Color.White.copy(alpha = 0.7f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
 
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = { onSelectBarista(barista) },
-                                leadingIcon = {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(10.dp)
-                                            .clip(CircleShape)
-                                            .background(if (isSelected) Color.White else dotColor)
-                                    )
-                                },
-                                label = {
-                                    Text(
-                                        text = barista,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        fontSize = 12.sp,
-                                        maxLines = 1
-                                    )
-                                },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = dotColor,
-                                    selectedLabelColor = Color.White,
-                                    containerColor = Color(0xFFF4F4F5),
-                                    labelColor = Color(0xFF27272A)
-                                ),
-                                shape = RoundedCornerShape(20.dp),
-                                modifier = Modifier.testTag("kds_barista_chip_${barista.lowercase(Locale.US).replace(" ", "_")}")
-                            )
-                        }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    KdsMetricPill(
+                        label = "${queueItems.size} Left",
+                        containerColor = Color.White.copy(alpha = 0.14f),
+                        contentColor = Color.White,
+                        tag = "kds_pending_count"
+                    )
+                    if (makingCount > 0) {
+                        KdsMetricPill(
+                            label = "$makingCount Making",
+                            containerColor = activeBaristaColor,
+                            contentColor = Color.White,
+                            tag = "kds_making_count"
+                        )
                     }
+                }
+            }
+        }
 
-                    Spacer(modifier = Modifier.width(8.dp))
+        // Barista Selector + Today/Backlog & Paid Filters Row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 6.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            LazyRow(
+                modifier = Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                items(items = baristaChoices, key = { it.lowercase(Locale.US) }) { barista ->
+                    val normalizedKey = AttendanceCalculator.normalizeStaffKey(barista)
+                    val isSelected = barista.equals(activeBaristaName, ignoreCase = true)
+                    val isOnDuty = normalizedKey in onDutyStaffKeys
+                    val rosterEntry = rosterByNormalized[normalizedKey]
+                    val colorHex = KdsBaristaColorPalette.resolveColorHex(
+                        barista,
+                        rosterEntry?.colorHex.orEmpty()
+                    )
+                    val dotColor = Color(KdsBaristaColorPalette.parseComposeColor(colorHex))
 
                     FilterChip(
-                        selected = paidOnlyFilter,
-                        onClick = { onTogglePaidOnlyFilter(!paidOnlyFilter) },
-                        label = {
-                            Text(
-                                text = if (paidOnlyFilter) "Paid Only ✓" else "All Active",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp
+                        selected = isSelected,
+                        onClick = { onSelectBarista(barista) },
+                        leadingIcon = {
+                            Box(
+                                modifier = Modifier
+                                    .size(9.dp)
+                                    .clip(CircleShape)
+                                    .background(if (isSelected) Color.White else dotColor)
                             )
                         },
+                        label = {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = barista,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                                if (isOnDuty) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(if (isSelected) Color(0xFF86EFAC) else Color(0xFF16A34A))
+                                    )
+                                }
+                            }
+                        },
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Color(0xFF09090B),
+                            selectedContainerColor = dotColor,
                             selectedLabelColor = Color.White,
                             containerColor = Color(0xFFF4F4F5),
-                            labelColor = Color(0xFF52525B)
+                            labelColor = Color(0xFF27272A)
                         ),
-                        shape = RoundedCornerShape(20.dp),
-                        modifier = Modifier.testTag("kds_paid_filter_chip")
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier
+                            .height(34.dp)
+                            .testTag("kds_barista_chip_${barista.lowercase(Locale.US).replace(" ", "_")}")
                     )
                 }
             }
+
+            FilterChip(
+                selected = todayOnlyFilter,
+                onClick = { onToggleTodayOnlyFilter(!todayOnlyFilter) },
+                label = {
+                    Text(
+                        text = if (todayOnlyFilter) "Today ✓" else "All Days",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = Color(0xFF09090B),
+                    selectedLabelColor = Color.White,
+                    containerColor = Color(0xFFF4F4F5),
+                    labelColor = Color(0xFF52525B)
+                ),
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier
+                    .height(34.dp)
+                    .testTag("kds_today_filter_chip")
+            )
+
+            FilterChip(
+                selected = paidOnlyFilter,
+                onClick = { onTogglePaidOnlyFilter(!paidOnlyFilter) },
+                label = {
+                    Text(
+                        text = if (paidOnlyFilter) "Paid ✓" else "All",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = Color(0xFF16A34A),
+                    selectedLabelColor = Color.White,
+                    containerColor = Color(0xFFF4F4F5),
+                    labelColor = Color(0xFF52525B)
+                ),
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier
+                    .height(34.dp)
+                    .testTag("kds_paid_filter_chip")
+            )
         }
 
         if (queueItems.isEmpty()) {
@@ -244,15 +305,26 @@ fun KdsScreen(
                         modifier = Modifier.size(56.dp)
                     )
                     Text(
-                        text = if (paidOnlyFilter) "No pending Paid orders in queue" else "All orders are prepared!",
+                        text = when {
+                            paidOnlyFilter && todayOnlyFilter -> "No pending Paid orders for today"
+                            todayOnlyFilter -> "All orders are prepared!"
+                            paidOnlyFilter -> "No pending Paid orders in queue"
+                            else -> "All orders are prepared!"
+                        },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF18181B)
+                        color = Color(0xFF18181B),
+                        textAlign = TextAlign.Center
                     )
                     Text(
-                        text = "New orders will appear here automatically in FIFO order.",
+                        text = if (todayOnlyFilter) {
+                            "Today's new orders will appear here live in FIFO order. Tap 'Today ✓' to inspect older backlog."
+                        } else {
+                            "New orders will appear here automatically in FIFO order."
+                        },
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF71717A)
+                        color = Color(0xFF71717A),
+                        textAlign = TextAlign.Center
                     )
                 }
             }
@@ -261,8 +333,8 @@ fun KdsScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .testTag("kds_queue_list"),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(
                     items = queueItems,
@@ -305,7 +377,7 @@ private fun KdsQueueCard(
 
     Surface(
         color = cardBackground,
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(borderWidth, borderColor),
         shadowElevation = if (isMaking) 2.dp else 0.dp,
         modifier = Modifier
@@ -319,15 +391,15 @@ private fun KdsQueueCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 12.dp),
+                .padding(horizontal = 10.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // Queue Rank Badge
             Box(
                 modifier = Modifier
-                    .size(38.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(9.dp))
                     .background(if (isMaking) claimColor else Color(0xFF18181B)),
                 contentAlignment = Alignment.Center
             ) {
@@ -335,7 +407,9 @@ private fun KdsQueueCard(
                     text = "#${unit.queuePosition}",
                     color = Color.White,
                     fontWeight = FontWeight.Black,
-                    fontSize = 13.sp
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    softWrap = false
                 )
             }
 
@@ -351,7 +425,7 @@ private fun KdsQueueCard(
                     Text(
                         text = unit.itemName,
                         fontWeight = FontWeight.ExtraBold,
-                        fontSize = 16.sp,
+                        fontSize = 15.sp,
                         color = Color(0xFF09090B),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -367,6 +441,8 @@ private fun KdsQueueCard(
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color(0xFF27272A),
+                                maxLines = 1,
+                                softWrap = false,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                             )
                         }
@@ -375,7 +451,7 @@ private fun KdsQueueCard(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Surface(
                         color = Color(0xFFF4F4F5),
@@ -397,7 +473,9 @@ private fun KdsQueueCard(
                                 text = "#${unit.shortOrderNumber}",
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = Color(0xFF18181B)
+                                color = Color(0xFF18181B),
+                                maxLines = 1,
+                                softWrap = false
                             )
                         }
                     }
@@ -406,7 +484,9 @@ private fun KdsQueueCard(
                         text = timeFormatted,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Medium,
-                        color = Color(0xFF71717A)
+                        color = Color(0xFF71717A),
+                        maxLines = 1,
+                        softWrap = false
                     )
 
                     if (unit.customerName.isNotBlank() && !unit.customerName.equals("Walk-in", ignoreCase = true)) {
@@ -447,6 +527,8 @@ private fun KdsQueueCard(
                         fontSize = 10.sp,
                         fontWeight = FontWeight.ExtraBold,
                         color = if (unit.isPaid) Color(0xFF15803D) else Color(0xFFB91C1C),
+                        maxLines = 1,
+                        softWrap = false,
                         modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                     )
                 }
@@ -476,7 +558,8 @@ private fun KdsQueueCard(
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
-                                maxLines = 1
+                                maxLines = 1,
+                                softWrap = false
                             )
                         }
                     }
@@ -500,7 +583,9 @@ private fun KdsQueueCard(
                                 text = "Tap to Make",
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = Color.White
+                                color = Color.White,
+                                maxLines = 1,
+                                softWrap = false
                             )
                         }
                     }
@@ -527,7 +612,9 @@ private fun KdsMetricPill(
             color = contentColor,
             fontSize = 11.sp,
             fontWeight = FontWeight.ExtraBold,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
         )
     }
 }

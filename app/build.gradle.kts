@@ -17,8 +17,8 @@ android {
     applicationId = "filtr.coffee"
     minSdk = 24
     targetSdk = 36
-    versionCode = 17
-    versionName = "2.4.0"
+    versionCode = 18
+    versionName = "2.4.1"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

@@ -1317,6 +1317,7 @@ class MainActivity : ComponentActivity() {
                                     val staffRoster by viewModel.staffRoster.collectAsStateWithLifecycle()
                                     val teamRollCall by viewModel.teamRollCall.collectAsStateWithLifecycle()
                                     val selectedCheckInStaffName by viewModel.selectedCheckInStaffName.collectAsStateWithLifecycle()
+                                    val onDutyStaffKeys by viewModel.onDutyStaffKeysToday.collectAsStateWithLifecycle()
 
                                     AttendanceScreen(
                                         isManager = !isStaffMode,
@@ -1350,10 +1351,14 @@ class MainActivity : ComponentActivity() {
                                         onChangeRadiusMeters = { viewModel.updateStoreRadiusMeters(it) },
                                         staffRoster = staffRoster,
                                         teamRollCall = teamRollCall,
+                                        onDutyStaffKeys = onDutyStaffKeys,
                                         selectedCheckInStaffName = selectedCheckInStaffName,
                                         onSelectCheckInStaff = { viewModel.selectCheckInStaff(it) },
                                         onSaveStaffRosterMember = { id, name, role, shift, offDay, joinDate, active ->
                                             viewModel.saveStaffRosterMember(id, name, role, shift, offDay, joinDate, active)
+                                        },
+                                        onSaveStaffRosterMemberWithColor = { id, name, role, shift, offDay, joinDate, active, colorHex ->
+                                            viewModel.saveStaffRosterMember(id, name, role, shift, offDay, joinDate, active, colorHex)
                                         }
                                     )
                                 }
@@ -1363,15 +1368,20 @@ class MainActivity : ComponentActivity() {
                                     val staffRoster by viewModel.staffRoster.collectAsStateWithLifecycle()
                                     val activeBaristaName by viewModel.selectedKdsBaristaName.collectAsStateWithLifecycle()
                                     val paidOnlyFilter by viewModel.kdsPaidOnlyFilter.collectAsStateWithLifecycle()
+                                    val todayOnlyFilter by viewModel.kdsTodayOnlyFilter.collectAsStateWithLifecycle()
+                                    val onDutyStaffKeys by viewModel.onDutyStaffKeysToday.collectAsStateWithLifecycle()
                                     KdsScreen(
                                         queueItems = queueItems,
                                         availableBaristas = availableBaristas,
                                         staffRoster = staffRoster,
                                         activeBaristaName = activeBaristaName,
                                         paidOnlyFilter = paidOnlyFilter,
+                                        todayOnlyFilter = todayOnlyFilter,
+                                        onDutyStaffKeys = onDutyStaffKeys,
                                         isStaffMode = isStaffMode,
                                         onSelectBarista = { viewModel.selectKdsBarista(it) },
                                         onTogglePaidOnlyFilter = { viewModel.setKdsPaidOnlyFilter(it) },
+                                        onToggleTodayOnlyFilter = { viewModel.setKdsTodayOnlyFilter(it) },
                                         onTapQueueItem = { viewModel.onKdsItemTap(it) },
                                         onUnclaimQueueItem = { viewModel.onKdsItemUnclaim(it) }
                                     )

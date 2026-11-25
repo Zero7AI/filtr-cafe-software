@@ -672,35 +672,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val staffRoster: StateFlow<List<StaffRosterEntity>> = repository.allStaffRoster
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val onDutyStaffKeysToday: StateFlow<Set<String>> = combine(
+        _activeDateKey,
+        repository.allAttendanceLogs
+    ) { dateKey, allLogs ->
+        allLogs
+            .asSequence()
+            .filter {
+                it.dateKey == dateKey &&
+                    it.checkInTimestamp > 0L &&
+                    it.checkOutTimestamp == 0L
+            }
+            .map { AttendanceCalculator.normalizeStaffKey(it.staffName) }
+            .filter { it.isNotBlank() }
+            .toSet()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
+
     val availableAttendanceStaffNames: StateFlow<List<String>> = combine(
-        repository.allFixedCosts,
         _uiState.map { it.operatorName to it.registeredDevices }.distinctUntilChanged(),
         repository.allAttendanceLogs,
-        staffRoster
-    ) { fixedCostsList, (operatorName, registeredDevices), attendanceLogs, roster ->
-        val fromRoster = roster
-            .filter { it.isActive }
-            .map { it.name.trim() }
-        val fromFixedCosts = fixedCostsList.flatMap { fc ->
-            if (fc.staffMembersJson.isNotBlank()) {
-                fc.parseStaffMembers().map { it.name.trim() }
-            } else {
-                emptyList()
-            }
-        }
+        staffRoster,
+        onDutyStaffKeysToday
+    ) { (operatorName, registeredDevices), attendanceLogs, roster, onDutyKeys ->
         val fromDevices = registeredDevices
             .filter { it.appRole == "STAFF" }
             .map { it.operatorName.trim() }
         val fromLogs = attendanceLogs.map { it.staffName.trim() }
 
-        val combined = (fromRoster + fromFixedCosts + fromDevices + fromLogs + listOf(operatorName.trim()))
-            .filter { it.isNotBlank() }
-            .distinctBy { it.lowercase(Locale.US) }
-            .sortedWith(String.CASE_INSENSITIVE_ORDER)
-
-        combined.ifEmpty {
-            listOf(operatorName.trim().ifBlank { "Staff" })
-        }
+        AttendanceCalculator.resolveSelectableStaffNames(
+            roster = roster,
+            onDutyNormalizedKeys = onDutyKeys,
+            fallbackDeviceNames = fromDevices,
+            fallbackLogNames = fromLogs,
+            loggedInOperatorName = operatorName
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _selectedCheckInStaffName = MutableStateFlow("")
@@ -742,6 +747,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _kdsPaidOnlyFilter = MutableStateFlow(false)
     val kdsPaidOnlyFilter: StateFlow<Boolean> = _kdsPaidOnlyFilter.asStateFlow()
 
+    private val _kdsTodayOnlyFilter = MutableStateFlow(true)
+    val kdsTodayOnlyFilter: StateFlow<Boolean> = _kdsTodayOnlyFilter.asStateFlow()
+
     val kdsClaimsByKey: StateFlow<Map<String, KdsItemClaimEntity>> = repository.allKdsClaims
         .map { claims -> claims.associateBy { it.key } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
@@ -750,14 +758,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         repository.allOrders,
         kdsClaimsByKey,
         staffRoster,
-        _kdsPaidOnlyFilter
-    ) { orders, claimsMap, roster, paidOnly ->
+        _kdsPaidOnlyFilter,
+        _kdsTodayOnlyFilter,
+        _activeDateKey
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        val orders = values[0] as List<OrderWithItems>
+        @Suppress("UNCHECKED_CAST")
+        val claimsMap = values[1] as Map<String, KdsItemClaimEntity>
+        @Suppress("UNCHECKED_CAST")
+        val roster = values[2] as List<StaffRosterEntity>
+        val paidOnly = values[3] as Boolean
+        val todayOnly = values[4] as Boolean
+        val activeDateKey = values[5] as String
+
         val rosterMap = roster.associateBy { AttendanceCalculator.normalizeStaffKey(it.name) }
+        val minTs = if (todayOnly) KdsQueueBuilder.parseDateKeyStartMillis(activeDateKey) else null
         KdsQueueBuilder.buildFifoPendingQueue(
             orders = orders,
             claimsByKey = claimsMap,
             rosterByNormalizedName = rosterMap,
-            paidOnlyFilter = paidOnly
+            paidOnlyFilter = paidOnly,
+            minTimestampMs = minTs
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -1361,6 +1383,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
+        refreshDateKeyIfNeeded()
         _uiState.update { it.copy(currentTab = tab) }
     }
 
@@ -4738,7 +4761,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         shiftLabel: String,
         weeklyOffDayOfWeek: Int,
         joinedDateKey: String,
-        isActive: Boolean
+        isActive: Boolean,
+        colorHex: String = ""
     ) {
         if (!requireAdmin("Managing staff roster")) return
         val cleanName = name.trim()
@@ -4755,17 +4779,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch(Dispatchers.IO) {
+            val currentRoster = staffRoster.value.ifEmpty { repository.allStaffRoster.first() }
             val resolvedId = if (cleanExistingId != null) {
                 cleanExistingId
             } else {
                 val baseId = AttendanceCalculator.normalizeStaffKey(cleanName)
-                val currentRoster = staffRoster.value.ifEmpty { repository.allStaffRoster.first() }
                 if (currentRoster.any { it.id == baseId }) {
                     "${baseId}_${System.currentTimeMillis()}"
                 } else {
                     baseId
                 }
             }
+            val existingColor = cleanExistingId?.let { id ->
+                currentRoster.firstOrNull { it.id == id }?.colorHex.orEmpty()
+            }.orEmpty()
+            val resolvedColor = KdsBaristaColorPalette.resolveColorHex(
+                cleanName,
+                colorHex.trim().ifBlank { existingColor }
+            )
             val entity = StaffRosterEntity(
                 id = resolvedId,
                 name = cleanName,
@@ -4774,7 +4805,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 weeklyOffDayOfWeek = safeWeeklyOff,
                 joinedDateKey = effectiveJoinedDateKey,
                 isActive = isActive,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                colorHex = resolvedColor
             )
             val result = repository.saveStaffRosterMember(entity)
             result.onSuccess {
@@ -4813,6 +4845,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setKdsPaidOnlyFilter(paidOnly: Boolean) {
         _kdsPaidOnlyFilter.value = paidOnly
+    }
+
+    fun setKdsTodayOnlyFilter(todayOnly: Boolean) {
+        refreshDateKeyIfNeeded()
+        _kdsTodayOnlyFilter.value = todayOnly
     }
 
     fun onKdsItemTap(unit: KdsQueueUnitItem) {

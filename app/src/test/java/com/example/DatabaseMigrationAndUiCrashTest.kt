@@ -401,9 +401,11 @@ class DatabaseMigrationAndUiCrashTest {
                     staffRoster = listOf(somesh, kanha),
                     activeBaristaName = activeBarista,
                     paidOnlyFilter = false,
+                    todayOnlyFilter = true,
                     isStaffMode = true,
                     onSelectBarista = { activeBarista = it },
                     onTogglePaidOnlyFilter = {},
+                    onToggleTodayOnlyFilter = {},
                     onTapQueueItem = { unit ->
                         val existing = claimsMap[unit.claimKey]
                         claimsMap = if (existing == null) {
@@ -431,7 +433,9 @@ class DatabaseMigrationAndUiCrashTest {
             }
         }
 
-        // Switch active barista to Kanha, Tap 1 claims card, Tap 2 completes queue
+        // Verify compact header pill + Today filter + 2-tap claim & complete
+        composeTestRule.onNodeWithText("1 Left").assertExists()
+        composeTestRule.onNodeWithText("Today ✓").assertExists()
         composeTestRule.onNodeWithText("Kanha").performClick()
         composeTestRule.onNodeWithText("Iced Americano").performClick()
         composeTestRule.onNodeWithText("Kanha • Tap Done").assertExists()
