@@ -9,6 +9,7 @@ import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
 import com.example.data.dao.InventoryDao
+import com.example.data.dao.KitchenInventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
@@ -20,10 +21,14 @@ import com.example.data.entity.InventoryItemEntity
 import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryUsageEntity
+import com.example.data.entity.KitchenInventoryEntryEntity
+import com.example.data.entity.KitchenInventoryItemEntity
+import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.UpiAccountEntity
+import com.example.domain.kitchen.KitchenInventorySeedCatalog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -38,9 +43,11 @@ import java.util.Locale
         MenuItemEntity::class, OrderEntity::class, OrderItemEntity::class, UpiAccountEntity::class,
         InventoryItemEntity::class, InventoryOrderEntity::class, InventoryOrderItemEntity::class,
         InventoryUsageEntity::class, CustomerEntity::class, FixedCostEntity::class,
-        ChecklistTaskEntity::class, ChecklistCompletionEntity::class
+        ChecklistTaskEntity::class, ChecklistCompletionEntity::class,
+        KitchenInventoryItemEntity::class, KitchenInventoryShiftEntity::class,
+        KitchenInventoryEntryEntity::class
     ],
-    version = 13,
+    version = 14,
     exportSchema = false
 )
 abstract class FiltrDatabase : RoomDatabase() {
@@ -51,6 +58,7 @@ abstract class FiltrDatabase : RoomDatabase() {
     abstract fun customerDao(): CustomerDao
     abstract fun fixedCostDao(): FixedCostDao
     abstract fun checklistDao(): ChecklistDao
+    abstract fun kitchenInventoryDao(): KitchenInventoryDao
 
     companion object {
         @Volatile
@@ -193,6 +201,66 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_13_14 = object : androidx.room.migration.Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `kitchen_inventory_items` (
+                        `id` TEXT NOT NULL PRIMARY KEY,
+                        `name` TEXT NOT NULL,
+                        `iconEmoji` TEXT NOT NULL DEFAULT '📦',
+                        `sectionId` TEXT NOT NULL,
+                        `countingMode` TEXT NOT NULL,
+                        `unitLabel` TEXT NOT NULL,
+                        `containerLabel` TEXT NOT NULL DEFAULT 'packets',
+                        `packSize` REAL NOT NULL DEFAULT 1.0,
+                        `minStockThreshold` REAL NOT NULL DEFAULT 1.0,
+                        `targetStockLevel` REAL NOT NULL DEFAULT 2.0,
+                        `orderIndex` INTEGER NOT NULL DEFAULT 0,
+                        `isDefault` INTEGER NOT NULL DEFAULT 1,
+                        `isActive` INTEGER NOT NULL DEFAULT 1,
+                        `updatedAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                """.trimIndent())
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `kitchen_inventory_shifts` (
+                        `id` TEXT NOT NULL PRIMARY KEY,
+                        `dateKey` TEXT NOT NULL,
+                        `shiftType` TEXT NOT NULL,
+                        `status` TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                        `staffName` TEXT NOT NULL DEFAULT 'Staff',
+                        `startedAt` INTEGER NOT NULL DEFAULT 0,
+                        `submittedAt` INTEGER NOT NULL DEFAULT 0,
+                        `lastUpdatedAt` INTEGER NOT NULL DEFAULT 0,
+                        `notes` TEXT NOT NULL DEFAULT ''
+                    )
+                """.trimIndent())
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `kitchen_inventory_entries` (
+                        `shiftId` TEXT NOT NULL,
+                        `dateKey` TEXT NOT NULL,
+                        `shiftType` TEXT NOT NULL,
+                        `itemId` TEXT NOT NULL,
+                        `itemNameSnapshot` TEXT NOT NULL,
+                        `sectionIdSnapshot` TEXT NOT NULL,
+                        `unitLabelSnapshot` TEXT NOT NULL,
+                        `countingModeSnapshot` TEXT NOT NULL,
+                        `packSizeSnapshot` REAL NOT NULL,
+                        `sealedQty` INTEGER NOT NULL DEFAULT 0,
+                        `openedQty` INTEGER NOT NULL DEFAULT 0,
+                        `openedRemainingQty` REAL NOT NULL DEFAULT 0.0,
+                        `totalUsableQty` REAL NOT NULL DEFAULT 0.0,
+                        `wastageQty` REAL NOT NULL DEFAULT 0.0,
+                        `wastageReason` TEXT NOT NULL DEFAULT '',
+                        `stockStatus` TEXT NOT NULL DEFAULT 'GREEN',
+                        `isChecked` INTEGER NOT NULL DEFAULT 0,
+                        `checkedBy` TEXT NOT NULL DEFAULT '',
+                        `checkedAt` INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(`shiftId`, `itemId`)
+                    )
+                """.trimIndent())
+            }
+        }
+
         internal fun getInstanceOrNull(): FiltrDatabase? = INSTANCE
 
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
@@ -202,7 +270,7 @@ abstract class FiltrDatabase : RoomDatabase() {
                     FiltrDatabase::class.java,
                     "filtr_coffee_db"
                 )
-                .addMigrations(MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)
+                .addMigrations(MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14)
                 .fallbackToDestructiveMigration(true) // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))
                 .build()
@@ -226,6 +294,7 @@ abstract class FiltrDatabase : RoomDatabase() {
                         populateInitialUpiAccount(database.upiAccountDao())
                         populateInitialFixedCosts(database.fixedCostDao())
                         populateInitialChecklistTasks(database.checklistDao())
+                        populateInitialKitchenInventory(database.kitchenInventoryDao())
                     }
                 }
             }
@@ -238,6 +307,7 @@ abstract class FiltrDatabase : RoomDatabase() {
                     seedMutex.withLock {
                         // Do not re-seed fixed_costs on every open so admin deletions persist
                         populateInitialChecklistTasks(database.checklistDao())
+                        populateInitialKitchenInventory(database.kitchenInventoryDao())
                     }
                 }
             }
@@ -547,6 +617,11 @@ abstract class FiltrDatabase : RoomDatabase() {
             )
 
             checklistDao.insertTasks(defaultTasks)
+        }
+
+        suspend fun populateInitialKitchenInventory(kitchenInventoryDao: KitchenInventoryDao) {
+            if (kitchenInventoryDao.getItemCountSync() > 0) return
+            kitchenInventoryDao.insertItems(KitchenInventorySeedCatalog.defaultItems())
         }
     }
 }

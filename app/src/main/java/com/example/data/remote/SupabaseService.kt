@@ -1556,6 +1556,32 @@ class SupabaseService private constructor() {
         saveSyncMetadata("checklist_custom_tasks", json)
     }
 
+    // ==================== KITCHEN INVENTORY CLOUD SYNC (via sync_metadata) ====================
+
+    suspend fun fetchCloudKitchenCatalog(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("kitchen_inv_catalog")
+    }
+
+    suspend fun saveCloudKitchenCatalog(json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("kitchen_inv_catalog", json)
+    }
+
+    suspend fun fetchCloudKitchenShift(shiftId: String): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("kitchen_inv_shift_$shiftId")
+    }
+
+    suspend fun saveCloudKitchenShift(shiftId: String, json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("kitchen_inv_shift_$shiftId", json)
+    }
+
+    suspend fun fetchCloudKitchenShiftIndex(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("kitchen_inv_shift_index")
+    }
+
+    suspend fun saveCloudKitchenShiftIndex(json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("kitchen_inv_shift_index", json)
+    }
+
     // ==================== DEEPGRAM REMOTE CONFIG ====================
 
     data class DeepgramConfig(

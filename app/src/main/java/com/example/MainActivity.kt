@@ -44,6 +44,7 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Inventory
+import androidx.compose.material.icons.filled.Kitchen
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.People
@@ -93,6 +94,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.ui.FiltrTab
+import com.example.ui.KitchenInventoryViewRoute
 import com.example.ui.MainViewModel
 import com.example.ui.STAFF_ALLOWED_TABS
 import com.example.ui.components.AccountsUpiDialog
@@ -114,6 +116,7 @@ import com.example.ui.screens.ChecklistScreen
 import com.example.ui.screens.CustomersScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.InventoriesScreen
+import com.example.ui.screens.KitchenInventoryScreen
 import com.example.ui.screens.ManualInventoryScreen
 import com.example.ui.screens.InventoryOrderScreen
 import com.example.ui.screens.InventoryUsageScreen
@@ -310,6 +313,25 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     NavigationDrawerItem(
+                                        label = { Text("Kitchen Inventory", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Kitchen, contentDescription = null, tint = Color(0xFF38BDF8)) },
+                                        selected = uiState.currentTab == FiltrTab.KITCHEN_INVENTORY,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.KITCHEN_INVENTORY)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFF38BDF8).copy(alpha = 0.2f),
+                                            selectedIconColor = Color(0xFF38BDF8),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
                                         label = { Text("Inventories Manual", fontWeight = FontWeight.Bold) },
                                         icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null, tint = Color(0xFFF59E0B)) },
                                         selected = uiState.currentTab == FiltrTab.MANUAL_INVENTORY,
@@ -468,6 +490,25 @@ class MainActivity : ComponentActivity() {
                                         colors = NavigationDrawerItemDefaults.colors(
                                             selectedContainerColor = Color(0xFF10B981).copy(alpha = 0.25f),
                                             selectedIconColor = Color(0xFF10B981),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Kitchen Inventory", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Kitchen, contentDescription = null, tint = Color(0xFF38BDF8)) },
+                                        selected = uiState.currentTab == FiltrTab.KITCHEN_INVENTORY,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.KITCHEN_INVENTORY)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFF38BDF8).copy(alpha = 0.2f),
+                                            selectedIconColor = Color(0xFF38BDF8),
                                             selectedTextColor = Color.White,
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
@@ -810,20 +851,35 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.testTag("tab_orders")
                                     )
 
-                                    NavigationBarItem(
-                                        selected = uiState.currentTab == FiltrTab.CHECKLIST,
-                                        onClick = { viewModel.selectTab(FiltrTab.CHECKLIST) },
-                                        icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check List") },
-                                        label = { Text("Check List", fontWeight = FontWeight.Bold) },
-                                        colors = NavigationBarItemDefaults.colors(
-                                            selectedIconColor = Color(0xFF09090B),
-                                            selectedTextColor = Color.White,
-                                            indicatorColor = Color(0xFF10B981),
-                                            unselectedIconColor = Color.White.copy(alpha = 0.6f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.6f)
-                                        ),
-                                        modifier = Modifier.testTag("tab_checklist")
-                                    )
+                                     NavigationBarItem(
+                                         selected = uiState.currentTab == FiltrTab.CHECKLIST,
+                                         onClick = { viewModel.selectTab(FiltrTab.CHECKLIST) },
+                                         icon = { Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check List") },
+                                         label = { Text("Check List", fontWeight = FontWeight.Bold, maxLines = 1) },
+                                         colors = NavigationBarItemDefaults.colors(
+                                             selectedIconColor = Color(0xFF09090B),
+                                             selectedTextColor = Color.White,
+                                             indicatorColor = Color(0xFF10B981),
+                                             unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                             unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                         ),
+                                         modifier = Modifier.testTag("tab_checklist")
+                                     )
+
+                                     NavigationBarItem(
+                                         selected = uiState.currentTab == FiltrTab.KITCHEN_INVENTORY,
+                                         onClick = { viewModel.selectTab(FiltrTab.KITCHEN_INVENTORY) },
+                                         icon = { Icon(imageVector = Icons.Default.Kitchen, contentDescription = "Kitchen") },
+                                         label = { Text("Kitchen", fontWeight = FontWeight.Bold, maxLines = 1) },
+                                         colors = NavigationBarItemDefaults.colors(
+                                             selectedIconColor = Color(0xFF09090B),
+                                             selectedTextColor = Color.White,
+                                             indicatorColor = Color(0xFF38BDF8),
+                                             unselectedIconColor = Color.White.copy(alpha = 0.6f),
+                                             unselectedTextColor = Color.White.copy(alpha = 0.6f)
+                                         ),
+                                         modifier = Modifier.testTag("tab_kitchen_inventory")
+                                     )
                                 } else {
                                     NavigationBarItem(
                                         selected = uiState.currentTab == FiltrTab.VOICE_ORDER,
@@ -1145,6 +1201,67 @@ class MainActivity : ComponentActivity() {
                                         onDismissAddDialog = { viewModel.dismissAddChecklistTaskDialog() },
                                         onAddTask = { title, section, notes -> viewModel.addChecklistTask(title, section, notes) },
                                         onDeleteTask = { viewModel.deleteChecklistTask(it) }
+                                    )
+                                }
+                                FiltrTab.KITCHEN_INVENTORY -> {
+                                    val summary by viewModel.kitchenDashboardSummary.collectAsStateWithLifecycle()
+                                    val route by viewModel.kitchenRoute.collectAsStateWithLifecycle()
+                                    val activeItems by viewModel.kitchenActiveItems.collectAsStateWithLifecycle()
+                                    val allItems by viewModel.kitchenAllItems.collectAsStateWithLifecycle()
+                                    val entriesToday by viewModel.kitchenEntriesToday.collectAsStateWithLifecycle()
+                                    val allShifts by viewModel.kitchenAllShifts.collectAsStateWithLifecycle()
+                                    val allEntries by viewModel.kitchenAllEntries.collectAsStateWithLifecycle()
+                                    val prevClosingShift by viewModel.previousClosingShift.collectAsStateWithLifecycle()
+                                    val prevClosingEntries by viewModel.previousClosingEntries.collectAsStateWithLifecycle()
+
+                                    KitchenInventoryScreen(
+                                        isManager = !isStaffMode,
+                                        summary = summary,
+                                        route = route,
+                                        activeItems = activeItems,
+                                        allItems = allItems,
+                                        entriesToday = entriesToday,
+                                        allShifts = allShifts,
+                                        allEntries = allEntries,
+                                        previousClosingShift = prevClosingShift,
+                                        previousClosingEntries = prevClosingEntries,
+                                        onNavigate = { viewModel.navigateKitchenRoute(it) },
+                                        onStartOrResumeShift = { viewModel.startOrResumeKitchenShift(it) },
+                                        onOpenFirstUnchecked = { shiftType, secId ->
+                                            viewModel.openFirstUncheckedKitchenItem(shiftType, secId)
+                                        },
+                                        onSaveItemAndAdvance = { shiftType, item, sealedQty, openedQty, openedRemainingQty, wastageQty, wastageReason, nextItemId, nextSectionId ->
+                                            viewModel.saveKitchenItemAndAdvance(
+                                                shiftType = shiftType,
+                                                item = item,
+                                                sealedQty = sealedQty,
+                                                openedQty = openedQty,
+                                                openedRemainingQty = openedRemainingQty,
+                                                wastageQty = wastageQty,
+                                                wastageReason = wastageReason,
+                                                nextItemId = nextItemId,
+                                                nextSectionId = nextSectionId
+                                            )
+                                        },
+                                        onSubmitShift = { shiftType, notes ->
+                                            viewModel.submitKitchenShift(shiftType, notes)
+                                        },
+                                        onSaveItemConfig = { existingId, name, emoji, sectionId, countingMode, unitLabel, containerLabel, packSize, minThreshold, targetLevel, isActive ->
+                                            viewModel.saveKitchenCatalogItemConfig(
+                                                existingId = existingId,
+                                                name = name,
+                                                iconEmoji = emoji,
+                                                sectionId = sectionId,
+                                                countingMode = countingMode,
+                                                unitLabel = unitLabel,
+                                                containerLabel = containerLabel,
+                                                packSize = packSize,
+                                                minStockThreshold = minThreshold,
+                                                targetStockLevel = targetLevel,
+                                                isActive = isActive
+                                            )
+                                        },
+                                        onRefresh = { viewModel.refreshKitchenInventory() }
                                     )
                                 }
                                 FiltrTab.MANUAL_INVENTORY -> {

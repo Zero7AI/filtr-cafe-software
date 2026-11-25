@@ -6,6 +6,7 @@ import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
 import com.example.data.dao.InventoryDao
+import com.example.data.dao.KitchenInventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
@@ -20,6 +21,11 @@ import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.InventoryUsageEntity
+import com.example.data.entity.KitchenInventoryEntryEntity
+import com.example.data.entity.KitchenInventoryItemEntity
+import com.example.data.entity.KitchenInventoryShiftEntity
+import com.example.domain.kitchen.KitchenInventoryCalculator
+import com.example.domain.kitchen.KitchenShiftType
 import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
@@ -54,6 +60,7 @@ class FiltrRepository(
     private val customerDao: CustomerDao? = null,
     private val fixedCostDao: FixedCostDao? = null,
     private val checklistDao: ChecklistDao? = null,
+    private val kitchenInventoryDao: KitchenInventoryDao? = null,
     private val sheetsSyncService: GoogleSheetsSyncService = GoogleSheetsSyncService(),
     private val geminiVoiceService: GeminiVoiceOrderService = GeminiVoiceOrderService(),
     private val deepgramVoiceService: DeepgramVoiceService = DeepgramVoiceService.getInstance(),
@@ -70,6 +77,7 @@ class FiltrRepository(
     private val stockMutex = Mutex()
     private val menuSyncMutex = Mutex()
     private val checklistSyncMutex = Mutex()
+    private val kitchenInventorySyncMutex = Mutex()
     private val customerSyncMutex = Mutex()
 
     @Volatile
@@ -111,6 +119,18 @@ class FiltrRepository(
     val allCustomers: Flow<List<CustomerEntity>> = customerDao?.getAllCustomers() ?: flowOf(emptyList())
     val allFixedCosts: Flow<List<FixedCostEntity>> = fixedCostDao?.getAllFixedCosts() ?: flowOf(emptyList())
     val allChecklistTasks: Flow<List<ChecklistTaskEntity>> = checklistDao?.getAllTasks() ?: flowOf(emptyList())
+    val activeKitchenItems: Flow<List<KitchenInventoryItemEntity>> = kitchenInventoryDao?.getActiveItems() ?: flowOf(emptyList())
+    val allKitchenItems: Flow<List<KitchenInventoryItemEntity>> = kitchenInventoryDao?.getAllItems() ?: flowOf(emptyList())
+    val allKitchenShifts: Flow<List<KitchenInventoryShiftEntity>> = kitchenInventoryDao?.getAllShifts() ?: flowOf(emptyList())
+    val allKitchenEntries: Flow<List<KitchenInventoryEntryEntity>> = kitchenInventoryDao?.getAllEntries() ?: flowOf(emptyList())
+
+    fun getKitchenShiftsForDate(dateKey: String): Flow<List<KitchenInventoryShiftEntity>> {
+        return kitchenInventoryDao?.getShiftsForDate(dateKey) ?: flowOf(emptyList())
+    }
+
+    fun getKitchenEntriesForDate(dateKey: String): Flow<List<KitchenInventoryEntryEntity>> {
+        return kitchenInventoryDao?.getEntriesForDate(dateKey) ?: flowOf(emptyList())
+    }
 
     fun getChecklistCompletionsForDate(dateKey: String): Flow<List<ChecklistCompletionEntity>> {
         return checklistDao?.getCompletionsForDate(dateKey) ?: flowOf(emptyList())
@@ -2307,6 +2327,403 @@ class FiltrRepository(
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "reconcileChecklistFromCloud failed: ${e.message}")
+            }
+        }
+    }
+
+    // ==================== SMART DAILY KITCHEN INVENTORY ====================
+
+    suspend fun ensureKitchenShiftStarted(
+        dateKey: String,
+        shiftType: KitchenShiftType,
+        staffName: String
+    ): KitchenInventoryShiftEntity {
+        val dao = kitchenInventoryDao ?: throw IllegalStateException("KitchenInventoryDao unavailable")
+        val shiftId = KitchenInventoryCalculator.buildShiftId(dateKey, shiftType)
+        val existing = dao.getShiftById(shiftId)
+        if (existing != null) return existing
+
+        val now = System.currentTimeMillis()
+        val cleanStaff = staffName.trim().ifBlank { "Staff" }
+        val newShift = KitchenInventoryShiftEntity(
+            id = shiftId,
+            dateKey = dateKey,
+            shiftType = shiftType.id,
+            status = "IN_PROGRESS",
+            staffName = cleanStaff,
+            startedAt = now,
+            submittedAt = 0L,
+            lastUpdatedAt = now,
+            notes = ""
+        )
+        dao.upsertShift(newShift)
+        launchManagedSync {
+            kitchenInventorySyncMutex.withLock {
+                syncKitchenShiftToCloud(shiftId)
+            }
+        }
+        return newShift
+    }
+
+    suspend fun saveKitchenItemEntry(
+        dateKey: String,
+        shiftType: KitchenShiftType,
+        item: KitchenInventoryItemEntity,
+        sealedQty: Int,
+        openedQty: Int,
+        openedRemainingQty: Double,
+        wastageQty: Double,
+        wastageReason: String,
+        checkedBy: String
+    ): Result<KitchenInventoryEntryEntity> {
+        val dao = kitchenInventoryDao ?: return Result.failure(IllegalStateException("KitchenInventoryDao unavailable"))
+        return try {
+            val shiftId = KitchenInventoryCalculator.buildShiftId(dateKey, shiftType)
+            val existingShift = dao.getShiftById(shiftId)
+            if (existingShift != null && !KitchenInventoryCalculator.canSubmitShift(existingShift)) {
+                return Result.failure(IllegalStateException("${shiftType.label} for $dateKey is already submitted"))
+            }
+
+            val cleanStaff = checkedBy.trim().ifBlank { "Staff" }
+            val now = System.currentTimeMillis()
+            val shiftHeader = (existingShift ?: KitchenInventoryShiftEntity(
+                id = shiftId,
+                dateKey = dateKey,
+                shiftType = shiftType.id,
+                status = "IN_PROGRESS",
+                staffName = cleanStaff,
+                startedAt = now,
+                submittedAt = 0L,
+                lastUpdatedAt = now,
+                notes = ""
+            )).copy(
+                staffName = cleanStaff,
+                lastUpdatedAt = now
+            )
+
+            val totalUsable = KitchenInventoryCalculator.calculateTotalUsableQty(
+                countingMode = item.countingMode,
+                packSize = item.packSize,
+                sealedQty = sealedQty,
+                openedQty = openedQty,
+                openedRemainingQty = openedRemainingQty
+            )
+            val status = KitchenInventoryCalculator.evaluateStockStatus(
+                totalUsableQty = totalUsable,
+                minStockThreshold = item.minStockThreshold
+            )
+            val entry = KitchenInventoryEntryEntity(
+                shiftId = shiftId,
+                dateKey = dateKey,
+                shiftType = shiftType.id,
+                itemId = item.id,
+                itemNameSnapshot = item.name,
+                sectionIdSnapshot = item.sectionId,
+                unitLabelSnapshot = item.unitLabel,
+                countingModeSnapshot = item.countingMode,
+                packSizeSnapshot = item.packSize,
+                sealedQty = sealedQty.coerceAtLeast(0),
+                openedQty = openedQty.coerceAtLeast(0),
+                openedRemainingQty = openedRemainingQty.coerceAtLeast(0.0),
+                totalUsableQty = totalUsable,
+                wastageQty = if (shiftType == KitchenShiftType.CLOSING) wastageQty.coerceAtLeast(0.0) else 0.0,
+                wastageReason = if (shiftType == KitchenShiftType.CLOSING) wastageReason.trim() else "",
+                stockStatus = status.id,
+                isChecked = true,
+                checkedBy = cleanStaff,
+                checkedAt = now
+            )
+
+            runInTransaction {
+                dao.upsertShift(shiftHeader)
+                dao.upsertEntry(entry)
+            }
+
+            launchManagedSync {
+                kitchenInventorySyncMutex.withLock {
+                    syncKitchenShiftToCloud(shiftId)
+                }
+            }
+            Result.success(entry)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveKitchenItemEntry error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun submitKitchenShift(
+        dateKey: String,
+        shiftType: KitchenShiftType,
+        staffName: String,
+        notes: String = ""
+    ): Result<KitchenInventoryShiftEntity> {
+        val dao = kitchenInventoryDao ?: return Result.failure(IllegalStateException("KitchenInventoryDao unavailable"))
+        return try {
+            val shiftId = KitchenInventoryCalculator.buildShiftId(dateKey, shiftType)
+            val existing = dao.getShiftById(shiftId)
+            if (!KitchenInventoryCalculator.canSubmitShift(existing)) {
+                return Result.failure(IllegalStateException("${shiftType.label} has already been submitted for $dateKey"))
+            }
+            val now = System.currentTimeMillis()
+            val cleanStaff = staffName.trim().ifBlank { existing?.staffName?.ifBlank { "Staff" } ?: "Staff" }
+            val submitted = (existing ?: KitchenInventoryShiftEntity(
+                id = shiftId,
+                dateKey = dateKey,
+                shiftType = shiftType.id,
+                status = "IN_PROGRESS",
+                staffName = cleanStaff,
+                startedAt = now
+            )).copy(
+                status = "SUBMITTED",
+                staffName = cleanStaff,
+                submittedAt = now,
+                lastUpdatedAt = now,
+                notes = notes.trim()
+            )
+            dao.upsertShift(submitted)
+
+            launchManagedSync {
+                kitchenInventorySyncMutex.withLock {
+                    syncKitchenShiftToCloud(shiftId)
+                }
+            }
+            Result.success(submitted)
+        } catch (e: Exception) {
+            Log.e(TAG, "submitKitchenShift error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun saveKitchenCatalogItem(item: KitchenInventoryItemEntity): Result<Unit> {
+        val dao = kitchenInventoryDao ?: return Result.failure(IllegalStateException("KitchenInventoryDao unavailable"))
+        return try {
+            val now = System.currentTimeMillis()
+            dao.upsertItem(item.copy(updatedAt = now))
+            launchManagedSync {
+                kitchenInventorySyncMutex.withLock {
+                    syncKitchenCatalogToCloud()
+                }
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveKitchenCatalogItem error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getPreviousClosingReference(dateKey: String): Pair<KitchenInventoryShiftEntity?, List<KitchenInventoryEntryEntity>> {
+        val dao = kitchenInventoryDao ?: return Pair(null, emptyList())
+        val allShifts = dao.getAllShiftsSync()
+        val prevClosing = allShifts
+            .filter { it.shiftType == KitchenShiftType.CLOSING.id && it.status == "SUBMITTED" && it.dateKey < dateKey }
+            .maxWithOrNull(compareBy<KitchenInventoryShiftEntity> { it.dateKey }.thenBy { it.submittedAt })
+            ?: return Pair(null, emptyList())
+        return Pair(prevClosing, dao.getEntriesForShiftSync(prevClosing.id))
+    }
+
+    private suspend fun syncKitchenCatalogToCloud() {
+        val dao = kitchenInventoryDao ?: return
+        try {
+            val items = dao.getAllItemsSync()
+            val arr = JSONArray()
+            for (item in items) {
+                arr.put(JSONObject().apply {
+                    put("id", item.id)
+                    put("name", item.name)
+                    put("iconEmoji", item.iconEmoji)
+                    put("sectionId", item.sectionId)
+                    put("countingMode", item.countingMode)
+                    put("unitLabel", item.unitLabel)
+                    put("containerLabel", item.containerLabel)
+                    put("packSize", item.packSize)
+                    put("minStockThreshold", item.minStockThreshold)
+                    put("targetStockLevel", item.targetStockLevel)
+                    put("orderIndex", item.orderIndex)
+                    put("isDefault", item.isDefault)
+                    put("isActive", item.isActive)
+                    put("updatedAt", item.updatedAt)
+                })
+            }
+            supabaseService.saveCloudKitchenCatalog(arr.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "syncKitchenCatalogToCloud failed: ${e.message}")
+        }
+    }
+
+    private suspend fun syncKitchenShiftToCloud(shiftId: String) {
+        val dao = kitchenInventoryDao ?: return
+        try {
+            val shift = dao.getShiftById(shiftId) ?: return
+            val entries = dao.getEntriesForShiftSync(shiftId)
+            val payload = JSONObject().apply {
+                put("id", shift.id)
+                put("dateKey", shift.dateKey)
+                put("shiftType", shift.shiftType)
+                put("status", shift.status)
+                put("staffName", shift.staffName)
+                put("startedAt", shift.startedAt)
+                put("submittedAt", shift.submittedAt)
+                put("lastUpdatedAt", shift.lastUpdatedAt)
+                put("notes", shift.notes)
+                val entriesArr = JSONArray()
+                for (entry in entries) {
+                    entriesArr.put(JSONObject().apply {
+                        put("shiftId", entry.shiftId)
+                        put("dateKey", entry.dateKey)
+                        put("shiftType", entry.shiftType)
+                        put("itemId", entry.itemId)
+                        put("itemNameSnapshot", entry.itemNameSnapshot)
+                        put("sectionIdSnapshot", entry.sectionIdSnapshot)
+                        put("unitLabelSnapshot", entry.unitLabelSnapshot)
+                        put("countingModeSnapshot", entry.countingModeSnapshot)
+                        put("packSizeSnapshot", entry.packSizeSnapshot)
+                        put("sealedQty", entry.sealedQty)
+                        put("openedQty", entry.openedQty)
+                        put("openedRemainingQty", entry.openedRemainingQty)
+                        put("totalUsableQty", entry.totalUsableQty)
+                        put("wastageQty", entry.wastageQty)
+                        put("wastageReason", entry.wastageReason)
+                        put("stockStatus", entry.stockStatus)
+                        put("isChecked", entry.isChecked)
+                        put("checkedBy", entry.checkedBy)
+                        put("checkedAt", entry.checkedAt)
+                    })
+                }
+                put("entries", entriesArr)
+            }
+            supabaseService.saveCloudKitchenShift(shiftId, payload.toString())
+
+            val recentShiftIds = dao.getAllShiftsSync().take(30).map { it.id }
+            val indexArr = JSONArray()
+            recentShiftIds.forEach { indexArr.put(it) }
+            supabaseService.saveCloudKitchenShiftIndex(indexArr.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "syncKitchenShiftToCloud failed: ${e.message}")
+        }
+    }
+
+    suspend fun reconcileKitchenInventoryFromCloud(activeDateKey: String) {
+        val dao = kitchenInventoryDao ?: return
+        kitchenInventorySyncMutex.withLock {
+            try {
+                // 1. Reconcile catalog by updatedAt timestamp
+                val catalogJson = supabaseService.fetchCloudKitchenCatalog()
+                if (!catalogJson.isNullOrBlank() && catalogJson.startsWith("[")) {
+                    val arr = JSONArray(catalogJson)
+                    val localById = dao.getAllItemsSync().associateBy { it.id }
+                    val toUpsert = mutableListOf<KitchenInventoryItemEntity>()
+                    var localNewer = false
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        val id = o.optNonNullString("id", "")
+                        if (id.isBlank()) continue
+                        val cloudUpdated = o.optLong("updatedAt", 0L)
+                        val cloudItem = KitchenInventoryItemEntity(
+                            id = id,
+                            name = o.optNonNullString("name", ""),
+                            iconEmoji = o.optNonNullString("iconEmoji", "📦").ifBlank { "📦" },
+                            sectionId = o.optNonNullString("sectionId", "NORMAL_TEMPERATURE"),
+                            countingMode = o.optNonNullString("countingMode", "DIRECT_PIECES"),
+                            unitLabel = o.optNonNullString("unitLabel", "pcs"),
+                            containerLabel = o.optNonNullString("containerLabel", ""),
+                            packSize = o.optDouble("packSize", 1.0),
+                            minStockThreshold = o.optDouble("minStockThreshold", 1.0),
+                            targetStockLevel = o.optDouble("targetStockLevel", 2.0),
+                            orderIndex = o.optInt("orderIndex", 0),
+                            isDefault = o.optBoolean("isDefault", false),
+                            isActive = o.optBoolean("isActive", true),
+                            updatedAt = cloudUpdated
+                        )
+                        val local = localById[id]
+                        if (local == null || cloudUpdated > local.updatedAt) {
+                            toUpsert.add(cloudItem)
+                        } else if (local.updatedAt > cloudUpdated) {
+                            localNewer = true
+                        }
+                    }
+                    if (toUpsert.isNotEmpty()) dao.insertItems(toUpsert)
+                    if (localNewer) syncKitchenCatalogToCloud()
+                } else {
+                    if (dao.getAllItemsSync().any { it.updatedAt > 0L }) {
+                        syncKitchenCatalogToCloud()
+                    }
+                }
+
+                // 2. Reconcile shifts (active date + recent index)
+                val targetShiftIds = linkedSetOf(
+                    KitchenInventoryCalculator.buildShiftId(activeDateKey, KitchenShiftType.OPENING),
+                    KitchenInventoryCalculator.buildShiftId(activeDateKey, KitchenShiftType.CLOSING)
+                )
+                val indexJson = supabaseService.fetchCloudKitchenShiftIndex()
+                if (!indexJson.isNullOrBlank() && indexJson.startsWith("[")) {
+                    val idxArr = JSONArray(indexJson)
+                    for (i in 0 until idxArr.length()) {
+                        val sid = idxArr.optString(i, "")
+                        if (sid.isNotBlank()) targetShiftIds.add(sid)
+                    }
+                }
+
+                for (shiftId in targetShiftIds.take(14)) {
+                    val shiftJson = supabaseService.fetchCloudKitchenShift(shiftId)
+                    if (!shiftJson.isNullOrBlank() && shiftJson.startsWith("{")) {
+                        val o = JSONObject(shiftJson)
+                        val cloudUpdatedAt = o.optLong("lastUpdatedAt", 0L)
+                        val localShift = dao.getShiftById(shiftId)
+                        if (localShift == null || cloudUpdatedAt > localShift.lastUpdatedAt) {
+                            val cloudShift = KitchenInventoryShiftEntity(
+                                id = shiftId,
+                                dateKey = o.optNonNullString("dateKey", activeDateKey),
+                                shiftType = o.optNonNullString("shiftType", "OPENING"),
+                                status = o.optNonNullString("status", "IN_PROGRESS"),
+                                staffName = o.optNonNullString("staffName", "Staff"),
+                                startedAt = o.optLong("startedAt", 0L),
+                                submittedAt = o.optLong("submittedAt", 0L),
+                                lastUpdatedAt = cloudUpdatedAt,
+                                notes = o.optNonNullString("notes", "")
+                            )
+                            val entriesArr = o.optJSONArray("entries") ?: JSONArray()
+                            val cloudEntries = mutableListOf<KitchenInventoryEntryEntity>()
+                            for (j in 0 until entriesArr.length()) {
+                                val eo = entriesArr.getJSONObject(j)
+                                val itemId = eo.optNonNullString("itemId", "")
+                                if (itemId.isBlank()) continue
+                                cloudEntries.add(
+                                    KitchenInventoryEntryEntity(
+                                        shiftId = shiftId,
+                                        dateKey = eo.optNonNullString("dateKey", cloudShift.dateKey),
+                                        shiftType = eo.optNonNullString("shiftType", cloudShift.shiftType),
+                                        itemId = itemId,
+                                        itemNameSnapshot = eo.optNonNullString("itemNameSnapshot", ""),
+                                        sectionIdSnapshot = eo.optNonNullString("sectionIdSnapshot", ""),
+                                        unitLabelSnapshot = eo.optNonNullString("unitLabelSnapshot", "pcs"),
+                                        countingModeSnapshot = eo.optNonNullString("countingModeSnapshot", "DIRECT_PIECES"),
+                                        packSizeSnapshot = eo.optDouble("packSizeSnapshot", 1.0),
+                                        sealedQty = eo.optInt("sealedQty", 0),
+                                        openedQty = eo.optInt("openedQty", 0),
+                                        openedRemainingQty = eo.optDouble("openedRemainingQty", 0.0),
+                                        totalUsableQty = eo.optDouble("totalUsableQty", 0.0),
+                                        wastageQty = eo.optDouble("wastageQty", 0.0),
+                                        wastageReason = eo.optNonNullString("wastageReason", ""),
+                                        stockStatus = eo.optNonNullString("stockStatus", "GREEN"),
+                                        isChecked = eo.optBoolean("isChecked", true),
+                                        checkedBy = eo.optNonNullString("checkedBy", ""),
+                                        checkedAt = eo.optLong("checkedAt", 0L)
+                                    )
+                                )
+                            }
+                            runInTransaction {
+                                dao.upsertShift(cloudShift)
+                                if (cloudEntries.isNotEmpty()) {
+                                    dao.upsertEntries(cloudEntries)
+                                }
+                            }
+                        } else if (localShift.lastUpdatedAt > cloudUpdatedAt) {
+                            syncKitchenShiftToCloud(shiftId)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "reconcileKitchenInventoryFromCloud failed: ${e.message}")
             }
         }
     }

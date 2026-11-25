@@ -35,6 +35,14 @@ import java.util.Date
 import java.util.Locale
 import com.example.data.entity.ChecklistCompletionEntity
 import com.example.data.entity.ChecklistTaskEntity
+import com.example.data.entity.KitchenInventoryEntryEntity
+import com.example.data.entity.KitchenInventoryItemEntity
+import com.example.data.entity.KitchenInventoryShiftEntity
+import com.example.domain.kitchen.KitchenCountingMode
+import com.example.domain.kitchen.KitchenInventoryCalculator
+import com.example.domain.kitchen.KitchenSection
+import com.example.domain.kitchen.KitchenShiftType
+import com.example.domain.kitchen.KitchenStockStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -58,6 +66,7 @@ val STAFF_ALLOWED_TABS: Set<FiltrTab> = setOf(
     FiltrTab.BILLING,
     FiltrTab.ORDERS,
     FiltrTab.CHECKLIST,
+    FiltrTab.KITCHEN_INVENTORY,
     FiltrTab.MANUAL_INVENTORY
 )
 
@@ -82,6 +91,7 @@ enum class FiltrTab {
     PROFIT_LOSS,
     VOICE_ORDER,
     CHECKLIST,
+    KITCHEN_INVENTORY,
     MANUAL_INVENTORY
 }
 
@@ -232,7 +242,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = FiltrRepository(
         database.menuDao(), database.orderDao(), database.upiAccountDao(),
         database.inventoryDao(), database.customerDao(), database.fixedCostDao(),
-        database.checklistDao()
+        database.checklistDao(), database.kitchenInventoryDao()
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
@@ -459,6 +469,131 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         percentage = 0
     ))
 
+    // ==================== SMART DAILY KITCHEN INVENTORY STATE ====================
+
+    private val _kitchenRoute = MutableStateFlow<KitchenInventoryViewRoute>(KitchenInventoryViewRoute.Dashboard)
+    val kitchenRoute: StateFlow<KitchenInventoryViewRoute> = _kitchenRoute.asStateFlow()
+
+    private val _previousClosingShift = MutableStateFlow<KitchenInventoryShiftEntity?>(null)
+    val previousClosingShift: StateFlow<KitchenInventoryShiftEntity?> = _previousClosingShift.asStateFlow()
+
+    private val _previousClosingEntries = MutableStateFlow<List<KitchenInventoryEntryEntity>>(emptyList())
+    val previousClosingEntries: StateFlow<List<KitchenInventoryEntryEntity>> = _previousClosingEntries.asStateFlow()
+
+    val kitchenAllItems: StateFlow<List<KitchenInventoryItemEntity>> =
+        repository.allKitchenItems.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val kitchenActiveItems: StateFlow<List<KitchenInventoryItemEntity>> =
+        repository.activeKitchenItems.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val kitchenAllShifts: StateFlow<List<KitchenInventoryShiftEntity>> =
+        repository.allKitchenShifts.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val kitchenAllEntries: StateFlow<List<KitchenInventoryEntryEntity>> =
+        repository.allKitchenEntries.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val kitchenShiftsToday: StateFlow<List<KitchenInventoryShiftEntity>> = _activeDateKey
+        .flatMapLatest { dateKey -> repository.getKitchenShiftsForDate(dateKey) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val kitchenEntriesToday: StateFlow<List<KitchenInventoryEntryEntity>> = _activeDateKey
+        .flatMapLatest { dateKey -> repository.getKitchenEntriesForDate(dateKey) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val kitchenDashboardSummary: StateFlow<KitchenInventoryDashboardSummary> = combine(
+        _activeDateKey,
+        kitchenActiveItems,
+        kitchenShiftsToday,
+        kitchenEntriesToday,
+        _uiState.map { it.operatorName.ifBlank { it.currentRole } }.distinctUntilChanged()
+    ) { dateKey, activeItems, shiftsToday, entriesToday, staffName ->
+        val openingShift = shiftsToday.firstOrNull { it.shiftType == KitchenShiftType.OPENING.id }
+        val closingShift = shiftsToday.firstOrNull { it.shiftType == KitchenShiftType.CLOSING.id }
+        val openingEntries = entriesToday.filter { it.shiftType == KitchenShiftType.OPENING.id && it.isChecked }
+        val closingEntries = entriesToday.filter { it.shiftType == KitchenShiftType.CLOSING.id && it.isChecked }
+
+        val activeIds = activeItems.map { it.id }.toSet()
+        val openingByItem = openingEntries.filter { it.itemId in activeIds }.associateBy { it.itemId }
+        val closingByItem = closingEntries.filter { it.itemId in activeIds }.associateBy { it.itemId }
+
+        val latestByItem = activeItems.mapNotNull { item ->
+            closingByItem[item.id] ?: openingByItem[item.id]
+        }.associateBy { it.itemId }
+
+        var lowCount = 0
+        var outCount = 0
+        val reorderList = activeItems.mapNotNull { item ->
+            val latest = latestByItem[item.id] ?: return@mapNotNull null
+            val rec = KitchenInventoryCalculator.computeReorderRecommendation(item, latest.totalUsableQty)
+            if (rec != null) {
+                if (rec.status == KitchenStockStatus.RED) outCount++ else if (rec.status == KitchenStockStatus.ORANGE) lowCount++
+            }
+            rec
+        }.sortedWith(compareBy<com.example.domain.kitchen.KitchenReorderRecommendation> {
+            if (it.status == KitchenStockStatus.RED) 0 else 1
+        }.thenBy { it.item.sectionId }.thenBy { it.item.orderIndex })
+
+        val openingPending = KitchenSection.entries.filter { sec ->
+            val secItems = activeItems.filter { it.sectionId == sec.id }
+            secItems.isNotEmpty() && secItems.any { it.id !in openingByItem }
+        }
+        val closingPending = KitchenSection.entries.filter { sec ->
+            val secItems = activeItems.filter { it.sectionId == sec.id }
+            secItems.isNotEmpty() && secItems.any { it.id !in closingByItem }
+        }
+
+        val varianceRows = KitchenInventoryCalculator.computeVarianceRows(
+            items = activeItems,
+            openingEntries = openingEntries,
+            closingEntries = closingEntries
+        )
+
+        val formatted = try {
+            val parsed = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(dateKey)
+            if (parsed != null) SimpleDateFormat("EEEE, d MMM yyyy", Locale.getDefault()).format(parsed) else currentFormattedDisplayDate()
+        } catch (_: Exception) {
+            currentFormattedDisplayDate()
+        }
+
+        KitchenInventoryDashboardSummary(
+            dateKey = dateKey,
+            formattedDate = formatted,
+            staffName = staffName,
+            totalActiveItems = activeItems.size,
+            openingShift = openingShift,
+            closingShift = closingShift,
+            openingCheckedCount = openingByItem.size,
+            closingCheckedCount = closingByItem.size,
+            lowStockCount = lowCount,
+            outOfStockCount = outCount,
+            openingPendingSections = openingPending,
+            closingPendingSections = closingPending,
+            reorderList = reorderList,
+            varianceRows = varianceRows
+        )
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        KitchenInventoryDashboardSummary(
+            dateKey = currentFormattedDateKey(),
+            formattedDate = currentFormattedDisplayDate(),
+            staffName = initialRole,
+            totalActiveItems = 0,
+            openingShift = null,
+            closingShift = null,
+            openingCheckedCount = 0,
+            closingCheckedCount = 0,
+            lowStockCount = 0,
+            outOfStockCount = 0,
+            openingPendingSections = emptyList(),
+            closingPendingSections = emptyList(),
+            reorderList = emptyList(),
+            varianceRows = emptyList()
+        )
+    )
+
     private var customerSearchJob: Job? = null
     private val connectivityManager =
         application.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
@@ -525,6 +660,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     Log.d("MainViewModel", "Supabase connected successfully — starting Supabase listeners")
                     repository.startSupabaseListeners(viewModelScope)
                     repository.reconcileChecklistFromCloud(todayDateKey)
+                    repository.reconcileKitchenInventoryFromCloud(todayDateKey)
+                    refreshPreviousClosingReferenceInternal(todayDateKey)
                 } else {
                     Log.w("MainViewModel", "Supabase init failed — falling back to Firestore")
                     initFirestoreFallback()
@@ -570,6 +707,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 try {
                     repository.reconcileChecklistFromCloud(_activeDateKey.value)
+                    repository.reconcileKitchenInventoryFromCloud(_activeDateKey.value)
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
@@ -3821,6 +3959,190 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 _uiState.update { it.copy(snackbarMessage = "Failed to save policy: ${e.message}") }
             }
+        }
+    }
+
+    // ==========================================
+    // SMART DAILY KITCHEN INVENTORY ACTIONS
+    // ==========================================
+
+    private suspend fun refreshPreviousClosingReferenceInternal(dateKey: String) {
+        try {
+            val (prevShift, prevEntries) = repository.getPreviousClosingReference(dateKey)
+            _previousClosingShift.value = prevShift
+            _previousClosingEntries.value = prevEntries
+        } catch (e: Exception) {
+            Log.w(TAG, "refreshPreviousClosingReference failed: ${e.message}")
+        }
+    }
+
+    fun navigateKitchenRoute(route: KitchenInventoryViewRoute) {
+        if (route is KitchenInventoryViewRoute.ManagerHub && !requireAdmin("Manager Kitchen Inventory")) {
+            return
+        }
+        _kitchenRoute.value = route
+        if (route is KitchenInventoryViewRoute.ShiftOverview || route is KitchenInventoryViewRoute.SectionCounting) {
+            viewModelScope.launch(Dispatchers.IO) {
+                refreshPreviousClosingReferenceInternal(_activeDateKey.value)
+            }
+        }
+    }
+
+    fun startOrResumeKitchenShift(shiftType: KitchenShiftType) {
+        if (!ensureAppAllowed()) return
+        refreshDateKeyIfNeeded()
+        val dateKey = _activeDateKey.value
+        val operator = _uiState.value.operatorName.ifBlank { _uiState.value.currentRole }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val shift = repository.ensureKitchenShiftStarted(dateKey, shiftType, operator)
+                refreshPreviousClosingReferenceInternal(dateKey)
+                _kitchenRoute.value = if (shift.status == "SUBMITTED") {
+                    KitchenInventoryViewRoute.ShiftSubmittedConfirmation(shiftType)
+                } else {
+                    KitchenInventoryViewRoute.ShiftOverview(shiftType)
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Could not open ${shiftType.label}: ${e.message}") }
+            }
+        }
+    }
+
+    fun openFirstUncheckedKitchenItem(shiftType: KitchenShiftType, sectionIdFilter: String? = null) {
+        if (!ensureAppAllowed()) return
+        val items = kitchenActiveItems.value
+            .filter { sectionIdFilter == null || it.sectionId == sectionIdFilter }
+            .sortedWith(compareBy<KitchenInventoryItemEntity> {
+                KitchenSection.fromId(it.sectionId).orderIndex
+            }.thenBy { it.orderIndex })
+        if (items.isEmpty()) {
+            _uiState.update { it.copy(snackbarMessage = "No items configured in this section yet") }
+            return
+        }
+        val checkedIds = kitchenEntriesToday.value
+            .filter { it.shiftType == shiftType.id && it.isChecked }
+            .map { it.itemId }
+            .toSet()
+        val targetItem = items.firstOrNull { it.id !in checkedIds } ?: items.first()
+        navigateKitchenRoute(
+            KitchenInventoryViewRoute.SectionCounting(
+                shiftType = shiftType,
+                sectionId = sectionIdFilter ?: targetItem.sectionId,
+                selectedItemId = targetItem.id
+            )
+        )
+    }
+
+    fun saveKitchenItemAndAdvance(
+        shiftType: KitchenShiftType,
+        item: KitchenInventoryItemEntity,
+        sealedQty: Int,
+        openedQty: Int,
+        openedRemainingQty: Double,
+        wastageQty: Double,
+        wastageReason: String,
+        nextItemId: String?,
+        nextSectionId: String?
+    ) {
+        if (!ensureAppAllowed()) return
+        val dateKey = _activeDateKey.value
+        val operator = _uiState.value.operatorName.ifBlank { _uiState.value.currentRole }
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = repository.saveKitchenItemEntry(
+                dateKey = dateKey,
+                shiftType = shiftType,
+                item = item,
+                sealedQty = sealedQty,
+                openedQty = openedQty,
+                openedRemainingQty = openedRemainingQty,
+                wastageQty = wastageQty,
+                wastageReason = wastageReason,
+                checkedBy = operator
+            )
+            res.onSuccess {
+                if (nextItemId != null) {
+                    _kitchenRoute.value = KitchenInventoryViewRoute.SectionCounting(
+                        shiftType = shiftType,
+                        sectionId = nextSectionId ?: item.sectionId,
+                        selectedItemId = nextItemId
+                    )
+                } else {
+                    _kitchenRoute.value = KitchenInventoryViewRoute.ShiftOverview(shiftType)
+                    _uiState.update { it.copy(snackbarMessage = "${item.name} saved! Ready to submit ${shiftType.label}.") }
+                }
+            }.onFailure { err ->
+                _uiState.update { it.copy(snackbarMessage = err.message ?: "Failed to save item") }
+            }
+        }
+    }
+
+    fun submitKitchenShift(shiftType: KitchenShiftType, notes: String = "") {
+        if (!ensureAppAllowed()) return
+        val dateKey = _activeDateKey.value
+        val operator = _uiState.value.operatorName.ifBlank { _uiState.value.currentRole }
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = repository.submitKitchenShift(dateKey, shiftType, operator, notes)
+            res.onSuccess {
+                _kitchenRoute.value = KitchenInventoryViewRoute.ShiftSubmittedConfirmation(shiftType)
+                _uiState.update { it.copy(snackbarMessage = "${shiftType.label} submitted by $operator") }
+            }.onFailure { err ->
+                _uiState.update { it.copy(snackbarMessage = err.message ?: "Already submitted") }
+            }
+        }
+    }
+
+    fun saveKitchenCatalogItemConfig(
+        existingId: String?,
+        name: String,
+        iconEmoji: String,
+        sectionId: String,
+        countingMode: String,
+        unitLabel: String,
+        containerLabel: String,
+        packSize: Double,
+        minStockThreshold: Double,
+        targetStockLevel: Double,
+        isActive: Boolean
+    ) {
+        if (!requireAdmin("Configuring kitchen inventory items")) return
+        if (name.isBlank()) {
+            _uiState.update { it.copy(snackbarMessage = "Item name cannot be empty") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val existing = existingId?.let { id -> kitchenAllItems.value.firstOrNull { it.id == id } }
+            val nextOrder = existing?.orderIndex ?: ((kitchenAllItems.value.filter { it.sectionId == sectionId }.maxOfOrNull { it.orderIndex } ?: 0) + 1)
+            val entity = KitchenInventoryItemEntity(
+                id = existing?.id ?: "custom_k_${System.currentTimeMillis()}",
+                name = name.trim(),
+                iconEmoji = iconEmoji.trim().ifBlank { "📦" },
+                sectionId = sectionId,
+                countingMode = countingMode,
+                unitLabel = unitLabel.trim().ifBlank { "pcs" },
+                containerLabel = containerLabel.trim(),
+                packSize = if (packSize > 0.0) packSize else 1.0,
+                minStockThreshold = minStockThreshold.coerceAtLeast(0.0),
+                targetStockLevel = targetStockLevel.coerceAtLeast(minStockThreshold.coerceAtLeast(0.0)),
+                orderIndex = nextOrder,
+                isDefault = existing?.isDefault ?: false,
+                isActive = isActive
+            )
+            repository.saveKitchenCatalogItem(entity)
+                .onSuccess {
+                    _uiState.update { it.copy(snackbarMessage = "${entity.name} configuration saved") }
+                }
+                .onFailure { err ->
+                    _uiState.update { it.copy(snackbarMessage = "Failed to save item: ${err.message}") }
+                }
+        }
+    }
+
+    fun refreshKitchenInventory() {
+        refreshDateKeyIfNeeded()
+        val key = _activeDateKey.value
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.reconcileKitchenInventoryFromCloud(key)
+            refreshPreviousClosingReferenceInternal(key)
         }
     }
 
