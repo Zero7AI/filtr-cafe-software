@@ -39,10 +39,13 @@ import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryItemEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
+import com.example.data.entity.StaffRosterEntity
 import com.example.domain.attendance.AttendanceCalculator
+import com.example.domain.attendance.DayAttendanceStatus
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
+import com.example.domain.attendance.TeamRollCallRow
 import com.example.domain.kitchen.KitchenCountingMode
 import com.example.domain.kitchen.KitchenInventoryCalculator
 import com.example.domain.kitchen.KitchenSection
@@ -661,11 +664,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectedAttendanceMonthKey = MutableStateFlow(currentFormattedDateKey().substring(0, 7))
     val selectedAttendanceMonthKey: StateFlow<String> = _selectedAttendanceMonthKey.asStateFlow()
 
+    val staffRoster: StateFlow<List<StaffRosterEntity>> = repository.allStaffRoster
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     val availableAttendanceStaffNames: StateFlow<List<String>> = combine(
         repository.allFixedCosts,
         _uiState.map { it.operatorName to it.registeredDevices }.distinctUntilChanged(),
-        repository.allAttendanceLogs
-    ) { fixedCostsList, (operatorName, registeredDevices), attendanceLogs ->
+        repository.allAttendanceLogs,
+        staffRoster
+    ) { fixedCostsList, (operatorName, registeredDevices), attendanceLogs, roster ->
+        val fromRoster = roster
+            .filter { it.isActive }
+            .map { it.name.trim() }
         val fromFixedCosts = fixedCostsList.flatMap { fc ->
             if (fc.staffMembersJson.isNotBlank()) {
                 fc.parseStaffMembers().map { it.name.trim() }
@@ -678,7 +688,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .map { it.operatorName.trim() }
         val fromLogs = attendanceLogs.map { it.staffName.trim() }
 
-        val combined = (fromFixedCosts + fromDevices + fromLogs + listOf(operatorName.trim()))
+        val combined = (fromRoster + fromFixedCosts + fromDevices + fromLogs + listOf(operatorName.trim()))
             .filter { it.isNotBlank() }
             .distinctBy { it.lowercase(Locale.US) }
             .sortedWith(String.CASE_INSENSITIVE_ORDER)
@@ -687,6 +697,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             listOf(operatorName.trim().ifBlank { "Staff" })
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _selectedCheckInStaffName = MutableStateFlow("")
+    val selectedCheckInStaffName: StateFlow<String> = combine(
+        _selectedCheckInStaffName,
+        _uiState.map { it.operatorName.trim().ifBlank { "Staff" } }.distinctUntilChanged(),
+        availableAttendanceStaffNames
+    ) { selected, operatorName, available ->
+        val cleanSelected = selected.trim()
+        if (cleanSelected.isNotBlank()) {
+            available.firstOrNull { it.equals(cleanSelected, ignoreCase = true) } ?: cleanSelected
+        } else {
+            available.firstOrNull { it.equals(operatorName, ignoreCase = true) } ?: operatorName
+        }
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        _uiState.value.operatorName.trim().ifBlank { "Staff" }
+    )
 
     private val _selectedManagerAttendanceStaff = MutableStateFlow("")
     val selectedManagerAttendanceStaff: StateFlow<String> = combine(
@@ -704,36 +732,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     @OptIn(ExperimentalCoroutinesApi::class)
     val todayPersonalAttendanceLog: StateFlow<AttendanceLogEntity?> = combine(
         _activeDateKey,
-        _uiState.map { it.operatorName.trim().ifBlank { "Staff" } }.distinctUntilChanged()
-    ) { activeDateKey, operatorName ->
-        activeDateKey to operatorName
-    }.flatMapLatest { (activeDateKey, operatorName) ->
+        selectedCheckInStaffName
+    ) { activeDateKey, staffName ->
+        activeDateKey to staffName
+    }.flatMapLatest { (activeDateKey, staffName) ->
         val todayMonthKey = if (activeDateKey.length >= 7) activeDateKey.substring(0, 7) else currentFormattedDateKey().substring(0, 7)
-        val expectedId = AttendanceCalculator.buildLogId(activeDateKey, operatorName)
+        val expectedId = AttendanceCalculator.buildLogId(activeDateKey, staffName)
         repository.getAttendanceLogsForMonth(todayMonthKey).map { logs ->
             logs.firstOrNull { it.id == expectedId }
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    val personalAttendanceSummary: StateFlow<MonthlyAttendanceSummary> = combine(
-        _selectedAttendanceMonthKey,
-        _uiState.map { it.operatorName.trim().ifBlank { "Staff" } }.distinctUntilChanged(),
-        repository.allAttendanceLogs,
-        _activeDateKey
-    ) { monthKey, staffName, allLogs, activeDateKey ->
-        val targetStaffKey = AttendanceCalculator.normalizeStaffKey(staffName)
+    private fun buildAttendanceSummaryForStaff(
+        monthKey: String,
+        staffName: String,
+        allLogs: List<AttendanceLogEntity>,
+        activeDateKey: String,
+        rosterMember: StaffRosterEntity?
+    ): MonthlyAttendanceSummary {
+        val effectiveStaffName = staffName.trim().ifBlank { "Staff" }
+        val targetStaffKey = AttendanceCalculator.normalizeStaffKey(effectiveStaffName)
         val logsForStaff = allLogs.filter {
             AttendanceCalculator.normalizeStaffKey(it.staffName) == targetStaffKey
         }
-        val trackingStartDateKey = logsForStaff
-            .mapNotNull { it.dateKey.takeIf { key -> key.isNotBlank() } }
-            .minOrNull() ?: "$monthKey-01"
-        AttendanceCalculator.buildMonthlySummary(
+        val trackingStartDateKey = rosterMember?.joinedDateKey?.takeIf { it.isNotBlank() }
+            ?: logsForStaff
+                .mapNotNull { it.dateKey.takeIf { key -> key.isNotBlank() } }
+                .minOrNull()
+            ?: "$monthKey-01"
+        return AttendanceCalculator.buildMonthlySummary(
             monthKey = monthKey,
-            staffName = staffName,
+            staffName = effectiveStaffName,
             logs = allLogs,
             trackingStartDateKey = trackingStartDateKey,
-            todayDateKey = activeDateKey
+            todayDateKey = activeDateKey,
+            weeklyOffDayOfWeek = rosterMember?.weeklyOffDayOfWeek ?: 0
+        )
+    }
+
+    val personalAttendanceSummary: StateFlow<MonthlyAttendanceSummary> = combine(
+        _selectedAttendanceMonthKey,
+        selectedCheckInStaffName,
+        repository.allAttendanceLogs,
+        _activeDateKey,
+        staffRoster
+    ) { monthKey, staffName, allLogs, activeDateKey, roster ->
+        val targetStaffKey = AttendanceCalculator.normalizeStaffKey(staffName.trim().ifBlank { "Staff" })
+        val rosterMember = roster.firstOrNull {
+            AttendanceCalculator.normalizeStaffKey(it.name) == targetStaffKey
+        }
+        buildAttendanceSummaryForStaff(
+            monthKey = monthKey,
+            staffName = staffName,
+            allLogs = allLogs,
+            activeDateKey = activeDateKey,
+            rosterMember = rosterMember
         )
     }.stateIn(
         viewModelScope,
@@ -751,22 +804,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _selectedAttendanceMonthKey,
         selectedManagerAttendanceStaff,
         repository.allAttendanceLogs,
-        _activeDateKey
-    ) { monthKey, staffName, allLogs, activeDateKey ->
+        _activeDateKey,
+        staffRoster
+    ) { monthKey, staffName, allLogs, activeDateKey, roster ->
         val effectiveStaffName = staffName.trim().ifBlank { "Staff" }
         val targetStaffKey = AttendanceCalculator.normalizeStaffKey(effectiveStaffName)
-        val logsForStaff = allLogs.filter {
-            AttendanceCalculator.normalizeStaffKey(it.staffName) == targetStaffKey
+        val rosterMember = roster.firstOrNull {
+            AttendanceCalculator.normalizeStaffKey(it.name) == targetStaffKey
         }
-        val trackingStartDateKey = logsForStaff
-            .mapNotNull { it.dateKey.takeIf { key -> key.isNotBlank() } }
-            .minOrNull() ?: "$monthKey-01"
-        AttendanceCalculator.buildMonthlySummary(
+        buildAttendanceSummaryForStaff(
             monthKey = monthKey,
             staffName = effectiveStaffName,
-            logs = allLogs,
-            trackingStartDateKey = trackingStartDateKey,
-            todayDateKey = activeDateKey
+            allLogs = allLogs,
+            activeDateKey = activeDateKey,
+            rosterMember = rosterMember
         )
     }.stateIn(
         viewModelScope,
@@ -779,6 +830,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             todayDateKey = currentFormattedDateKey()
         )
     )
+
+    val teamRollCall: StateFlow<List<TeamRollCallRow>> = combine(
+        staffRoster,
+        _selectedAttendanceMonthKey,
+        repository.allAttendanceLogs,
+        _activeDateKey
+    ) { roster, monthKey, allLogs, activeDateKey ->
+        val todayMonthKey = if (activeDateKey.length >= 7) activeDateKey.substring(0, 7) else monthKey
+        roster
+            .filter { it.isActive }
+            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
+            .map { member ->
+                val targetStaffKey = AttendanceCalculator.normalizeStaffKey(member.name)
+                val summary = buildAttendanceSummaryForStaff(
+                    monthKey = monthKey,
+                    staffName = member.name,
+                    allLogs = allLogs,
+                    activeDateKey = activeDateKey,
+                    rosterMember = member
+                )
+                val todayLog = allLogs
+                    .filter {
+                        it.dateKey == activeDateKey &&
+                            AttendanceCalculator.normalizeStaffKey(it.staffName) == targetStaffKey
+                    }
+                    .maxByOrNull { it.updatedAt }
+                val todayStatus = if (monthKey == todayMonthKey) {
+                    summary.days.firstOrNull { it.dateKey == activeDateKey }?.status ?: DayAttendanceStatus.ABSENT
+                } else {
+                    buildAttendanceSummaryForStaff(
+                        monthKey = todayMonthKey,
+                        staffName = member.name,
+                        allLogs = allLogs,
+                        activeDateKey = activeDateKey,
+                        rosterMember = member
+                    ).days.firstOrNull { it.dateKey == activeDateKey }?.status ?: DayAttendanceStatus.ABSENT
+                }
+                TeamRollCallRow(
+                    member = member,
+                    todayLog = todayLog,
+                    todayStatus = todayStatus,
+                    monthlySummary = summary
+                )
+            }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private var customerSearchJob: Job? = null
     private val connectivityManager =
@@ -850,6 +946,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     refreshPreviousClosingReferenceInternal(todayDateKey)
                     reconcileAttendanceStoreConfigFromCloud()
                     repository.reconcileAttendanceFromCloud(todayDateKey.substring(0, 7))
+                    repository.reconcileStaffRosterFromCloud()
                 } else {
                     Log.w("MainViewModel", "Supabase init failed — falling back to Firestore")
                     initFirestoreFallback()
@@ -898,6 +995,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     repository.reconcileKitchenInventoryFromCloud(_activeDateKey.value)
                     reconcileAttendanceStoreConfigFromCloud()
                     repository.reconcileAttendanceFromCloud(_activeDateKey.value.substring(0, 7))
+                    repository.reconcileStaffRosterFromCloud()
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
@@ -4390,6 +4488,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (todayMonth != selectedMonth) {
                 repository.reconcileAttendanceFromCloud(todayMonth)
             }
+            repository.reconcileStaffRosterFromCloud()
         }
     }
 
@@ -4491,7 +4590,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val dateKey = _activeDateKey.value
             val monthKey = dateKey.substring(0, 7)
-            val staffName = _uiState.value.operatorName.trim().ifBlank { "Staff" }
+            val staffName = resolveActiveCheckInStaffName()
             val config = _storeGeofenceConfig.value
 
             val res = withContext(Dispatchers.IO) {
@@ -4507,7 +4606,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             res.onSuccess { log ->
                 _uiState.update {
-                    it.copy(snackbarMessage = "Checked in! (${log.checkInDistanceMeters.toInt()}m from store)")
+                    it.copy(snackbarMessage = "${log.staffName} checked in! (${log.checkInDistanceMeters.toInt()}m from store)")
                 }
             }.onFailure { err ->
                 _uiState.update {
@@ -4541,7 +4640,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _currentLocationSample.value = sample
 
             val dateKey = _activeDateKey.value
-            val staffName = _uiState.value.operatorName.trim().ifBlank { "Staff" }
+            val staffName = resolveActiveCheckInStaffName()
             val config = _storeGeofenceConfig.value
 
             val res = withContext(Dispatchers.IO) {
@@ -4556,11 +4655,84 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             res.onSuccess { log ->
                 val duration = AttendanceCalculator.formatWorkedDuration(log.workedMinutes)
                 _uiState.update {
-                    it.copy(snackbarMessage = "Checked out! Worked $duration today")
+                    it.copy(snackbarMessage = "${log.staffName} checked out! Worked $duration today")
                 }
             }.onFailure { err ->
                 _uiState.update {
                     it.copy(snackbarMessage = err.message ?: "Check-out failed")
+                }
+            }
+        }
+    }
+
+    private fun resolveActiveCheckInStaffName(): String {
+        val explicit = _selectedCheckInStaffName.value.trim()
+        val available = availableAttendanceStaffNames.value
+        if (explicit.isNotBlank()) {
+            return available.firstOrNull { it.equals(explicit, ignoreCase = true) } ?: explicit
+        }
+        val operator = _uiState.value.operatorName.trim().ifBlank { "Staff" }
+        return available.firstOrNull { it.equals(operator, ignoreCase = true) } ?: operator
+    }
+
+    fun selectCheckInStaff(staffName: String) {
+        _selectedCheckInStaffName.value = staffName.trim()
+    }
+
+    fun saveStaffRosterMember(
+        existingId: String?,
+        name: String,
+        roleTitle: String,
+        shiftLabel: String,
+        weeklyOffDayOfWeek: Int,
+        joinedDateKey: String,
+        isActive: Boolean
+    ) {
+        if (!requireAdmin("Managing staff roster")) return
+        val cleanName = name.trim()
+        if (cleanName.isBlank()) {
+            _uiState.update { it.copy(snackbarMessage = "Staff name cannot be blank.") }
+            return
+        }
+        val cleanExistingId = existingId?.trim()?.takeIf { it.isNotBlank() }
+        val effectiveJoinedDateKey = joinedDateKey.trim().ifBlank { _activeDateKey.value }
+        val safeWeeklyOff = if (weeklyOffDayOfWeek in Calendar.SUNDAY..Calendar.SATURDAY) {
+            weeklyOffDayOfWeek
+        } else {
+            0
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolvedId = if (cleanExistingId != null) {
+                cleanExistingId
+            } else {
+                val baseId = AttendanceCalculator.normalizeStaffKey(cleanName)
+                val currentRoster = staffRoster.value.ifEmpty { repository.allStaffRoster.first() }
+                if (currentRoster.any { it.id == baseId }) {
+                    "${baseId}_${System.currentTimeMillis()}"
+                } else {
+                    baseId
+                }
+            }
+            val entity = StaffRosterEntity(
+                id = resolvedId,
+                name = cleanName,
+                roleTitle = roleTitle.trim().ifBlank { "Barista" },
+                shiftLabel = shiftLabel.trim().ifBlank { "Full Day" },
+                weeklyOffDayOfWeek = safeWeeklyOff,
+                joinedDateKey = effectiveJoinedDateKey,
+                isActive = isActive,
+                updatedAt = System.currentTimeMillis()
+            )
+            val result = repository.saveStaffRosterMember(entity)
+            result.onSuccess {
+                val verb = if (cleanExistingId != null) "updated" else "added"
+                _uiState.update {
+                    it.copy(snackbarMessage = "${entity.name} $verb in staff roster.")
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(snackbarMessage = err.message ?: "Failed to save staff roster member.")
                 }
             }
         }

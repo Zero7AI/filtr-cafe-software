@@ -1326,6 +1326,9 @@ class MainActivity : ComponentActivity() {
                                     val personalSummary by viewModel.personalAttendanceSummary.collectAsStateWithLifecycle()
                                     val managerSummary by viewModel.managerAttendanceSummary.collectAsStateWithLifecycle()
                                     val todayPersonalLog by viewModel.todayPersonalAttendanceLog.collectAsStateWithLifecycle()
+                                    val staffRoster by viewModel.staffRoster.collectAsStateWithLifecycle()
+                                    val teamRollCall by viewModel.teamRollCall.collectAsStateWithLifecycle()
+                                    val selectedCheckInStaffName by viewModel.selectedCheckInStaffName.collectAsStateWithLifecycle()
 
                                     AttendanceScreen(
                                         isManager = !isStaffMode,
@@ -1356,7 +1359,14 @@ class MainActivity : ComponentActivity() {
                                         onSelectMonth = { viewModel.selectAttendanceMonth(it) },
                                         onSelectManagerStaff = { viewModel.selectManagerAttendanceStaff(it) },
                                         onSetStoreLocationHere = { viewModel.setStoreLocationFromCurrentGps() },
-                                        onChangeRadiusMeters = { viewModel.updateStoreRadiusMeters(it) }
+                                        onChangeRadiusMeters = { viewModel.updateStoreRadiusMeters(it) },
+                                        staffRoster = staffRoster,
+                                        teamRollCall = teamRollCall,
+                                        selectedCheckInStaffName = selectedCheckInStaffName,
+                                        onSelectCheckInStaff = { viewModel.selectCheckInStaff(it) },
+                                        onSaveStaffRosterMember = { id, name, role, shift, offDay, joinDate, active ->
+                                            viewModel.saveStaffRosterMember(id, name, role, shift, offDay, joinDate, active)
+                                        }
                                     )
                                 }
                                 FiltrTab.MANUAL_INVENTORY -> {
