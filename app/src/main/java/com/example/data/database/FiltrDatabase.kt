@@ -5,6 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.data.dao.AttendanceDao
 import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
@@ -13,6 +14,7 @@ import com.example.data.dao.KitchenInventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
+import com.example.data.entity.AttendanceLogEntity
 import com.example.data.entity.ChecklistCompletionEntity
 import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.CustomerEntity
@@ -45,9 +47,9 @@ import java.util.Locale
         InventoryUsageEntity::class, CustomerEntity::class, FixedCostEntity::class,
         ChecklistTaskEntity::class, ChecklistCompletionEntity::class,
         KitchenInventoryItemEntity::class, KitchenInventoryShiftEntity::class,
-        KitchenInventoryEntryEntity::class
+        KitchenInventoryEntryEntity::class, AttendanceLogEntity::class
     ],
-    version = 14,
+    version = 15,
     exportSchema = false
 )
 abstract class FiltrDatabase : RoomDatabase() {
@@ -59,6 +61,7 @@ abstract class FiltrDatabase : RoomDatabase() {
     abstract fun fixedCostDao(): FixedCostDao
     abstract fun checklistDao(): ChecklistDao
     abstract fun kitchenInventoryDao(): KitchenInventoryDao
+    abstract fun attendanceDao(): AttendanceDao
 
     companion object {
         @Volatile
@@ -261,6 +264,31 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_14_15 = object : androidx.room.migration.Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `staff_attendance_logs` (
+                        `id` TEXT NOT NULL PRIMARY KEY,
+                        `dateKey` TEXT NOT NULL,
+                        `monthKey` TEXT NOT NULL,
+                        `staffName` TEXT NOT NULL,
+                        `deviceId` TEXT NOT NULL DEFAULT '',
+                        `checkInTimestamp` INTEGER NOT NULL DEFAULT 0,
+                        `checkInLat` REAL NOT NULL DEFAULT 0.0,
+                        `checkInLng` REAL NOT NULL DEFAULT 0.0,
+                        `checkInDistanceMeters` REAL NOT NULL DEFAULT 0.0,
+                        `checkOutTimestamp` INTEGER NOT NULL DEFAULT 0,
+                        `checkOutLat` REAL NOT NULL DEFAULT 0.0,
+                        `checkOutLng` REAL NOT NULL DEFAULT 0.0,
+                        `checkOutDistanceMeters` REAL NOT NULL DEFAULT 0.0,
+                        `workedMinutes` INTEGER NOT NULL DEFAULT 0,
+                        `notes` TEXT NOT NULL DEFAULT '',
+                        `updatedAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                """.trimIndent())
+            }
+        }
+
         internal fun getInstanceOrNull(): FiltrDatabase? = INSTANCE
 
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
@@ -270,7 +298,15 @@ abstract class FiltrDatabase : RoomDatabase() {
                     FiltrDatabase::class.java,
                     "filtr_coffee_db"
                 )
-                .addMigrations(MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14)
+                .addMigrations(
+                    MIGRATION_8_9,
+                    MIGRATION_9_10,
+                    MIGRATION_10_11,
+                    MIGRATION_11_12,
+                    MIGRATION_12_13,
+                    MIGRATION_13_14,
+                    MIGRATION_14_15
+                )
                 .fallbackToDestructiveMigration(true) // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))
                 .build()
