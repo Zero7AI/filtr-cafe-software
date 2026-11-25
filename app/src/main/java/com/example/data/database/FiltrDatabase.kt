@@ -203,7 +203,7 @@ abstract class FiltrDatabase : RoomDatabase() {
                     "filtr_coffee_db"
                 )
                 .addMigrations(MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)
-                .fallbackToDestructiveMigration() // Last resort for ancient versions
+                .fallbackToDestructiveMigration(true) // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))
                 .build()
                 INSTANCE = instance

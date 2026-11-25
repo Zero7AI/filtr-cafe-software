@@ -39,16 +39,16 @@ import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Coffee
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.automirrored.filled.ListAlt
+import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Inventory
-import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Logout
-import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PointOfSale
 import androidx.compose.material.icons.filled.QrCode
-import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.RestaurantMenu
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warehouse
@@ -273,7 +273,7 @@ class MainActivity : ComponentActivity() {
 
                                     NavigationDrawerItem(
                                         label = { Text("Orders", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = null) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ListAlt, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.ORDERS,
                                         onClick = {
                                             viewModel.selectTab(FiltrTab.ORDERS)
@@ -348,7 +348,7 @@ class MainActivity : ComponentActivity() {
 
                                     NavigationDrawerItem(
                                         label = { Text("Log Out / Switch Operator", fontWeight = FontWeight.Medium) },
-                                        icon = { Icon(imageVector = Icons.Default.Logout, contentDescription = null, tint = Color(0xFFEF4444)) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = Color(0xFFEF4444)) },
                                         selected = false,
                                         onClick = {
                                             viewModel.logOutDevice()
@@ -440,7 +440,7 @@ class MainActivity : ComponentActivity() {
 
                                     NavigationDrawerItem(
                                         label = { Text("Order Records & Status", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = null) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ListAlt, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.ORDERS,
                                         onClick = {
                                             viewModel.selectTab(FiltrTab.ORDERS)
@@ -497,7 +497,7 @@ class MainActivity : ComponentActivity() {
 
                                     NavigationDrawerItem(
                                         label = { Text("Item Master (Menu)", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.MenuBook, contentDescription = null) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.MenuBook, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.MENU,
                                         onClick = {
                                             viewModel.selectTab(FiltrTab.MENU)
@@ -671,7 +671,7 @@ class MainActivity : ComponentActivity() {
 
                                     NavigationDrawerItem(
                                         label = { Text("🎨 Bill & Receipt Design", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.ReceiptLong, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, tint = Color(0xFFF59E0B)) },
                                         selected = uiState.currentTab == FiltrTab.RECEIPT_DESIGN,
                                         onClick = {
                                             viewModel.selectTab(FiltrTab.RECEIPT_DESIGN)
@@ -739,7 +739,7 @@ class MainActivity : ComponentActivity() {
 
                                     NavigationDrawerItem(
                                         label = { Text("Log Out / Switch Operator", fontWeight = FontWeight.Medium) },
-                                        icon = { Icon(imageVector = Icons.Default.Logout, contentDescription = null, tint = Color(0xFFEF4444)) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = Color(0xFFEF4444)) },
                                         selected = false,
                                         onClick = {
                                             viewModel.logOutDevice()
@@ -798,7 +798,7 @@ class MainActivity : ComponentActivity() {
                                     NavigationBarItem(
                                         selected = uiState.currentTab == FiltrTab.ORDERS,
                                         onClick = { viewModel.selectTab(FiltrTab.ORDERS) },
-                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = "Orders") },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ListAlt, contentDescription = "Orders") },
                                         label = { Text("Orders", fontWeight = FontWeight.Bold) },
                                         colors = NavigationBarItemDefaults.colors(
                                             selectedIconColor = Color(0xFF09090B),
@@ -843,7 +843,7 @@ class MainActivity : ComponentActivity() {
                                     NavigationBarItem(
                                         selected = uiState.currentTab == FiltrTab.ORDERS,
                                         onClick = { viewModel.selectTab(FiltrTab.ORDERS) },
-                                        icon = { Icon(imageVector = Icons.Default.ListAlt, contentDescription = "Orders") },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ListAlt, contentDescription = "Orders") },
                                         label = { Text("Orders", fontWeight = FontWeight.Bold) },
                                         colors = NavigationBarItemDefaults.colors(
                                             selectedIconColor = Color(0xFF09090B),

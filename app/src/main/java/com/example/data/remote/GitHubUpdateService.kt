@@ -166,9 +166,9 @@ class GitHubUpdateService private constructor() {
             val response = try {
                 client.newCall(requestBuilder.build()).execute()
             } catch (e: Exception) {
-                if (isMandatory && policy != null) {
+                if (isMandatory) {
                     Log.i(TAG, "GitHub API call failed (${e.message}), using Supabase policy for mandatory update")
-                    return@withContext Result.success(buildPolicyFallbackUpdate(cleanOwner, cleanRepo, policy, isStaffApp))
+                    return@withContext Result.success(buildPolicyFallbackUpdate(cleanOwner, cleanRepo, policy!!, isStaffApp))
                 }
                 throw e
             }
@@ -178,9 +178,9 @@ class GitHubUpdateService private constructor() {
                     val code = resp.code
                     val errBody = resp.body?.string().orEmpty()
                     Log.w(TAG, "GitHub API returned HTTP $code: $errBody")
-                    if (isMandatory && policy != null) {
+                    if (isMandatory) {
                         Log.i(TAG, "GitHub API HTTP $code, using Supabase policy for mandatory update")
-                        return@withContext Result.success(buildPolicyFallbackUpdate(cleanOwner, cleanRepo, policy, isStaffApp))
+                        return@withContext Result.success(buildPolicyFallbackUpdate(cleanOwner, cleanRepo, policy!!, isStaffApp))
                     }
                     return@withContext Result.failure(
                         Exception(
