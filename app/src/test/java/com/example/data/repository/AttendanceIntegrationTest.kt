@@ -10,6 +10,7 @@ import com.example.data.remote.SupabaseService
 import com.example.domain.attendance.StoreGeofenceConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
@@ -492,6 +493,8 @@ class AttendanceIntegrationTest {
                 put("updatedAt", 7000L)
             })
         }
+        // Drain background roster sync jobs launched by saveStaffRosterMember before seeding cloud state
+        repoScope.coroutineContext[Job]?.children?.toList()?.forEach { it.join() }
         fakeMetadataStore["attendance_staff_roster"] = cloudArr.toString()
 
         repository.reconcileStaffRosterFromCloud()
