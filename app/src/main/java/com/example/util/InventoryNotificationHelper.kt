@@ -65,10 +65,12 @@ object InventoryNotificationHelper {
                 if (maxPacksPerOrder > 0.0) {
                     (item.currentStock / maxPacksPerOrder).toInt()
                 } else {
-                    (item.currentStock * item.standardQuantity).toInt()
+                    val safeStdQty = if (item.standardQuantity > 0.0) item.standardQuantity else 1.0
+                    (item.currentStock * safeStdQty).toInt()
                 }
             } else {
-                (item.currentStock * (if (item.standardQuantity > 0) item.standardQuantity else 1.0)).toInt()
+                val safeStdQty = if (item.standardQuantity > 0.0) item.standardQuantity else 1.0
+                (item.currentStock * safeStdQty).toInt()
             }
 
             if (ordersLeft <= 7) {
@@ -97,7 +99,7 @@ object InventoryNotificationHelper {
         initChannel(context)
 
         val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
             context,
@@ -107,7 +109,7 @@ object InventoryNotificationHelper {
         )
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("⚠️ FILTR Reorder Alert (≤ 7 Orders Left)")
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))

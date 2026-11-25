@@ -25,9 +25,18 @@ object ThermalImageProcessor {
      * @return Packed 1-bit raster bytes ready for GS v 0 command
      */
     fun processForThermal(source: Bitmap, targetWidth: Int = 384): ProcessedImage {
+        require(source.width > 0 && source.height > 0 && targetWidth > 0) {
+            "Invalid bitmap or target width"
+        }
         // Step 1: Bicubic resample to target width
         val scaled = resizeToWidth(source, targetWidth)
-        return runPipeline(scaled)
+        try {
+            return runPipeline(scaled)
+        } finally {
+            if (scaled !== source && !scaled.isRecycled) {
+                scaled.recycle()
+            }
+        }
     }
 
     /**
@@ -49,10 +58,27 @@ object ThermalImageProcessor {
         aspectNumerator: Int = 7,
         aspectDenominator: Int = 4
     ): ProcessedImage {
+        require(source.width > 0 && source.height > 0 && targetWidth > 0 && aspectNumerator > 0 && aspectDenominator > 0) {
+            "Invalid image dimensions or aspect ratio"
+        }
         val cropped = centerCropAspectRatio(source, aspectNumerator, aspectDenominator)
-        val targetHeight = ((targetWidth.toFloat() * aspectDenominator) / aspectNumerator).roundToInt()
-        val scaled = Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
-        return runPipeline(scaled)
+        val scaled: Bitmap = try {
+            val targetHeight = ((targetWidth.toFloat() * aspectDenominator) / aspectNumerator)
+                .roundToInt()
+                .coerceAtLeast(1)
+            Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
+        } finally {
+            if (cropped !== source && !cropped.isRecycled) {
+                cropped.recycle()
+            }
+        }
+        try {
+            return runPipeline(scaled)
+        } finally {
+            if (scaled !== source && !scaled.isRecycled) {
+                scaled.recycle()
+            }
+        }
     }
 
     /**
@@ -67,14 +93,14 @@ object ThermalImageProcessor {
 
         if (currentRatio > targetRatio) {
             // Source is wider than target ratio -> crop width
-            cropHeight = source.height
+            cropHeight = source.height.coerceAtLeast(1)
             cropWidth = ((source.height * aspectNumerator).toFloat() / aspectDenominator).roundToInt()
-                .coerceAtMost(source.width)
+                .coerceIn(1, source.width)
         } else {
             // Source is taller than target ratio -> crop height
-            cropWidth = source.width
+            cropWidth = source.width.coerceAtLeast(1)
             cropHeight = ((source.width * aspectDenominator).toFloat() / aspectNumerator).roundToInt()
-                .coerceAtMost(source.height)
+                .coerceIn(1, source.height)
         }
 
         val xOffset = max(0, (source.width - cropWidth) / 2)
@@ -86,9 +112,9 @@ object ThermalImageProcessor {
      * Center-crop a bitmap to 1:1 square aspect ratio.
      */
     private fun centerCropSquare(source: Bitmap): Bitmap {
-        val size = min(source.width, source.height)
-        val xOffset = (source.width - size) / 2
-        val yOffset = (source.height - size) / 2
+        val size = min(source.width, source.height).coerceAtLeast(1)
+        val xOffset = max(0, (source.width - size) / 2)
+        val yOffset = max(0, (source.height - size) / 2)
         return Bitmap.createBitmap(source, xOffset, yOffset, size, size)
     }
 
@@ -182,7 +208,7 @@ object ThermalImageProcessor {
 
                 // Clip histogram
                 val totalPixels = tw * th
-                val clipThreshold = (clipLimit * totalPixels / 256).roundToInt()
+                val clipThreshold = (clipLimit * totalPixels / 256).roundToInt().coerceAtLeast(1)
                 var excess = 0
                 for (i in 0 until 256) {
                     if (hist[i] > clipThreshold) {
@@ -201,7 +227,7 @@ object ThermalImageProcessor {
                 for (i in 1 until 256) {
                     cdf[i] = cdf[i - 1] + hist[i]
                 }
-                val cdfMin = cdf.first { it > 0 }
+                val cdfMin = cdf.firstOrNull { it > 0 } ?: 0
                 val denom = (totalPixels - cdfMin).coerceAtLeast(1)
 
                 // Apply mapping

@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import android.util.Log
+import androidx.room.withTransaction
 import com.example.data.dao.ChecklistDao
 import com.example.data.dao.CustomerDao
 import com.example.data.dao.FixedCostDao
@@ -8,6 +9,7 @@ import com.example.data.dao.InventoryDao
 import com.example.data.dao.MenuDao
 import com.example.data.dao.OrderDao
 import com.example.data.dao.UpiAccountDao
+import com.example.data.database.FiltrDatabase
 import com.example.data.entity.ChecklistCompletionEntity
 import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.CustomerEntity
@@ -31,6 +33,7 @@ import com.example.data.remote.GoogleSheetsSyncService
 import com.example.data.remote.ParsedVoiceOrder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
@@ -41,6 +44,7 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class FiltrRepository(
     private val menuDao: MenuDao,
@@ -54,13 +58,48 @@ class FiltrRepository(
     private val geminiVoiceService: GeminiVoiceOrderService = GeminiVoiceOrderService(),
     private val deepgramVoiceService: DeepgramVoiceService = DeepgramVoiceService.getInstance(),
     private val firestoreService: FirestoreService = FirestoreService.getInstance(),
-    private val supabaseService: SupabaseService = SupabaseService.getInstance()
+    private val supabaseService: SupabaseService = SupabaseService.getInstance(),
+    private val externalScope: CoroutineScope? = null
 ) {
     companion object {
         private const val TAG = "FiltrRepository"
     }
 
     private val orderIdMutex = Mutex()
+    private val inventoryOrderIdMutex = Mutex()
+    private val stockMutex = Mutex()
+    private val menuSyncMutex = Mutex()
+    private val checklistSyncMutex = Mutex()
+    private val customerSyncMutex = Mutex()
+
+    @Volatile
+    private var managedScope: CoroutineScope? = externalScope
+    private val fallbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // In-memory protection & retry tracking for non-order entities and dual-backend sync status
+    private val pendingOrderDeletions = ConcurrentHashMap.newKeySet<String>()
+    private val sheetsPendingOrderIds = ConcurrentHashMap.newKeySet<String>()
+    private val pendingMenuUpsertIds = ConcurrentHashMap.newKeySet<Int>()
+    private val pendingMenuDeleteIds = ConcurrentHashMap.newKeySet<Int>()
+    private val dirtyInventoryItemIds = ConcurrentHashMap.newKeySet<Int>()
+    private val pendingUsageUpsertKeys = ConcurrentHashMap.newKeySet<Pair<Int, Int>>()
+    private val pendingUsageDeleteIds = ConcurrentHashMap.newKeySet<Int>()
+    private val pendingUsageDeleteMenuIds = ConcurrentHashMap.newKeySet<Int>()
+    private val pendingCustomerNames = ConcurrentHashMap.newKeySet<String>()
+    private val pendingCustomerDeleteIds = ConcurrentHashMap.newKeySet<Int>()
+    private val pendingChecklistTaskAdds = ConcurrentHashMap.newKeySet<String>()
+    private val pendingChecklistTaskDeletes = ConcurrentHashMap.newKeySet<String>()
+    private val dirtyChecklistDateKeys = ConcurrentHashMap.newKeySet<String>()
+    private val localChecklistActionTimestamps = ConcurrentHashMap<Pair<String, String>, Long>()
+
+    private fun launchManagedSync(block: suspend CoroutineScope.() -> Unit) {
+        (managedScope ?: fallbackScope).launch(Dispatchers.IO, block = block)
+    }
+
+    private suspend fun <T> runInTransaction(block: suspend () -> T): T {
+        val db = FiltrDatabase.getInstanceOrNull()
+        return if (db != null) db.withTransaction { block() } else block()
+    }
 
     val allMenuItems: Flow<List<MenuItemEntity>> = menuDao.getAllMenuItems()
     val availableMenuItems: Flow<List<MenuItemEntity>> = menuDao.getAvailableMenuItems()
@@ -104,6 +143,7 @@ class FiltrRepository(
 
         for (remoteOrder in remoteOrders) {
             try {
+                if (remoteOrder.order.orderId in pendingOrderDeletions) continue
                 val localOrder = orderDao.getOrderById(remoteOrder.order.orderId)
                 if (localOrder == null && remoteOrder.items.isNotEmpty()) {
                     // New order not in Room — insert it
@@ -147,14 +187,16 @@ class FiltrRepository(
      * This is the primary cloud sync method (replaces Firestore listeners).
      */
     fun startSupabaseListeners(scope: CoroutineScope) {
+        managedScope = scope
         if (!supabaseService.isInitialized) return
 
-        // Listen to order changes from Supabase (polling every 4s)
+        // Listen to order changes from Supabase (polling every 2s)
         scope.launch(Dispatchers.IO) {
             supabaseService.listenToOrders().collect { remoteOrders ->
                 for (remoteOrder in remoteOrders) {
                     try {
                         val orderId = remoteOrder.order.orderId
+                        if (orderId in pendingOrderDeletions) continue
                         val localOrder = orderDao.getOrderById(orderId)
 
                         if (localOrder == null) {
@@ -176,8 +218,8 @@ class FiltrRepository(
                                     localOrder.items.map { it.itemName }.sorted() != remoteOrder.items.map { it.itemName }.sorted()
 
                             if (itemsDiffer) {
-                                // If local device is not currently mid-edit, adopt the edited order items from the other device
-                                if (!localIsPending) {
+                                // Guard against transient empty items emitted mid-write during remote saveOrder
+                                if (!localIsPending && remoteOrder.items.isNotEmpty()) {
                                     val itemsForRoom = remoteOrder.items.map { it.copy(id = 0) }
                                     orderDao.updateOrderWithItems(
                                         remoteOrder.order.copy(syncStatus = "SYNCED"),
@@ -238,26 +280,31 @@ class FiltrRepository(
         scope.launch(Dispatchers.IO) {
             deduplicateMenuItems()
             supabaseService.listenToMenuItems().collect { remoteItems ->
-                if (remoteItems.isNotEmpty()) {
-                    val remoteIds = remoteItems.map { it.id }.toSet()
-                    val localItems = menuDao.getAllMenuItemsList()
-                    // Remove obsolete local items that are no longer in Supabase
-                    for (local in localItems) {
-                        if (local.id !in remoteIds) {
-                            menuDao.deleteMenuItem(local)
-                            Log.d(TAG, "Removed obsolete local menu item #${local.id} (${local.name})")
+                menuSyncMutex.withLock {
+                    if (remoteItems.isNotEmpty()) {
+                        val remoteIds = remoteItems.map { it.id }.toSet()
+                        val localItems = menuDao.getAllMenuItemsList()
+                        // Remove obsolete local items that are no longer in Supabase (protect unsynced local additions)
+                        for (local in localItems) {
+                            if (local.id !in remoteIds && local.id !in pendingMenuUpsertIds) {
+                                menuDao.deleteMenuItem(local)
+                                Log.d(TAG, "Removed obsolete local menu item #${local.id} (${local.name})")
+                            }
                         }
                     }
-                }
-                for (remoteItem in remoteItems) {
-                    try {
-                        if (remoteItem.id > 0) {
-                            val localItem = menuDao.getMenuItemById(remoteItem.id)
-                            if (localItem == null) menuDao.insertMenuItem(remoteItem)
-                            else menuDao.updateMenuItem(remoteItem)
+                    for (remoteItem in remoteItems) {
+                        try {
+                            if (remoteItem.id > 0 &&
+                                remoteItem.id !in pendingMenuDeleteIds &&
+                                remoteItem.id !in pendingMenuUpsertIds
+                            ) {
+                                val localItem = menuDao.getMenuItemById(remoteItem.id)
+                                if (localItem == null) menuDao.insertMenuItem(remoteItem)
+                                else menuDao.updateMenuItem(remoteItem)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Supabase: Error syncing menu item: ${e.message}")
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Supabase: Error syncing menu item: ${e.message}")
                     }
                 }
                 deduplicateMenuItems()
@@ -287,10 +334,12 @@ class FiltrRepository(
                 for ((order, items) in remoteOrders) {
                     try {
                         val existing = dao.getInventoryOrderById(order.orderId)
-                        if (existing == null) {
-                            dao.insertInventoryOrder(order.copy(syncStatus = "SYNCED"))
-                            for (item in items) {
-                                dao.insertInventoryOrderItem(item.copy(id = 0))
+                        if (existing == null && items.isNotEmpty()) {
+                            runInTransaction {
+                                dao.insertInventoryOrder(order.copy(syncStatus = "SYNCED"))
+                                for (item in items) {
+                                    dao.insertInventoryOrderItem(item.copy(id = 0))
+                                }
                             }
                             Log.d(TAG, "Supabase: Synced new inventory order: ${order.orderId}")
                         }
@@ -305,15 +354,17 @@ class FiltrRepository(
         scope.launch(Dispatchers.IO) {
             val dao = inventoryDao ?: return@launch
             supabaseService.listenToInventoryItems().collect { remoteItems ->
-                for (remoteItem in remoteItems) {
-                    try {
-                        if (remoteItem.id > 0) {
-                            val localItem = dao.getInventoryItemById(remoteItem.id)
-                            if (localItem == null) dao.insertInventoryItem(remoteItem)
-                            else dao.updateInventoryItem(remoteItem)
+                stockMutex.withLock {
+                    for (remoteItem in remoteItems) {
+                        try {
+                            if (remoteItem.id > 0 && remoteItem.id !in dirtyInventoryItemIds) {
+                                val localItem = dao.getInventoryItemById(remoteItem.id)
+                                if (localItem == null) dao.insertInventoryItem(remoteItem)
+                                else dao.updateInventoryItem(remoteItem)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Supabase: Error syncing inventory item: ${e.message}")
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Supabase: Error syncing inventory item: ${e.message}")
                     }
                 }
             }
@@ -328,7 +379,8 @@ class FiltrRepository(
                         val remoteKeys = remoteUsages.map { Pair(it.menuItemId, it.inventoryItemId) }.toSet()
                         val localUsages = dao.getAllUsagesSnapshot()
                         for (local in localUsages) {
-                            if (Pair(local.menuItemId, local.inventoryItemId) !in remoteKeys) {
+                            val key = Pair(local.menuItemId, local.inventoryItemId)
+                            if (key !in remoteKeys && key !in pendingUsageUpsertKeys) {
                                 dao.deleteUsage(local)
                             }
                         }
@@ -338,7 +390,12 @@ class FiltrRepository(
 
                     for (remoteUsage in remoteUsages) {
                         try {
-                            if (remoteUsage.id > 0) {
+                            val key = Pair(remoteUsage.menuItemId, remoteUsage.inventoryItemId)
+                            if (remoteUsage.id > 0 &&
+                                remoteUsage.id !in pendingUsageDeleteIds &&
+                                remoteUsage.menuItemId !in pendingUsageDeleteMenuIds &&
+                                key !in pendingUsageUpsertKeys
+                            ) {
                                 val localUsage = dao.getUsageForMenuAndInventoryItem(remoteUsage.menuItemId, remoteUsage.inventoryItemId)
                                 if (localUsage == null) {
                                     dao.insertUsage(remoteUsage)
@@ -360,12 +417,16 @@ class FiltrRepository(
             supabaseService.listenToCustomers().collect { remoteCustomers ->
                 for (remoteCustomer in remoteCustomers) {
                     try {
-                        val localCustomer = dao.getCustomerByName(remoteCustomer.name)
+                        val normalizedName = remoteCustomer.name.trim().lowercase(Locale.US)
+                        if (remoteCustomer.id in pendingCustomerDeleteIds || normalizedName in pendingCustomerNames) {
+                            continue
+                        }
+                        val localCustomer = dao.getCustomerByName(remoteCustomer.name.trim())
                         if (localCustomer == null) {
-                            dao.insertCustomer(remoteCustomer)
+                            dao.insertCustomer(remoteCustomer.copy(name = remoteCustomer.name.trim()))
                         } else if (remoteCustomer.lastOrderTimestamp > localCustomer.lastOrderTimestamp ||
                             remoteCustomer.totalOrders > localCustomer.totalOrders) {
-                            dao.updateCustomer(remoteCustomer.copy(id = localCustomer.id))
+                            dao.updateCustomer(remoteCustomer.copy(id = localCustomer.id, name = localCustomer.name))
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "Supabase: Error syncing customer: ${e.message}")
@@ -380,6 +441,7 @@ class FiltrRepository(
     // ==================== FIRESTORE REAL-TIME LISTENERS (LEGACY) ====================
 
     fun startFirestoreListeners(scope: CoroutineScope) {
+        managedScope = scope
         if (!firestoreService.isInitialized) return
 
         // Listen to order changes from other devices
@@ -388,6 +450,7 @@ class FiltrRepository(
                 for (remoteOrderStub in remoteOrders) {
                     try {
                         val orderId = remoteOrderStub.order.orderId
+                        if (orderId in pendingOrderDeletions) continue
                         val localOrder = orderDao.getOrderById(orderId)
 
                         if (localOrder == null) {
@@ -583,20 +646,34 @@ class FiltrRepository(
 
     // ==================== MENU MANAGEMENT ====================
 
-    suspend fun addMenuItem(item: MenuItemEntity): Long {
-        val insertedId = menuDao.insertMenuItem(item)
+    suspend fun hasOrderHistoryForMenuItem(menuItem: MenuItemEntity): Boolean {
+        return orderDao.countOrderItemsForMenuItem(menuItem.id, menuItem.name) > 0
+    }
 
-        // Sync to Firestore
+    suspend fun addMenuItem(item: MenuItemEntity): Long {
+        val insertedId = menuSyncMutex.withLock {
+            val id = menuDao.insertMenuItem(item)
+            if (id > 0) pendingMenuUpsertIds.add(id.toInt())
+            id
+        }
+        val persisted = item.copy(id = insertedId.toInt())
+
+        // Sync to Supabase/Firestore
         if (supabaseService.isInitialized) {
             try {
-                supabaseService.saveMenuItem(item.copy(id = insertedId.toInt()))
+                val res = supabaseService.saveMenuItem(persisted)
+                if (res.isSuccess) {
+                    pendingMenuUpsertIds.remove(persisted.id)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync menu item to Supabase: ${e.message}")
             }
+        } else {
+            pendingMenuUpsertIds.remove(persisted.id)
         }
         if (firestoreService.isInitialized) {
             try {
-                firestoreService.saveMenuItem(item.copy(id = insertedId.toInt()))
+                firestoreService.saveMenuItem(persisted)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync menu item to Firestore: ${e.message}")
             }
@@ -606,15 +683,23 @@ class FiltrRepository(
     }
 
     suspend fun updateMenuItem(item: MenuItemEntity) {
-        menuDao.updateMenuItem(item)
+        menuSyncMutex.withLock {
+            menuDao.updateMenuItem(item)
+            if (item.id > 0) pendingMenuUpsertIds.add(item.id)
+        }
 
-        // Sync to Firestore
+        // Sync to Supabase/Firestore
         if (supabaseService.isInitialized) {
             try {
-                supabaseService.saveMenuItem(item)
+                val res = supabaseService.saveMenuItem(item)
+                if (res.isSuccess) {
+                    pendingMenuUpsertIds.remove(item.id)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync menu item update to Supabase: ${e.message}")
             }
+        } else {
+            pendingMenuUpsertIds.remove(item.id)
         }
         if (firestoreService.isInitialized) {
             try {
@@ -626,15 +711,24 @@ class FiltrRepository(
     }
 
     suspend fun deleteMenuItem(item: MenuItemEntity) {
-        menuDao.deleteMenuItem(item)
+        menuSyncMutex.withLock {
+            pendingMenuUpsertIds.remove(item.id)
+            if (item.id > 0) pendingMenuDeleteIds.add(item.id)
+            menuDao.deleteMenuItem(item)
+        }
 
-        // Sync to Firestore
+        // Sync to Supabase/Firestore
         if (supabaseService.isInitialized) {
             try {
-                supabaseService.deleteMenuItem(item.id)
+                val res = supabaseService.deleteMenuItem(item.id)
+                if (res.isSuccess) {
+                    pendingMenuDeleteIds.remove(item.id)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to delete menu item from Supabase: ${e.message}")
             }
+        } else {
+            pendingMenuDeleteIds.remove(item.id)
         }
         if (firestoreService.isInitialized) {
             try {
@@ -647,36 +741,47 @@ class FiltrRepository(
 
     suspend fun deduplicateMenuItems() {
         try {
-            val all = menuDao.getAllMenuItemsList()
-            val usages = inventoryDao?.getAllUsagesSnapshot() ?: emptyList()
-            val grouped = all.groupBy { it.name.trim().lowercase() }
-            val duplicates = mutableListOf<MenuItemEntity>()
+            val duplicates = menuSyncMutex.withLock {
+                val all = menuDao.getAllMenuItemsList()
+                val usages = inventoryDao?.getAllUsagesSnapshot() ?: emptyList()
+                val grouped = all.groupBy { it.name.trim().lowercase(Locale.US) }
+                val dupes = mutableListOf<MenuItemEntity>()
 
-            for ((_, group) in grouped) {
-                if (group.size > 1) {
-                    // Prefer keeping the item that has recipe usages defined, then lowest ID
-                    val canonical = group.find { item -> usages.any { it.menuItemId == item.id || it.menuItemName.equals(item.name, ignoreCase = true) } }
-                        ?: group.minByOrNull { it.id }
-                        ?: group.first()
+                for ((_, group) in grouped) {
+                    if (group.size > 1) {
+                        // Prefer keeping the item that has recipe usages defined, then lowest ID
+                        val canonical = group.find { item ->
+                            usages.any { it.menuItemId == item.id || it.menuItemName.equals(item.name, ignoreCase = true) }
+                        } ?: group.minByOrNull { it.id } ?: group.first()
 
-                    for (item in group) {
-                        if (item.id != canonical.id) {
-                            duplicates.add(item)
+                        for (item in group) {
+                            if (item.id != canonical.id) {
+                                dupes.add(item)
+                            }
                         }
                     }
                 }
+
+                dupes.forEach {
+                    menuDao.deleteMenuItem(it)
+                    pendingMenuUpsertIds.remove(it.id)
+                    if (it.id > 0) pendingMenuDeleteIds.add(it.id)
+                    Log.d(TAG, "Deduplication: deleted duplicate menu item #${it.id} '${it.name}'")
+                }
+                dupes
             }
 
             duplicates.forEach {
-                menuDao.deleteMenuItem(it)
-                Log.d(TAG, "Deduplication: deleted duplicate menu item #${it.id} '${it.name}'")
                 // Also delete from Supabase / Firestore
                 if (supabaseService.isInitialized) {
                     try {
-                        supabaseService.deleteMenuItem(it.id)
+                        val res = supabaseService.deleteMenuItem(it.id)
+                        if (res.isSuccess) pendingMenuDeleteIds.remove(it.id)
                     } catch (e: Exception) {
                         Log.w(TAG, "Failed to delete duplicate from Supabase: ${e.message}")
                     }
+                } else {
+                    pendingMenuDeleteIds.remove(it.id)
                 }
                 if (firestoreService.isInitialized) {
                     try {
@@ -692,42 +797,44 @@ class FiltrRepository(
     }
 
     suspend fun resetMenuToFiltrDefault() {
-        try {
-            menuDao.deleteAllMenuItems()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to clear old menu items: ${e.message}")
+        val allItems = menuSyncMutex.withLock {
+            try {
+                menuDao.deleteAllMenuItems()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to clear old menu items: ${e.message}")
+            }
+            val defaultItems = listOf(
+                // ICED COFFEE
+                MenuItemEntity(name = "Americano", category = "ICED COFFEE", price = 79.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
+                MenuItemEntity(name = "Vanila Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
+                MenuItemEntity(name = "Hazelnut Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
+                MenuItemEntity(name = "Caramel Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
+                MenuItemEntity(name = "Vietnamese Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
+                MenuItemEntity(name = "OG Vietnamese", category = "ICED COFFEE", price = 109.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
+
+                // FRAPPE
+                MenuItemEntity(name = "Just Frappe", category = "FRAPPE", price = 109.0, description = "Ice Cream + Coffee + Flavour"),
+                MenuItemEntity(name = "Vanila Frappe", category = "FRAPPE", price = 129.0, description = "Ice Cream + Coffee + Flavour"),
+                MenuItemEntity(name = "Hazelnut Frappe", category = "FRAPPE", price = 129.0, description = "Ice Cream + Coffee + Flavour"),
+                MenuItemEntity(name = "Caramel Frappe", category = "FRAPPE", price = 129.0, description = "Ice Cream + Coffee + Flavour"),
+
+                // FRIES
+                MenuItemEntity(name = "Salted Fries", category = "FRIES", price = 89.0, description = "Potato + Deep Fry"),
+                MenuItemEntity(name = "Peri Peri Fries", category = "FRIES", price = 99.0, description = "Potato + Deep Fry"),
+
+                // SANDWICH
+                MenuItemEntity(name = "Bombay", category = "SANDWICH", price = 89.0, description = "Fried Meshed Aaloo + Cheese (Extra Cheese Slice ₹15)"),
+                MenuItemEntity(name = "Cheese Corn", category = "SANDWICH", price = 99.0, description = "Sweet Corn + Cheese (Extra Cheese Slice ₹15)"),
+                MenuItemEntity(name = "Caramalized Onion", category = "SANDWICH", price = 109.0, description = "Caramel Onion + Cheese (Extra Cheese Slice ₹15)"),
+                MenuItemEntity(name = "Paneer Sandwich", category = "SANDWICH", price = 119.0, description = "Paneer + Olive + Onion + Cucumber (Extra Cheese Slice ₹15)")
+            )
+            menuDao.insertAll(defaultItems)
+            menuDao.getAllMenuItemsList()
         }
-        val defaultItems = listOf(
-            // ICED COFFEE
-            MenuItemEntity(name = "Americano", category = "ICED COFFEE", price = 79.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
-            MenuItemEntity(name = "Vanila Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
-            MenuItemEntity(name = "Hazelnut Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
-            MenuItemEntity(name = "Caramel Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
-            MenuItemEntity(name = "Vietnamese Iced Coffee", category = "ICED COFFEE", price = 99.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
-            MenuItemEntity(name = "OG Vietnamese", category = "ICED COFFEE", price = 109.0, description = "Milk + Whipped Cream + Flavour + Coffee"),
 
-            // FRAPPE
-            MenuItemEntity(name = "Just Frappe", category = "FRAPPE", price = 109.0, description = "Ice Cream + Coffee + Flavour"),
-            MenuItemEntity(name = "Vanila Frappe", category = "FRAPPE", price = 129.0, description = "Ice Cream + Coffee + Flavour"),
-            MenuItemEntity(name = "Hazelnut Frappe", category = "FRAPPE", price = 129.0, description = "Ice Cream + Coffee + Flavour"),
-            MenuItemEntity(name = "Caramel Frappe", category = "FRAPPE", price = 129.0, description = "Ice Cream + Coffee + Flavour"),
-
-            // FRIES
-            MenuItemEntity(name = "Salted Fries", category = "FRIES", price = 89.0, description = "Potato + Deep Fry"),
-            MenuItemEntity(name = "Peri Peri Fries", category = "FRIES", price = 99.0, description = "Potato + Deep Fry"),
-
-            // SANDWICH
-            MenuItemEntity(name = "Bombay", category = "SANDWICH", price = 89.0, description = "Fried Meshed Aaloo + Cheese (Extra Cheese Slice ₹15)"),
-            MenuItemEntity(name = "Cheese Corn", category = "SANDWICH", price = 99.0, description = "Sweet Corn + Cheese (Extra Cheese Slice ₹15)"),
-            MenuItemEntity(name = "Caramalized Onion", category = "SANDWICH", price = 109.0, description = "Caramel Onion + Cheese (Extra Cheese Slice ₹15)"),
-            MenuItemEntity(name = "Paneer Sandwich", category = "SANDWICH", price = 119.0, description = "Paneer + Olive + Onion + Cucumber (Extra Cheese Slice ₹15)")
-        )
-        menuDao.insertAll(defaultItems)
-
-        // Sync defaults to Firestore
+        // Sync defaults to Supabase / Firestore
         if (supabaseService.isInitialized) {
             try {
-                val allItems = menuDao.getAllMenuItemsList()
                 supabaseService.syncAllMenuItems(allItems)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync default menu to Supabase: ${e.message}")
@@ -735,7 +842,6 @@ class FiltrRepository(
         }
         if (firestoreService.isInitialized) {
             try {
-                val allItems = menuDao.getAllMenuItemsList()
                 firestoreService.syncAllMenuItems(allItems)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync default menu to Firestore: ${e.message}")
@@ -747,7 +853,7 @@ class FiltrRepository(
 
     // Generate sequential nomenclature order ID e.g. FLT-20260804-1017, FLT-20260804-1018
     suspend fun generateOrderId(webhookUrl: String = ""): String = orderIdMutex.withLock {
-        val datePart = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
+        val datePart = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
         val calendar = java.util.Calendar.getInstance().apply {
             set(java.util.Calendar.HOUR_OF_DAY, 0)
             set(java.util.Calendar.MINUTE, 0)
@@ -779,25 +885,27 @@ class FiltrRepository(
                 // Use Supabase atomic transaction to get next sequence
                 val nextSeqResult = supabaseService.getNextOrderSequence(datePart)
                 if (nextSeqResult.isSuccess) {
-                    var nextSeq = nextSeqResult.getOrNull() ?: (maxSequence + 1)
-                    // If zero orders exist today locally and remotely, ensure first order is 1001
-                    if (localOrderIds.isEmpty() && supabaseOrdersMax <= 1000 && nextSeq > 1001) {
-                        nextSeq = 1001
-                    }
-                    var candidateId = "FLT-$datePart-$nextSeq"
+                    val rpcSeq = nextSeqResult.getOrNull()
+                    if (rpcSeq != null) {
+                        var nextSeq = maxOf(rpcSeq, maxSequence + 1)
+                        var candidateId = "FLT-$datePart-$nextSeq"
 
-                    // Verify unique in local Room DB
-                    while (orderDao.getOrderById(candidateId) != null) {
-                        // Extremely rare edge case — get another sequence
-                        val retryResult = supabaseService.getNextOrderSequence(datePart)
-                        if (retryResult.isSuccess) {
-                            candidateId = "FLT-$datePart-${retryResult.getOrNull() ?: break}"
-                        } else {
-                            break
+                        // Bounded verification against local Room DB
+                        var attempts = 0
+                        val maxAttempts = 5
+                        while (orderDao.getOrderById(candidateId) != null && attempts < maxAttempts) {
+                            attempts++
+                            val retryResult = supabaseService.getNextOrderSequence(datePart)
+                            val retrySeq = retryResult.getOrNull() ?: break
+                            if (retrySeq <= nextSeq) break
+                            nextSeq = retrySeq
+                            candidateId = "FLT-$datePart-$nextSeq"
+                        }
+
+                        if (orderDao.getOrderById(candidateId) == null) {
+                            return@withLock candidateId
                         }
                     }
-
-                    return@withLock candidateId
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Supabase sequence generation failed, falling back: ${e.message}")
@@ -813,28 +921,33 @@ class FiltrRepository(
                 // Use Firestore atomic transaction to get next sequence
                 val nextSeqResult = firestoreService.getNextOrderSequence(datePart)
                 if (nextSeqResult.isSuccess) {
-                    val nextSeq = nextSeqResult.getOrNull() ?: (maxSequence + 1)
-                    var candidateId = "FLT-$datePart-$nextSeq"
+                    val fsSeq = nextSeqResult.getOrNull()
+                    if (fsSeq != null) {
+                        var nextSeq = maxOf(fsSeq, maxSequence + 1)
+                        var candidateId = "FLT-$datePart-$nextSeq"
 
-                    // Verify unique in local Room DB
-                    while (orderDao.getOrderById(candidateId) != null) {
-                        // Extremely rare edge case — get another sequence
-                        val retryResult = firestoreService.getNextOrderSequence(datePart)
-                        if (retryResult.isSuccess) {
-                            candidateId = "FLT-$datePart-${retryResult.getOrNull() ?: break}"
-                        } else {
-                            break
+                        var attempts = 0
+                        val maxAttempts = 5
+                        while (orderDao.getOrderById(candidateId) != null && attempts < maxAttempts) {
+                            attempts++
+                            val retryResult = firestoreService.getNextOrderSequence(datePart)
+                            val retrySeq = retryResult.getOrNull() ?: break
+                            if (retrySeq <= nextSeq) break
+                            nextSeq = retrySeq
+                            candidateId = "FLT-$datePart-$nextSeq"
+                        }
+
+                        if (orderDao.getOrderById(candidateId) == null) {
+                            return@withLock candidateId
                         }
                     }
-
-                    return@withLock candidateId
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Firestore sequence generation failed, falling back: ${e.message}")
             }
         }
 
-        // 3. Fallback: Query Google Sheets for cloud max sequence (original logic)
+        // 3. Fallback: Query Google Sheets for cloud max sequence
         if (webhookUrl.isNotBlank()) {
             try {
                 val remoteResult = sheetsSyncService.fetchLatestOrderInfoFromSheets(webhookUrl, datePart)
@@ -846,7 +959,10 @@ class FiltrRepository(
                         }
                         // Sync missing remote orders from Google Sheets into local Room DB
                         for (remoteOrder in syncData.remoteOrders) {
-                            if (orderDao.getOrderById(remoteOrder.order.orderId) == null) {
+                            if (remoteOrder.order.orderId !in pendingOrderDeletions &&
+                                remoteOrder.items.isNotEmpty() &&
+                                orderDao.getOrderById(remoteOrder.order.orderId) == null
+                            ) {
                                 orderDao.insertOrderWithItems(
                                     remoteOrder.order.copy(syncStatus = "SYNCED"),
                                     remoteOrder.items
@@ -855,15 +971,19 @@ class FiltrRepository(
                         }
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.w(TAG, "Sheets sequence fallback failed: ${e.message}")
+            }
         }
 
         var nextSequence = maxSequence + 1
         var candidateId = "FLT-$datePart-$nextSequence"
 
-        // Ensure candidateId is unique in local Room DB
-        while (orderDao.getOrderById(candidateId) != null) {
+        // Ensure candidateId is unique in local Room DB (bounded)
+        var localAttempts = 0
+        while (orderDao.getOrderById(candidateId) != null && localAttempts < 1000) {
             nextSequence++
+            localAttempts++
             candidateId = "FLT-$datePart-$nextSequence"
         }
 
@@ -910,11 +1030,12 @@ class FiltrRepository(
 
         // Save to Room DB first (instant, offline-first)
         orderDao.insertOrderWithItems(orderEntity, itemEntities)
+        sheetsPendingOrderIds.add(orderId)
 
         // Get the order back with generated item IDs
         val savedOrder = orderDao.getOrderById(orderId) ?: OrderWithItems(orderEntity, itemEntities)
 
-        // Push to remote in background (non-blocking)
+        // Push to remote
         if (supabaseService.isInitialized) {
             try {
                 val res = supabaseService.saveOrder(savedOrder)
@@ -932,20 +1053,24 @@ class FiltrRepository(
         if (firestoreService.isInitialized) {
             try {
                 val res = firestoreService.saveOrder(savedOrder)
-                if (res.isSuccess) {
-                    orderDao.updateSyncStatus(orderId, "SYNCED")
-                } else {
-                    orderDao.updateSyncStatus(orderId, "FAILED")
-                    Log.w(TAG, "Failed to sync new order to Firestore: ${res.exceptionOrNull()?.message}")
+                if (!supabaseService.isInitialized) {
+                    if (res.isSuccess) {
+                        orderDao.updateSyncStatus(orderId, "SYNCED")
+                    } else {
+                        orderDao.updateSyncStatus(orderId, "FAILED")
+                        Log.w(TAG, "Failed to sync new order to Firestore: ${res.exceptionOrNull()?.message}")
+                    }
                 }
             } catch (e: Exception) {
-                orderDao.updateSyncStatus(orderId, "FAILED")
+                if (!supabaseService.isInitialized) {
+                    orderDao.updateSyncStatus(orderId, "FAILED")
+                }
                 Log.w(TAG, "Failed to sync new order to Firestore: ${e.message}")
             }
         }
 
-        // Track customer stats (non-blocking)
-        CoroutineScope(Dispatchers.IO).launch {
+        // Track customer stats using managed scope
+        launchManagedSync {
             recordCustomerOrder(name, contactNumber.trim(), totalAmount)
         }
 
@@ -954,22 +1079,41 @@ class FiltrRepository(
 
     suspend fun updateOrderMadeStatus(orderId: String, isMade: Boolean) {
         val now = if (isMade) System.currentTimeMillis() else 0L
-        orderDao.updateMadeStatus(orderId, isMade, completedTimestamp = now)
-        if (isMade) {
-            orderDao.markAllOrderItemsCompleted(orderId, completedTimestamp = now)
-        } else {
-            orderDao.resetAllOrderItemsCompleted(orderId)
+        runInTransaction {
+            orderDao.updateMadeStatus(orderId, isMade, completedTimestamp = now)
+            if (isMade) {
+                orderDao.markAllOrderItemsCompleted(orderId, completedTimestamp = now)
+            } else {
+                orderDao.resetAllOrderItemsCompleted(orderId)
+            }
         }
+        sheetsPendingOrderIds.add(orderId)
 
-        // Sync made status to Supabase via field update (non-destructive)
+        // Sync made status + order_items completion to Supabase
         if (supabaseService.isInitialized) {
             try {
-                val res = supabaseService.updateOrderFields(orderId, mapOf(
+                val fieldsRes = supabaseService.updateOrderFields(orderId, mapOf(
                     "isMade" to isMade,
                     "completedTimestamp" to now,
                     "syncStatus" to "SYNCED"
                 ))
-                if (res.isSuccess) {
+                val itemsSuccess = if (isMade) {
+                    val fullOrder = orderDao.getOrderById(orderId)
+                    var allOk = true
+                    fullOrder?.items?.forEach { item ->
+                        val itemRes = supabaseService.updateOrderItemCompletion(
+                            orderId = orderId,
+                            itemName = item.itemName,
+                            completedQuantity = item.quantity,
+                            completedTimestamp = now
+                        )
+                        if (itemRes.isFailure) allOk = false
+                    }
+                    allOk
+                } else {
+                    supabaseService.updateAllOrderItemsCompletion(orderId, 0, 0L).isSuccess
+                }
+                if (fieldsRes.isSuccess && itemsSuccess) {
                     orderDao.updateSyncStatus(orderId, "SYNCED")
                 }
             } catch (e: Exception) {
@@ -993,11 +1137,13 @@ class FiltrRepository(
         val completedTs = if (completedQty > 0) now else 0L
         orderDao.updateOrderItemCompletedQuantity(itemId, completedQty, completedTimestamp = completedTs)
         orderDao.updateSyncStatus(orderId, "PENDING")
+        sheetsPendingOrderIds.add(orderId)
         val orderWithItems = orderDao.getOrderById(orderId)
         if (orderWithItems != null) {
             val allCompleted = orderWithItems.items.isNotEmpty() && orderWithItems.items.all { it.completedQuantity >= it.quantity }
             val orderCompletedTs = if (allCompleted) now else 0L
-            if (allCompleted != orderWithItems.order.isMade) {
+            val madeChanged = allCompleted != orderWithItems.order.isMade
+            if (madeChanged) {
                 orderDao.updateMadeStatus(orderId, allCompleted, completedTimestamp = orderCompletedTs)
             }
 
@@ -1007,15 +1153,15 @@ class FiltrRepository(
             // Sync item completion to Supabase
             if (supabaseService.isInitialized && itemName.isNotBlank()) {
                 try {
-                    val res = supabaseService.updateOrderItemCompletion(orderId, itemName, completedQty, completedTs)
-                    if (allCompleted != orderWithItems.order.isMade) {
+                    val itemRes = supabaseService.updateOrderItemCompletion(orderId, itemName, completedQty, completedTs)
+                    val fieldsOk = if (madeChanged) {
                         supabaseService.updateOrderFields(orderId, mapOf(
                             "isMade" to allCompleted,
                             "completedTimestamp" to orderCompletedTs,
                             "syncStatus" to "SYNCED"
-                        ))
-                    }
-                    if (res.isSuccess) {
+                        )).isSuccess
+                    } else true
+                    if (itemRes.isSuccess && fieldsOk) {
                         orderDao.updateSyncStatus(orderId, "SYNCED")
                     }
                 } catch (e: Exception) {
@@ -1024,7 +1170,7 @@ class FiltrRepository(
             }
             if (firestoreService.isInitialized) {
                 try {
-                    if (allCompleted != orderWithItems.order.isMade) {
+                    if (madeChanged) {
                         firestoreService.updateOrderFields(orderId, mapOf(
                             "isMade" to allCompleted,
                             "completedTimestamp" to orderCompletedTs
@@ -1043,6 +1189,7 @@ class FiltrRepository(
 
     suspend fun updateOrderPaidStatus(orderId: String, isPaid: Boolean, paymentMode: String = "UNPAID") {
         orderDao.updatePaidStatus(orderId, isPaid, paymentMode)
+        sheetsPendingOrderIds.add(orderId)
 
         // Sync to Supabase
         if (supabaseService.isInitialized) {
@@ -1073,6 +1220,7 @@ class FiltrRepository(
 
     suspend fun updateOrderDeliveredStatus(orderId: String, isDelivered: Boolean) {
         orderDao.updateDeliveredStatus(orderId, isDelivered)
+        sheetsPendingOrderIds.add(orderId)
 
         // Sync to Supabase
         if (supabaseService.isInitialized) {
@@ -1109,6 +1257,7 @@ class FiltrRepository(
         )
         val cleanItems = updatedItems.map { it.copy(orderId = updatedOrder.orderId) }
         orderDao.updateOrderWithItems(updatedOrder, cleanItems)
+        sheetsPendingOrderIds.add(updatedOrder.orderId)
 
         // Sync to Supabase
         if (supabaseService.isInitialized) {
@@ -1135,23 +1284,33 @@ class FiltrRepository(
             }
         }
 
-        // Sync to Google Sheets
+        // Sync to Google Sheets (using protected repository method so Supabase PENDING isn't overwritten)
         if (webhookUrl.isNotBlank()) {
-            sheetsSyncService.syncOrderToGoogleSheets(webhookUrl, OrderWithItems(updatedOrder, updatedItems))
+            val latest = orderDao.getOrderById(updatedOrder.orderId) ?: OrderWithItems(updatedOrder, cleanItems)
+            syncOrderToGoogleSheets(webhookUrl, latest)
         }
     }
 
     suspend fun deleteOrder(orderId: String, webhookUrl: String = "") {
-        orderDao.deleteOrderItemsByOrderId(orderId)
-        orderDao.deleteOrder(orderId)
+        pendingOrderDeletions.add(orderId)
+        sheetsPendingOrderIds.remove(orderId)
+        runInTransaction {
+            orderDao.deleteOrderItemsByOrderId(orderId)
+            orderDao.deleteOrder(orderId)
+        }
 
-        // Delete from Firestore
+        // Delete from Supabase / Firestore
         if (supabaseService.isInitialized) {
             try {
-                supabaseService.deleteOrder(orderId)
+                val res = supabaseService.deleteOrder(orderId)
+                if (res.isSuccess) {
+                    pendingOrderDeletions.remove(orderId)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to delete order from Supabase: ${e.message}")
             }
+        } else {
+            pendingOrderDeletions.remove(orderId)
         }
         if (firestoreService.isInitialized) {
             try {
@@ -1169,20 +1328,40 @@ class FiltrRepository(
 
     // ==================== GOOGLE SHEETS SYNC (PRESERVED) ====================
 
+    private fun hasPrimaryCloudBackend(): Boolean =
+        supabaseService.isInitialized || firestoreService.isInitialized
+
     suspend fun syncOrderToGoogleSheets(webhookUrl: String, orderWithItems: OrderWithItems): Result<String> {
         val result = sheetsSyncService.syncOrderToGoogleSheets(webhookUrl, orderWithItems)
+        val orderId = orderWithItems.order.orderId
         if (result.isSuccess) {
-            orderDao.updateSyncStatus(orderWithItems.order.orderId, "SYNCED")
+            sheetsPendingOrderIds.remove(orderId)
+            // Only write Room syncStatus when no primary cloud (Supabase/Firestore) owns it
+            if (!hasPrimaryCloudBackend()) {
+                orderDao.updateSyncStatus(orderId, "SYNCED")
+            }
         } else {
-            orderDao.updateSyncStatus(orderWithItems.order.orderId, "FAILED")
+            sheetsPendingOrderIds.add(orderId)
+            if (!hasPrimaryCloudBackend()) {
+                orderDao.updateSyncStatus(orderId, "FAILED")
+            }
         }
         return result
     }
 
     suspend fun syncPendingOrdersToSupabase(): Result<String> {
         if (!supabaseService.isInitialized) return Result.failure(Exception("Supabase not initialized"))
-        val unsynced = orderDao.getUnsyncedOrders()
-        if (unsynced.isEmpty()) return Result.success("All orders already synced to Supabase")
+
+        // 1. Retry pending order deletions so deleted orders cannot be resurrected
+        for (delOrderId in pendingOrderDeletions.toList()) {
+            val res = supabaseService.deleteOrder(delOrderId)
+            if (res.isSuccess) {
+                pendingOrderDeletions.remove(delOrderId)
+            }
+        }
+
+        // 2. Retry unsynced orders
+        val unsynced = orderDao.getUnsyncedOrders().filter { it.order.orderId !in pendingOrderDeletions }
         var syncedCount = 0
         for (orderWithItems in unsynced) {
             val res = supabaseService.saveOrder(orderWithItems)
@@ -1191,30 +1370,102 @@ class FiltrRepository(
                 syncedCount++
             }
         }
+
+        // 3. Retry pending non-order mutations (menu, inventory, recipes, customers, checklist)
+        for (menuId in pendingMenuUpsertIds.toList()) {
+            val item = menuDao.getMenuItemById(menuId)
+            if (item != null && supabaseService.saveMenuItem(item).isSuccess) {
+                pendingMenuUpsertIds.remove(menuId)
+            }
+        }
+        for (menuId in pendingMenuDeleteIds.toList()) {
+            if (supabaseService.deleteMenuItem(menuId).isSuccess) {
+                pendingMenuDeleteIds.remove(menuId)
+            }
+        }
+        for (invId in dirtyInventoryItemIds.toList()) {
+            val item = inventoryDao?.getInventoryItemById(invId)
+            if (item != null && supabaseService.saveInventoryItem(item).isSuccess) {
+                dirtyInventoryItemIds.remove(invId)
+            }
+        }
+        for (menuId in pendingUsageDeleteMenuIds.toList()) {
+            if (supabaseService.deleteInventoryUsagesForMenuItem(menuId).isSuccess) {
+                pendingUsageDeleteMenuIds.remove(menuId)
+            }
+        }
+        for (usageId in pendingUsageDeleteIds.toList()) {
+            if (supabaseService.deleteInventoryUsage(usageId).isSuccess) {
+                pendingUsageDeleteIds.remove(usageId)
+            }
+        }
+        for (pair in pendingUsageUpsertKeys.toList()) {
+            val usage = inventoryDao?.getUsageForMenuAndInventoryItem(pair.first, pair.second)
+            if (usage != null && supabaseService.saveInventoryUsage(usage).isSuccess) {
+                pendingUsageUpsertKeys.remove(pair)
+            }
+        }
+        for (custId in pendingCustomerDeleteIds.toList()) {
+            if (supabaseService.deleteCustomer(custId).isSuccess) {
+                pendingCustomerDeleteIds.remove(custId)
+            }
+        }
+        for (custName in pendingCustomerNames.toList()) {
+            val cust = customerDao?.getCustomerByName(custName)
+            if (cust != null && supabaseService.saveCustomer(cust).isSuccess) {
+                pendingCustomerNames.remove(custName)
+            }
+        }
+        for (dateKey in dirtyChecklistDateKeys.toList()) {
+            checklistSyncMutex.withLock {
+                syncChecklistCompletionsToCloud(dateKey)
+            }
+        }
+
         return Result.success("Synced $syncedCount pending orders to Supabase")
     }
 
     suspend fun syncPendingOrdersToGoogleSheets(webhookUrl: String): Result<String> {
-        val unsynced = orderDao.getUnsyncedOrders()
+        val roomUnsynced = orderDao.getUnsyncedOrders()
+        val extraIds = sheetsPendingOrderIds.toList().filter { id ->
+            id !in pendingOrderDeletions && roomUnsynced.none { it.order.orderId == id }
+        }
+        val extraOrders = if (extraIds.isNotEmpty()) orderDao.getOrdersByIds(extraIds) else emptyList()
+        val unsynced = (roomUnsynced + extraOrders)
+            .filter { it.order.orderId !in pendingOrderDeletions }
+            .distinctBy { it.order.orderId }
+
         if (unsynced.isEmpty()) {
             return Result.success("All orders are already synced")
         }
 
+        val hasPrimaryCloud = hasPrimaryCloudBackend()
         val batchResult = sheetsSyncService.syncBatchOrdersToGoogleSheets(webhookUrl, unsynced)
         if (batchResult.isSuccess) {
-            orderDao.updateSyncStatusForOrders(unsynced.map { it.order.orderId }, "SYNCED")
+            val syncedIds = unsynced.map { it.order.orderId }
+            syncedIds.forEach { sheetsPendingOrderIds.remove(it) }
+            if (!hasPrimaryCloud) {
+                orderDao.updateSyncStatusForOrders(syncedIds, "SYNCED")
+            }
             return Result.success("Successfully synced ${unsynced.size} pending orders to Google Sheets")
         }
 
         // Fallback to sequential single order syncs if batch endpoint failed
         var syncedCount = 0
         unsynced.forEach { orderWithItems ->
+            val id = orderWithItems.order.orderId
             val singleRes = sheetsSyncService.syncOrderToGoogleSheets(webhookUrl, orderWithItems)
             if (singleRes.isSuccess) {
-                orderDao.updateSyncStatus(orderWithItems.order.orderId, "SYNCED")
+                sheetsPendingOrderIds.remove(id)
+                if (!hasPrimaryCloud) {
+                    orderDao.updateSyncStatus(id, "SYNCED")
+                }
                 syncedCount++
             } else {
-                orderDao.updateSyncStatus(orderWithItems.order.orderId, "FAILED")
+                sheetsPendingOrderIds.add(id)
+                if (!hasPrimaryCloud) {
+                    orderDao.updateSyncStatus(id, "FAILED")
+                }
             }
         }
 
@@ -1229,7 +1480,8 @@ class FiltrRepository(
         val result = sheetsSyncService.syncAllOrdersToGoogleSheets(webhookUrl, ordersList, datePrefix)
         if (result.isSuccess) {
             val orderIds = ordersList.map { it.order.orderId }
-            if (orderIds.isNotEmpty()) {
+            orderIds.forEach { sheetsPendingOrderIds.remove(it) }
+            if (!hasPrimaryCloudBackend() && orderIds.isNotEmpty()) {
                 orderDao.updateSyncStatusForOrders(orderIds, "SYNCED")
             }
         }
@@ -1315,8 +1567,11 @@ class FiltrRepository(
         val id = inventoryDao?.insertInventoryItem(item) ?: -1
         // Sync to Supabase
         if (id > 0 && supabaseService.isInitialized) {
+            val intId = id.toInt()
+            dirtyInventoryItemIds.add(intId)
             try {
-                supabaseService.saveInventoryItem(item.copy(id = id.toInt()))
+                val res = supabaseService.saveInventoryItem(item.copy(id = intId))
+                if (res.isSuccess) dirtyInventoryItemIds.remove(intId)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync inventory item to Supabase: ${e.message}")
             }
@@ -1327,8 +1582,10 @@ class FiltrRepository(
     suspend fun updateInventoryItem(item: InventoryItemEntity) {
         inventoryDao?.updateInventoryItem(item)
         if (supabaseService.isInitialized) {
+            if (item.id > 0) dirtyInventoryItemIds.add(item.id)
             try {
-                supabaseService.saveInventoryItem(item)
+                val res = supabaseService.saveInventoryItem(item)
+                if (res.isSuccess) dirtyInventoryItemIds.remove(item.id)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync inventory item update to Supabase: ${e.message}")
             }
@@ -1336,6 +1593,7 @@ class FiltrRepository(
     }
 
     suspend fun deleteInventoryItem(item: InventoryItemEntity) {
+        dirtyInventoryItemIds.remove(item.id)
         inventoryDao?.deleteInventoryItem(item)
         if (supabaseService.isInitialized) {
             try {
@@ -1351,27 +1609,34 @@ class FiltrRepository(
     }
 
     suspend fun addInventoryOrder(order: InventoryOrderEntity, items: List<InventoryOrderItemEntity>) {
-        inventoryDao?.insertInventoryOrderWithItems(order, items)
-        // Auto-add stock for each item
-        for (item in items) {
-            val masterItem = inventoryDao?.getInventoryItemByName(item.itemName)
-            if (masterItem != null && item.quantity > 0) {
-                inventoryDao?.addStock(masterItem.id, item.quantity)
-                // Sync updated stock to Supabase
-                if (supabaseService.isInitialized) {
-                    try {
-                        val updatedItem = inventoryDao?.getInventoryItemById(masterItem.id)
-                        if (updatedItem != null) {
-                            supabaseService.updateInventoryStock(masterItem.id, updatedItem.currentStock)
+        val affectedIds = mutableSetOf<Int>()
+        stockMutex.withLock {
+            runInTransaction {
+                inventoryDao?.insertInventoryOrderWithItems(order, items)
+                for (item in items) {
+                    val masterItem = inventoryDao?.getInventoryItemByName(item.itemName)
+                    if (masterItem != null && item.quantity > 0) {
+                        val (packsToAdd, _) = calculatePacksAndCost(item.quantity, item.unit, masterItem)
+                        if (packsToAdd > 0.0) {
+                            inventoryDao?.addStock(masterItem.id, packsToAdd)
+                            affectedIds.add(masterItem.id)
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to sync stock update to Supabase: ${e.message}")
                     }
                 }
             }
         }
-        // Sync order to Supabase
         if (supabaseService.isInitialized) {
+            for (itemId in affectedIds) {
+                dirtyInventoryItemIds.add(itemId)
+                try {
+                    val updatedItem = inventoryDao?.getInventoryItemById(itemId)
+                    if (updatedItem != null && supabaseService.updateInventoryStock(itemId, updatedItem.currentStock).isSuccess) {
+                        dirtyInventoryItemIds.remove(itemId)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync stock update to Supabase: ${e.message}")
+                }
+            }
             try {
                 supabaseService.saveInventoryOrder(order, items)
             } catch (e: Exception) {
@@ -1381,28 +1646,35 @@ class FiltrRepository(
     }
 
     suspend fun deleteInventoryOrder(orderId: String) {
-        // Reverse stock additions before deleting
-        val orderWithItems = inventoryDao?.getInventoryOrderWithItemsById(orderId)
-        orderWithItems?.items?.forEach { item ->
-            val masterItem = inventoryDao?.getInventoryItemByName(item.itemName)
-            if (masterItem != null && item.quantity > 0) {
-                inventoryDao?.deductStock(masterItem.id, item.quantity)
-                // Sync updated stock to Supabase
-                if (supabaseService.isInitialized) {
-                    try {
-                        val updatedItem = inventoryDao?.getInventoryItemById(masterItem.id)
-                        if (updatedItem != null) {
-                            supabaseService.updateInventoryStock(masterItem.id, updatedItem.currentStock)
+        val affectedIds = mutableSetOf<Int>()
+        stockMutex.withLock {
+            runInTransaction {
+                val orderWithItems = inventoryDao?.getInventoryOrderWithItemsById(orderId)
+                orderWithItems?.items?.forEach { item ->
+                    val masterItem = inventoryDao?.getInventoryItemByName(item.itemName)
+                    if (masterItem != null && item.quantity > 0) {
+                        val (packsToDeduct, _) = calculatePacksAndCost(item.quantity, item.unit, masterItem)
+                        if (packsToDeduct > 0.0) {
+                            inventoryDao?.deductStock(masterItem.id, packsToDeduct)
+                            affectedIds.add(masterItem.id)
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to sync stock reversal to Supabase: ${e.message}")
                     }
                 }
+                inventoryDao?.deleteInventoryOrderWithItems(orderId)
             }
         }
-        inventoryDao?.deleteInventoryOrderWithItems(orderId)
-        // Sync deletion to Supabase
         if (supabaseService.isInitialized) {
+            for (itemId in affectedIds) {
+                dirtyInventoryItemIds.add(itemId)
+                try {
+                    val updatedItem = inventoryDao?.getInventoryItemById(itemId)
+                    if (updatedItem != null && supabaseService.updateInventoryStock(itemId, updatedItem.currentStock).isSuccess) {
+                        dirtyInventoryItemIds.remove(itemId)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync stock reversal to Supabase: ${e.message}")
+                }
+            }
             try {
                 supabaseService.deleteInventoryOrder(orderId)
             } catch (e: Exception) {
@@ -1411,21 +1683,37 @@ class FiltrRepository(
         }
     }
 
-    suspend fun getNextInventoryOrderId(): String {
-        val datePrefix = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
+    suspend fun getNextInventoryOrderId(): String = inventoryOrderIdMutex.withLock {
+        val datePrefix = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
         val prefix = "INV-$datePrefix-"
-        val maxSeq = inventoryDao?.getMaxSequenceForPrefix(prefix) ?: 0
-        val nextSeq = maxSeq + 1
-        return "$prefix${String.format("%03d", nextSeq)}"
+        var maxSeq = inventoryDao?.getMaxSequenceForPrefix(prefix) ?: 0
+        if (supabaseService.isInitialized) {
+            val remoteMax = supabaseService.getTodayMaxInventoryOrderSequence(datePrefix)
+            if (remoteMax > maxSeq) maxSeq = remoteMax
+        }
+        var nextSeq = maxSeq + 1
+        var candidate = "$prefix${String.format(Locale.US, "%03d", nextSeq)}"
+        var attempts = 0
+        while (inventoryDao?.getInventoryOrderById(candidate) != null && attempts < 1000) {
+            nextSeq++
+            attempts++
+            candidate = "$prefix${String.format(Locale.US, "%03d", nextSeq)}"
+        }
+        return@withLock candidate
     }
 
     // ==================== STOCK MANAGEMENT ====================
 
     suspend fun updateStock(itemId: Int, newStock: Double) {
-        inventoryDao?.updateStock(itemId, newStock)
+        stockMutex.withLock {
+            inventoryDao?.updateStock(itemId, newStock)
+        }
         if (supabaseService.isInitialized) {
+            dirtyInventoryItemIds.add(itemId)
             try {
-                supabaseService.updateInventoryStock(itemId, newStock)
+                if (supabaseService.updateInventoryStock(itemId, newStock).isSuccess) {
+                    dirtyInventoryItemIds.remove(itemId)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync stock update to Supabase: ${e.message}")
             }
@@ -1433,12 +1721,16 @@ class FiltrRepository(
     }
 
     suspend fun addStock(itemId: Int, amount: Double) {
-        inventoryDao?.addStock(itemId, amount)
-        if (supabaseService.isInitialized) {
+        if (amount == 0.0) return
+        val updatedStock = stockMutex.withLock {
+            inventoryDao?.addStock(itemId, amount)
+            inventoryDao?.getInventoryItemById(itemId)?.currentStock
+        }
+        if (supabaseService.isInitialized && updatedStock != null) {
+            dirtyInventoryItemIds.add(itemId)
             try {
-                val updatedItem = inventoryDao?.getInventoryItemById(itemId)
-                if (updatedItem != null) {
-                    supabaseService.updateInventoryStock(itemId, updatedItem.currentStock)
+                if (supabaseService.updateInventoryStock(itemId, updatedStock).isSuccess) {
+                    dirtyInventoryItemIds.remove(itemId)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync stock addition to Supabase: ${e.message}")
@@ -1447,25 +1739,47 @@ class FiltrRepository(
     }
 
     suspend fun deductStockForOrder(orderItems: List<OrderItemEntity>) {
-        for (orderItem in orderItems) {
-            val usages = inventoryDao?.getUsageForMenuItem(orderItem.menuItemId) ?: emptyList()
-            for (usage in usages) {
-                val totalUsed = usage.quantityUsed * orderItem.quantity
-                val item = inventoryDao?.getInventoryItemById(usage.inventoryItemId)
-                if (item != null) {
-                    val (packsToDeduct, _) = calculatePacksAndCost(totalUsed, usage.unit, item)
-                    inventoryDao?.deductStock(usage.inventoryItemId, packsToDeduct)
-                    // Sync updated stock to Supabase
-                    if (supabaseService.isInitialized) {
-                        try {
-                            val updatedItem = inventoryDao?.getInventoryItemById(usage.inventoryItemId)
-                            if (updatedItem != null) {
-                                supabaseService.updateInventoryStock(usage.inventoryItemId, updatedItem.currentStock)
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed to sync stock deduction to Supabase: ${e.message}")
+        if (orderItems.isEmpty()) return
+        val dao = inventoryDao ?: return
+
+        val packsToDeductByItem = mutableMapOf<Int, Double>()
+        stockMutex.withLock {
+            runInTransaction {
+                val allUsages = dao.getAllUsagesSnapshot()
+                val usagesByMenuId = allUsages.groupBy { it.menuItemId }
+                for (orderItem in orderItems) {
+                    val usages = if (orderItem.menuItemId > 0) {
+                        usagesByMenuId[orderItem.menuItemId].orEmpty()
+                    } else {
+                        allUsages.filter { it.menuItemName.equals(orderItem.itemName, ignoreCase = true) }
+                    }
+                    for (usage in usages) {
+                        val totalUsed = usage.quantityUsed * orderItem.quantity
+                        if (totalUsed <= 0.0) continue
+                        val item = dao.getInventoryItemById(usage.inventoryItemId) ?: continue
+                        val (packsToDeduct, _) = calculatePacksAndCost(totalUsed, usage.unit, item)
+                        if (packsToDeduct > 0.0) {
+                            packsToDeductByItem[usage.inventoryItemId] =
+                                (packsToDeductByItem[usage.inventoryItemId] ?: 0.0) + packsToDeduct
                         }
                     }
+                }
+                for ((invId, totalPacks) in packsToDeductByItem) {
+                    dao.deductStock(invId, totalPacks)
+                }
+            }
+        }
+
+        if (supabaseService.isInitialized) {
+            for (invId in packsToDeductByItem.keys) {
+                dirtyInventoryItemIds.add(invId)
+                try {
+                    val updatedItem = dao.getInventoryItemById(invId)
+                    if (updatedItem != null && supabaseService.updateInventoryStock(invId, updatedItem.currentStock).isSuccess) {
+                        dirtyInventoryItemIds.remove(invId)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync stock deduction to Supabase: ${e.message}")
                 }
             }
         }
@@ -1486,10 +1800,15 @@ class FiltrRepository(
     }
 
     suspend fun saveUsage(usage: InventoryUsageEntity): Long {
+        val key = Pair(usage.menuItemId, usage.inventoryItemId)
+        pendingUsageDeleteMenuIds.remove(usage.menuItemId)
         val id = inventoryDao?.insertUsage(usage) ?: -1
         if (id > 0 && supabaseService.isInitialized) {
+            pendingUsageUpsertKeys.add(key)
             try {
-                supabaseService.saveInventoryUsage(usage.copy(id = id.toInt()))
+                if (supabaseService.saveInventoryUsage(usage.copy(id = id.toInt())).isSuccess) {
+                    pendingUsageUpsertKeys.remove(key)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync usage to Supabase: ${e.message}")
             }
@@ -1498,10 +1817,15 @@ class FiltrRepository(
     }
 
     suspend fun updateUsage(usage: InventoryUsageEntity) {
+        val key = Pair(usage.menuItemId, usage.inventoryItemId)
+        pendingUsageDeleteMenuIds.remove(usage.menuItemId)
         inventoryDao?.updateUsage(usage)
         if (supabaseService.isInitialized) {
+            pendingUsageUpsertKeys.add(key)
             try {
-                supabaseService.saveInventoryUsage(usage)
+                if (supabaseService.saveInventoryUsage(usage).isSuccess) {
+                    pendingUsageUpsertKeys.remove(key)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync usage update to Supabase: ${e.message}")
             }
@@ -1509,10 +1833,14 @@ class FiltrRepository(
     }
 
     suspend fun deleteUsage(usage: InventoryUsageEntity) {
+        pendingUsageUpsertKeys.remove(Pair(usage.menuItemId, usage.inventoryItemId))
         inventoryDao?.deleteUsage(usage)
-        if (supabaseService.isInitialized) {
+        if (supabaseService.isInitialized && usage.id > 0) {
+            pendingUsageDeleteIds.add(usage.id)
             try {
-                supabaseService.deleteInventoryUsage(usage.id)
+                if (supabaseService.deleteInventoryUsage(usage.id).isSuccess) {
+                    pendingUsageDeleteIds.remove(usage.id)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync usage deletion to Supabase: ${e.message}")
             }
@@ -1520,7 +1848,18 @@ class FiltrRepository(
     }
 
     suspend fun deleteAllUsagesForMenuItem(menuItemId: Int) {
+        pendingUsageUpsertKeys.removeAll { it.first == menuItemId }
         inventoryDao?.deleteAllUsagesForMenuItem(menuItemId)
+        if (supabaseService.isInitialized) {
+            pendingUsageDeleteMenuIds.add(menuItemId)
+            try {
+                if (supabaseService.deleteInventoryUsagesForMenuItem(menuItemId).isSuccess) {
+                    pendingUsageDeleteMenuIds.remove(menuItemId)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync deleteAllUsagesForMenuItem($menuItemId) to Supabase: ${e.message}")
+            }
+        }
     }
 
     // ==================== CUSTOMER MANAGEMENT ====================
@@ -1531,23 +1870,34 @@ class FiltrRepository(
 
     suspend fun saveCustomer(name: String, contactNumber: String = ""): Result<String> {
         val dao = customerDao ?: return Result.failure(Exception("Customer DAO not available"))
+        val cleanName = name.trim()
+        val cleanContact = contactNumber.trim()
+        val normalizedKey = cleanName.lowercase(Locale.US)
         return try {
-            val existing = dao.getCustomerByName(name)
+            val existing = dao.getCustomerByName(cleanName)
             if (existing != null) {
-                return Result.failure(Exception("Customer '$name' already exists"))
+                return Result.failure(Exception("Customer '$cleanName' already exists"))
             }
             val customer = CustomerEntity(
-                name = name,
-                contactNumber = contactNumber,
+                name = cleanName,
+                contactNumber = cleanContact,
                 createdAt = System.currentTimeMillis()
             )
-            dao.insertCustomer(customer)
-            CoroutineScope(Dispatchers.IO).launch {
-                try { supabaseService.saveCustomer(customer) } catch (e: Exception) {
-                    Log.w(TAG, "Failed to sync customer to Supabase: ${e.message}")
+            val insertedId = dao.insertCustomer(customer)
+            val savedCustomer = customer.copy(id = insertedId.toInt())
+            pendingCustomerNames.add(normalizedKey)
+            launchManagedSync {
+                customerSyncMutex.withLock {
+                    try {
+                        if (supabaseService.saveCustomer(savedCustomer).isSuccess) {
+                            pendingCustomerNames.remove(normalizedKey)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to sync customer to Supabase: ${e.message}")
+                    }
                 }
             }
-            Result.success(name)
+            Result.success(cleanName)
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -1555,12 +1905,23 @@ class FiltrRepository(
 
     suspend fun updateCustomer(customer: CustomerEntity): Result<String> {
         val dao = customerDao ?: return Result.failure(Exception("Customer DAO not available"))
+        val cleaned = customer.copy(name = customer.name.trim(), contactNumber = customer.contactNumber.trim())
+        val normalizedKey = cleaned.name.lowercase(Locale.US)
         return try {
-            dao.updateCustomer(customer)
-            CoroutineScope(Dispatchers.IO).launch {
-                try { supabaseService.saveCustomer(customer) } catch (_: Exception) {}
+            dao.updateCustomer(cleaned)
+            pendingCustomerNames.add(normalizedKey)
+            launchManagedSync {
+                customerSyncMutex.withLock {
+                    try {
+                        if (supabaseService.saveCustomer(cleaned).isSuccess) {
+                            pendingCustomerNames.remove(normalizedKey)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to sync customer update to Supabase: ${e.message}")
+                    }
+                }
             }
-            Result.success(customer.name)
+            Result.success(cleaned.name)
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -1569,9 +1930,21 @@ class FiltrRepository(
     suspend fun deleteCustomer(customer: CustomerEntity): Result<String> {
         val dao = customerDao ?: return Result.failure(Exception("Customer DAO not available"))
         return try {
+            pendingCustomerNames.remove(customer.name.trim().lowercase(Locale.US))
             dao.deleteCustomer(customer)
-            CoroutineScope(Dispatchers.IO).launch {
-                try { supabaseService.deleteCustomer(customer.id) } catch (_: Exception) {}
+            if (customer.id > 0) {
+                pendingCustomerDeleteIds.add(customer.id)
+                launchManagedSync {
+                    customerSyncMutex.withLock {
+                        try {
+                            if (supabaseService.deleteCustomer(customer.id).isSuccess) {
+                                pendingCustomerDeleteIds.remove(customer.id)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to delete customer from Supabase: ${e.message}")
+                        }
+                    }
+                }
             }
             Result.success(customer.name)
         } catch (e: Exception) {
@@ -1580,31 +1953,43 @@ class FiltrRepository(
     }
 
     suspend fun recordCustomerOrder(customerName: String, contactNumber: String, amount: Double) {
-        if (customerName.isBlank() || customerName == "Walk-in Customer") return
+        val cleanName = customerName.trim()
+        val cleanContact = contactNumber.trim()
+        if (cleanName.isBlank() || cleanName == "Walk-in Customer") return
         val dao = customerDao ?: return
+        val normalizedKey = cleanName.lowercase(Locale.US)
         try {
-            val existing = dao.getCustomerByName(customerName)
-            val now = System.currentTimeMillis()
-            if (existing != null) {
-                dao.incrementOrderStats(customerName, amount, now, contactNumber)
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        val updated = dao.getCustomerByName(customerName)
-                        if (updated != null) supabaseService.saveCustomer(updated)
-                    } catch (_: Exception) {}
+            val savedCustomer = runInTransaction {
+                val existing = dao.getCustomerByName(cleanName)
+                val now = System.currentTimeMillis()
+                if (existing != null) {
+                    dao.incrementOrderStats(cleanName, amount, now, cleanContact)
+                    dao.getCustomerByName(cleanName)
+                } else {
+                    val newCustomer = CustomerEntity(
+                        name = cleanName,
+                        contactNumber = cleanContact,
+                        totalOrders = 1,
+                        totalSpent = amount,
+                        lastOrderTimestamp = now,
+                        createdAt = now
+                    )
+                    val insertedId = dao.insertCustomer(newCustomer)
+                    newCustomer.copy(id = insertedId.toInt())
                 }
-            } else {
-                val newCustomer = CustomerEntity(
-                    name = customerName,
-                    contactNumber = contactNumber,
-                    totalOrders = 1,
-                    totalSpent = amount,
-                    lastOrderTimestamp = now,
-                    createdAt = now
-                )
-                dao.insertCustomer(newCustomer)
-                CoroutineScope(Dispatchers.IO).launch {
-                    try { supabaseService.saveCustomer(newCustomer) } catch (_: Exception) {}
+            }
+            if (savedCustomer != null) {
+                pendingCustomerNames.add(normalizedKey)
+                launchManagedSync {
+                    customerSyncMutex.withLock {
+                        try {
+                            if (supabaseService.saveCustomer(savedCustomer).isSuccess) {
+                                pendingCustomerNames.remove(normalizedKey)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to sync recorded customer order to Supabase: ${e.message}")
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -1636,21 +2021,27 @@ class FiltrRepository(
         return try {
             val existing = checklistDao?.getCompletion(dateKey, taskId)
             val newStatus = !(existing?.isCompleted ?: false)
+            val now = System.currentTimeMillis()
             val completion = ChecklistCompletionEntity(
                 dateKey = dateKey,
                 taskId = taskId,
                 isCompleted = newStatus,
-                completedTimestamp = if (newStatus) System.currentTimeMillis() else 0L,
-                completedBy = completedBy
+                completedTimestamp = if (newStatus) now else 0L,
+                completedBy = completedBy,
+                isOutOfStock = existing?.isOutOfStock ?: false
             )
             checklistDao?.insertOrUpdateCompletion(completion)
+            localChecklistActionTimestamps[dateKey to taskId] = now
+            dirtyChecklistDateKeys.add(dateKey)
 
-            // Asynchronously sync completions to cloud metadata
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    syncChecklistCompletionsToCloud(dateKey)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to sync checklist completions: ${e.message}")
+            // Asynchronously sync completions to cloud metadata on managed scope
+            launchManagedSync {
+                checklistSyncMutex.withLock {
+                    try {
+                        syncChecklistCompletionsToCloud(dateKey)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to sync checklist completions: ${e.message}")
+                    }
                 }
             }
             Result.success(Unit)
@@ -1667,21 +2058,28 @@ class FiltrRepository(
         completedBy: String = "Staff"
     ): Result<Unit> {
         return try {
+            val existing = checklistDao?.getCompletion(dateKey, taskId)
+            val now = System.currentTimeMillis()
             val completion = ChecklistCompletionEntity(
                 dateKey = dateKey,
                 taskId = taskId,
                 isCompleted = isCompleted,
-                completedTimestamp = if (isCompleted) System.currentTimeMillis() else 0L,
-                completedBy = completedBy
+                completedTimestamp = if (isCompleted) now else 0L,
+                completedBy = completedBy,
+                isOutOfStock = existing?.isOutOfStock ?: false
             )
             checklistDao?.insertOrUpdateCompletion(completion)
+            localChecklistActionTimestamps[dateKey to taskId] = now
+            dirtyChecklistDateKeys.add(dateKey)
 
-            // Asynchronously sync completions to cloud metadata
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    syncChecklistCompletionsToCloud(dateKey)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to sync checklist completions: ${e.message}")
+            // Asynchronously sync completions to cloud metadata on managed scope
+            launchManagedSync {
+                checklistSyncMutex.withLock {
+                    try {
+                        syncChecklistCompletionsToCloud(dateKey)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to sync checklist completions: ${e.message}")
+                    }
                 }
             }
             Result.success(Unit)
@@ -1709,14 +2107,18 @@ class FiltrRepository(
                 orderIndex = 100,
                 createdAt = System.currentTimeMillis()
             )
+            pendingChecklistTaskAdds.add(id)
+            pendingChecklistTaskDeletes.remove(id)
             checklistDao?.insertTask(task)
 
-            // Push custom tasks to cloud metadata
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    syncCustomTasksToCloud()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to sync custom tasks: ${e.message}")
+            // Push custom tasks to cloud metadata on managed scope
+            launchManagedSync {
+                checklistSyncMutex.withLock {
+                    try {
+                        syncCustomTasksToCloud()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to sync custom tasks: ${e.message}")
+                    }
                 }
             }
             Result.success(task)
@@ -1728,11 +2130,17 @@ class FiltrRepository(
 
     suspend fun deleteChecklistTask(taskId: String): Result<Unit> {
         return try {
+            pendingChecklistTaskAdds.remove(taskId)
+            pendingChecklistTaskDeletes.add(taskId)
             checklistDao?.deleteTaskById(taskId)
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    syncCustomTasksToCloud()
-                } catch (_: Exception) {}
+            launchManagedSync {
+                checklistSyncMutex.withLock {
+                    try {
+                        syncCustomTasksToCloud()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to sync custom task deletion: ${e.message}")
+                    }
+                }
             }
             Result.success(Unit)
         } catch (e: Exception) {
@@ -1749,16 +2157,21 @@ class FiltrRepository(
         val completions = dao.getCompletionsForDateSync(dateKey)
         val arr = JSONArray()
         completions.forEach { c ->
+            val updatedAt = maxOf(c.completedTimestamp, localChecklistActionTimestamps[dateKey to c.taskId] ?: 0L)
             val obj = JSONObject().apply {
                 put("taskId", c.taskId)
                 put("isCompleted", c.isCompleted)
                 put("completedTimestamp", c.completedTimestamp)
+                put("updatedAt", updatedAt)
                 put("completedBy", c.completedBy)
                 put("isOutOfStock", c.isOutOfStock)
             }
             arr.put(obj)
         }
-        supabaseService.saveCloudChecklistCompletions(dateKey, arr.toString())
+        val res = supabaseService.saveCloudChecklistCompletions(dateKey, arr.toString())
+        if (res.isSuccess) {
+            dirtyChecklistDateKeys.remove(dateKey)
+        }
     }
 
     suspend fun syncCustomTasksToCloud() {
@@ -1778,62 +2191,123 @@ class FiltrRepository(
             }
             arr.put(obj)
         }
-        supabaseService.saveCloudCustomTasks(arr.toString())
+        val res = supabaseService.saveCloudCustomTasks(arr.toString())
+        if (res.isSuccess) {
+            allTasks.forEach { pendingChecklistTaskAdds.remove(it.id) }
+            pendingChecklistTaskDeletes.clear()
+        }
+    }
+
+    private fun JSONObject.optNonNullString(key: String, fallback: String = ""): String {
+        if (isNull(key)) return fallback
+        val value = optString(key, fallback)
+        return if (value == "null") fallback else value
     }
 
     suspend fun reconcileChecklistFromCloud(dateKey: String) {
         val dao = checklistDao ?: return
-        try {
-            // 1. Reconcile custom tasks
-            val customTasksJson = supabaseService.fetchCloudCustomTasks()
-            if (!customTasksJson.isNullOrBlank() && customTasksJson.startsWith("[")) {
-                val arr = JSONArray(customTasksJson)
-                val cloudTasks = mutableListOf<ChecklistTaskEntity>()
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
-                    cloudTasks.add(
-                        ChecklistTaskEntity(
-                            id = o.getString("id"),
-                            sectionId = o.optString("sectionId", "01_OPENING"),
-                            sectionName = o.optString("sectionName", "01. Opening & Daily Preparation"),
-                            title = o.getString("title"),
-                            description = o.optString("description", ""),
-                            isDefault = false,
-                            orderIndex = o.optInt("orderIndex", 100),
-                            isWeeklyMondayOnly = o.optBoolean("isWeeklyMondayOnly", false),
-                            createdAt = o.optLong("createdAt", System.currentTimeMillis())
+        checklistSyncMutex.withLock {
+            try {
+                // 1. Reconcile custom tasks (adding new cloud tasks and removing deleted custom tasks)
+                val customTasksJson = supabaseService.fetchCloudCustomTasks()
+                if (!customTasksJson.isNullOrBlank() && customTasksJson.startsWith("[")) {
+                    val arr = JSONArray(customTasksJson)
+                    val cloudTasks = mutableListOf<ChecklistTaskEntity>()
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        val taskId = o.optNonNullString("id", "")
+                        if (taskId.isBlank() || taskId in pendingChecklistTaskDeletes) continue
+                        cloudTasks.add(
+                            ChecklistTaskEntity(
+                                id = taskId,
+                                sectionId = o.optNonNullString("sectionId", "01_OPENING"),
+                                sectionName = o.optNonNullString("sectionName", "01. Opening & Daily Preparation"),
+                                title = o.optNonNullString("title", ""),
+                                description = o.optNonNullString("description", ""),
+                                isDefault = false,
+                                orderIndex = o.optInt("orderIndex", 100),
+                                isWeeklyMondayOnly = o.optBoolean("isWeeklyMondayOnly", false),
+                                createdAt = o.optLong("createdAt", System.currentTimeMillis())
+                            )
                         )
-                    )
+                    }
+                    val cloudIds = cloudTasks.map { it.id }.toSet()
+                    val localCustomTasks = dao.getAllTasksSync().filter { !it.isDefault }
+                    for (localTask in localCustomTasks) {
+                        if (localTask.id !in cloudIds && localTask.id !in pendingChecklistTaskAdds) {
+                            dao.deleteTaskById(localTask.id)
+                        }
+                    }
+                    if (cloudTasks.isNotEmpty()) {
+                        dao.insertTasks(cloudTasks)
+                    }
+                    if (pendingChecklistTaskAdds.isNotEmpty() || pendingChecklistTaskDeletes.isNotEmpty()) {
+                        syncCustomTasksToCloud()
+                    }
+                } else if (pendingChecklistTaskAdds.isNotEmpty() || pendingChecklistTaskDeletes.isNotEmpty()) {
+                    syncCustomTasksToCloud()
                 }
-                if (cloudTasks.isNotEmpty()) {
-                    dao.insertTasks(cloudTasks)
-                }
-            }
 
-            // 2. Reconcile completions for dateKey
-            val completionsJson = supabaseService.fetchCloudChecklistCompletions(dateKey)
-            if (!completionsJson.isNullOrBlank() && completionsJson.startsWith("[")) {
-                val arr = JSONArray(completionsJson)
-                val cloudCompletions = mutableListOf<ChecklistCompletionEntity>()
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
-                    cloudCompletions.add(
-                        ChecklistCompletionEntity(
+                // 2. Reconcile completions for dateKey using timestamp-based merge
+                val completionsJson = supabaseService.fetchCloudChecklistCompletions(dateKey)
+                if (!completionsJson.isNullOrBlank() && completionsJson.startsWith("[")) {
+                    val arr = JSONArray(completionsJson)
+                    val toSaveLocally = mutableListOf<ChecklistCompletionEntity>()
+                    var localHasNewerChanges = dirtyChecklistDateKeys.contains(dateKey)
+
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        val taskId = o.optNonNullString("taskId", "")
+                        if (taskId.isBlank()) continue
+                        val cloudCompleted = o.optBoolean("isCompleted", false)
+                        val cloudCompletedTs = o.optLong("completedTimestamp", 0L)
+                        val cloudUpdatedAt = o.optLong("updatedAt", cloudCompletedTs)
+
+                        val cloudEntity = ChecklistCompletionEntity(
                             dateKey = dateKey,
-                            taskId = o.getString("taskId"),
-                            isCompleted = o.optBoolean("isCompleted", false),
-                            completedTimestamp = o.optLong("completedTimestamp", 0L),
-                            completedBy = o.optString("completedBy", "Staff"),
+                            taskId = taskId,
+                            isCompleted = cloudCompleted,
+                            completedTimestamp = cloudCompletedTs,
+                            completedBy = o.optNonNullString("completedBy", "Staff").ifBlank { "Staff" },
                             isOutOfStock = o.optBoolean("isOutOfStock", false)
                         )
-                    )
+
+                        val local = dao.getCompletion(dateKey, taskId)
+                        val localUpdatedAt = maxOf(
+                            local?.completedTimestamp ?: 0L,
+                            localChecklistActionTimestamps[dateKey to taskId] ?: 0L
+                        )
+
+                        when {
+                            local == null -> {
+                                toSaveLocally.add(cloudEntity)
+                                localChecklistActionTimestamps[dateKey to taskId] = cloudUpdatedAt
+                            }
+                            cloudUpdatedAt > localUpdatedAt -> {
+                                toSaveLocally.add(cloudEntity)
+                                localChecklistActionTimestamps[dateKey to taskId] = cloudUpdatedAt
+                            }
+                            localUpdatedAt > cloudUpdatedAt -> {
+                                localHasNewerChanges = true
+                            }
+                            // Equal timestamps: adopt cloud completion if cloud is completed while local has no recorded action
+                            cloudCompleted && !local.isCompleted && localUpdatedAt == 0L -> {
+                                toSaveLocally.add(cloudEntity)
+                            }
+                        }
+                    }
+                    if (toSaveLocally.isNotEmpty()) {
+                        dao.insertOrUpdateCompletions(toSaveLocally)
+                    }
+                    if (localHasNewerChanges) {
+                        syncChecklistCompletionsToCloud(dateKey)
+                    }
+                } else if (dirtyChecklistDateKeys.contains(dateKey)) {
+                    syncChecklistCompletionsToCloud(dateKey)
                 }
-                if (cloudCompletions.isNotEmpty()) {
-                    dao.insertOrUpdateCompletions(cloudCompletions)
-                }
+            } catch (e: Exception) {
+                Log.w(TAG, "reconcileChecklistFromCloud failed: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "reconcileChecklistFromCloud failed: ${e.message}")
         }
     }
 }

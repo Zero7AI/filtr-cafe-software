@@ -2,18 +2,25 @@ package com.example.data.remote
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.net.URI
+import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 data class AppUpdateInfo(
@@ -27,7 +34,8 @@ data class AppUpdateInfo(
     val isForceUpdate: Boolean = false,
     val forceUpdateMessage: String = "",
     val publishedAt: String = "",
-    val token: String? = null
+    val token: String? = null,
+    val fallbackBrowserUrl: String? = null
 )
 
 sealed interface AppUpdateStatus {
@@ -49,28 +57,49 @@ class GitHubUpdateService private constructor() {
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
-        .followSslRedirects(true)
+        .followSslRedirects(false)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            if (!isAllowedGitHubHttpsUrl(request.url.toString())) {
+                throw SecurityException("Blocked non-GitHub or insecure OTA URL: ${request.url.host}")
+            }
+            chain.proceed(request)
+        }
         .build()
 
     companion object {
         private const val TAG = "GitHubUpdateService"
         const val DEFAULT_REPO_OWNER = "Zero7AI"
         const val DEFAULT_REPO_NAME = "filtr-cafe-software"
+        private val SAFE_REPO_SEGMENT_REGEX = Regex("""^[A-Za-z0-9_.-]+$""")
 
         @Volatile
         private var instance: GitHubUpdateService? = null
-
-        @Volatile
-        private var lastResolvedToken: String? = null
-
-        @Volatile
-        private var lastResolvedFallbackUrl: String? = null
 
         fun getInstance(): GitHubUpdateService {
             return instance ?: synchronized(this) {
                 instance ?: GitHubUpdateService().also { instance = it }
             }
         }
+
+        internal fun isAllowedGitHubHttpsUrl(rawUrl: String): Boolean {
+            val parsed = try {
+                URI(rawUrl.trim())
+            } catch (_: Exception) {
+                return false
+            }
+            if (!parsed.scheme.equals("https", ignoreCase = true)) return false
+            val host = parsed.host?.lowercase(Locale.US) ?: return false
+            return host == "github.com" ||
+                host == "api.github.com" ||
+                host.endsWith(".githubusercontent.com")
+        }
+    }
+
+    private fun JSONObject.optNonNullString(key: String, fallback: String = ""): String {
+        if (isNull(key)) return fallback
+        val value = optString(key, fallback)
+        return if (value == "null") fallback else value
     }
 
     /**
@@ -96,9 +125,9 @@ class GitHubUpdateService private constructor() {
                 if (!remoteConfig.isNullOrBlank()) {
                     if (remoteConfig.startsWith("{")) {
                         val json = JSONObject(remoteConfig)
-                        cleanOwner = json.optString("owner", cleanOwner)
-                        cleanRepo = json.optString("repo", cleanRepo)
-                        cleanToken = json.optString("token", cleanToken)
+                        cleanOwner = json.optNonNullString("owner", cleanOwner)
+                        cleanRepo = json.optNonNullString("repo", cleanRepo)
+                        cleanToken = json.optNonNullString("token", cleanToken)
                     } else if (remoteConfig.contains("/")) {
                         val parts = remoteConfig.split("/")
                         if (parts.size >= 2) {
@@ -112,7 +141,9 @@ class GitHubUpdateService private constructor() {
                 Log.d(TAG, "Remote config fetch fallback: ${e.message}")
             }
 
-            lastResolvedToken = cleanToken.ifBlank { null }
+            if (!SAFE_REPO_SEGMENT_REGEX.matches(cleanOwner) || !SAFE_REPO_SEGMENT_REGEX.matches(cleanRepo)) {
+                return@withContext Result.failure(SecurityException("Invalid GitHub repository configuration"))
+            }
 
             // Check remote policy from Supabase early
             val policy = try { SupabaseService.getInstance().fetchAppUpdatePolicy() } catch (e: Exception) { null }
@@ -142,119 +173,124 @@ class GitHubUpdateService private constructor() {
                 throw e
             }
 
-            if (!response.isSuccessful) {
-                val code = response.code
-                val errBody = response.body?.string().orEmpty()
-                Log.w(TAG, "GitHub API returned HTTP $code: $errBody")
-                if (isMandatory && policy != null) {
-                    Log.i(TAG, "GitHub API HTTP $code, using Supabase policy for mandatory update")
-                    return@withContext Result.success(buildPolicyFallbackUpdate(cleanOwner, cleanRepo, policy, isStaffApp))
-                }
-                return@withContext Result.failure(
-                    Exception(
-                        when (code) {
-                            404 -> "No releases found on GitHub repository ($cleanOwner/$cleanRepo)."
-                            401 -> "GitHub authentication failed. Please verify your token."
-                            403 -> "GitHub API rate limit exceeded or access denied."
-                            else -> "GitHub API error (HTTP $code)."
-                        }
+            response.use { resp ->
+                if (!resp.isSuccessful) {
+                    val code = resp.code
+                    val errBody = resp.body?.string().orEmpty()
+                    Log.w(TAG, "GitHub API returned HTTP $code: $errBody")
+                    if (isMandatory && policy != null) {
+                        Log.i(TAG, "GitHub API HTTP $code, using Supabase policy for mandatory update")
+                        return@withContext Result.success(buildPolicyFallbackUpdate(cleanOwner, cleanRepo, policy, isStaffApp))
+                    }
+                    return@withContext Result.failure(
+                        Exception(
+                            when (code) {
+                                404 -> "No releases found on GitHub repository ($cleanOwner/$cleanRepo)."
+                                401 -> "GitHub authentication failed. Please verify your token."
+                                403 -> "GitHub API rate limit exceeded or access denied."
+                                else -> "GitHub API error (HTTP $code)."
+                            }
+                        )
                     )
-                )
-            }
+                }
 
-            val bodyStr = response.body?.string() ?: return@withContext Result.failure(Exception("Empty response from GitHub"))
-            val releaseJson = JSONObject(bodyStr)
+                val bodyStr = resp.body?.string() ?: return@withContext Result.failure(Exception("Empty response from GitHub"))
+                val releaseJson = JSONObject(bodyStr)
 
-            val tagName = releaseJson.optString("tag_name", "").trim()
-            val releaseTitle = releaseJson.optString("name", tagName).ifBlank { tagName }
-            val releaseNotes = releaseJson.optString("body", "No release notes provided.").trim()
-            val publishedAt = releaseJson.optString("published_at", "")
+                val tagName = releaseJson.optNonNullString("tag_name", "").trim()
+                val releaseTitle = releaseJson.optNonNullString("name", tagName).ifBlank { tagName }
+                val releaseNotes = releaseJson.optNonNullString("body", "No release notes provided.").trim()
+                val publishedAt = releaseJson.optNonNullString("published_at", "")
 
-            // Find single unified APK asset (matching "filtr-billing-*.apk" or "filtr-*.apk")
-            val assetsArray = releaseJson.optJSONArray("assets")
-            var apkDownloadUrl = ""
-            var apkFileName = ""
-            var apkSizeBytes = 0L
-            var fallbackApkUrl = ""
-            var fallbackApkName = ""
-            var fallbackApkSize = 0L
-            var fallbackBrowserUrl = ""
+                // Find single unified APK asset (matching "filtr-billing-*.apk" or "filtr-*.apk")
+                val assetsArray = releaseJson.optJSONArray("assets")
+                var apkDownloadUrl = ""
+                var apkFileName = ""
+                var apkSizeBytes = 0L
+                var fallbackApkUrl = ""
+                var fallbackApkName = ""
+                var fallbackApkSize = 0L
+                var fallbackBrowserUrl = ""
 
-            if (assetsArray != null) {
-                for (i in 0 until assetsArray.length()) {
-                    val asset = assetsArray.getJSONObject(i)
-                    val name = asset.optString("name", "")
-                    if (!name.endsWith(".apk", ignoreCase = true)) continue
+                if (assetsArray != null) {
+                    for (i in 0 until assetsArray.length()) {
+                        val asset = assetsArray.getJSONObject(i)
+                        val name = asset.optNonNullString("name", "")
+                        if (!name.endsWith(".apk", ignoreCase = true)) continue
 
-                    val size = asset.optLong("size", 0L)
-                    val browserUrl = asset.optString("browser_download_url", "")
-                    val downloadTarget = if (cleanToken.isNotBlank()) {
-                        asset.optString("url", browserUrl)
-                    } else {
-                        browserUrl
-                    }
+                        val size = asset.optLong("size", 0L)
+                        val browserUrl = asset.optNonNullString("browser_download_url", "")
+                        val apiAssetUrl = asset.optNonNullString("url", browserUrl)
+                        val downloadTarget = if (cleanToken.isNotBlank()) apiAssetUrl else browserUrl
 
-                    val isBillingAsset = name.contains("filtr-billing", ignoreCase = true)
-                    val isFiltrAsset = name.startsWith("filtr-", ignoreCase = true)
+                        if (!isAllowedGitHubHttpsUrl(downloadTarget)) {
+                            Log.w(TAG, "Ignoring non-GitHub/insecure APK asset URL for $name")
+                            continue
+                        }
 
-                    // Best match: "filtr-billing-*.apk"
-                    if (isBillingAsset) {
-                        apkFileName = name
-                        apkSizeBytes = size
-                        apkDownloadUrl = downloadTarget
-                        fallbackBrowserUrl = browserUrl
-                        break
-                    } else if (isFiltrAsset && apkDownloadUrl.isBlank()) {
-                        // Good match: "filtr-*.apk"
-                        apkFileName = name
-                        apkSizeBytes = size
-                        apkDownloadUrl = downloadTarget
-                        fallbackBrowserUrl = browserUrl
-                    } else if (fallbackApkUrl.isBlank()) {
-                        fallbackApkName = name
-                        fallbackApkSize = size
-                        fallbackApkUrl = downloadTarget
-                        if (fallbackBrowserUrl.isBlank()) fallbackBrowserUrl = browserUrl
+                        val isBillingAsset = name.contains("filtr-billing", ignoreCase = true)
+                        val isFiltrAsset = name.startsWith("filtr-", ignoreCase = true)
+
+                        // Best match: "filtr-billing-*.apk"
+                        if (isBillingAsset) {
+                            apkFileName = name
+                            apkSizeBytes = size
+                            apkDownloadUrl = downloadTarget
+                            fallbackBrowserUrl = browserUrl.takeIf { isAllowedGitHubHttpsUrl(it) }.orEmpty()
+                            break
+                        } else if (isFiltrAsset && apkDownloadUrl.isBlank()) {
+                            // Good match: "filtr-*.apk"
+                            apkFileName = name
+                            apkSizeBytes = size
+                            apkDownloadUrl = downloadTarget
+                            fallbackBrowserUrl = browserUrl.takeIf { isAllowedGitHubHttpsUrl(it) }.orEmpty()
+                        } else if (fallbackApkUrl.isBlank()) {
+                            fallbackApkName = name
+                            fallbackApkSize = size
+                            fallbackApkUrl = downloadTarget
+                            if (fallbackBrowserUrl.isBlank() && isAllowedGitHubHttpsUrl(browserUrl)) {
+                                fallbackBrowserUrl = browserUrl
+                            }
+                        }
                     }
                 }
-            }
 
-            if (apkDownloadUrl.isBlank() && fallbackApkUrl.isNotBlank()) {
-                apkDownloadUrl = fallbackApkUrl
-                apkFileName = fallbackApkName
-                apkSizeBytes = fallbackApkSize
-            }
+                if (apkDownloadUrl.isBlank() && fallbackApkUrl.isNotBlank()) {
+                    apkDownloadUrl = fallbackApkUrl
+                    apkFileName = fallbackApkName
+                    apkSizeBytes = fallbackApkSize
+                }
 
-            if (apkDownloadUrl.isBlank()) {
-                return@withContext Result.failure(
-                    Exception("Release $tagName exists on GitHub, but no matching unified APK (filtr-billing-*.apk or filtr-*.apk) was uploaded to it.")
+                if (apkDownloadUrl.isBlank()) {
+                    return@withContext Result.failure(
+                        Exception("Release $tagName exists on GitHub, but no matching verified GitHub APK (filtr-billing-*.apk or filtr-*.apk) was uploaded to it.")
+                    )
+                }
+
+                val isNewer = isNewerVersion(tagName, currentVersionName)
+                val cleanVersionName = tagName.removePrefix("v").removePrefix("V")
+
+                val isForce = isMandatoryByCode || isMandatoryByName || (isMandatoryByFlag && isNewer)
+                val isAvailable = isNewer || isMandatoryByCode || isMandatoryByName
+
+                val updateInfo = AppUpdateInfo(
+                    versionName = cleanVersionName,
+                    releaseTitle = releaseTitle,
+                    releaseNotes = releaseNotes,
+                    apkDownloadUrl = apkDownloadUrl,
+                    apkFileName = apkFileName,
+                    apkSizeBytes = apkSizeBytes,
+                    isUpdateAvailable = isAvailable,
+                    isForceUpdate = isForce,
+                    forceUpdateMessage = policy?.message ?: "",
+                    publishedAt = publishedAt,
+                    token = cleanToken.ifBlank { null },
+                    fallbackBrowserUrl = fallbackBrowserUrl.ifBlank { null }
                 )
+
+                Log.d(TAG, "Check complete: local=$currentVersionName (code=$currentVersionCode), remote=$cleanVersionName, isNewer=$isNewer, isForce=$isForce")
+                Result.success(updateInfo)
             }
-
-            lastResolvedFallbackUrl = fallbackBrowserUrl.ifBlank { null }
-
-            val isNewer = isNewerVersion(tagName, currentVersionName)
-            val cleanVersionName = tagName.removePrefix("v").removePrefix("V")
-
-            val isForce = isMandatoryByCode || isMandatoryByName || (isMandatoryByFlag && isNewer)
-            val isAvailable = isNewer || isMandatoryByCode || isMandatoryByName
-
-            val updateInfo = AppUpdateInfo(
-                versionName = cleanVersionName,
-                releaseTitle = releaseTitle,
-                releaseNotes = releaseNotes,
-                apkDownloadUrl = apkDownloadUrl,
-                apkFileName = apkFileName,
-                apkSizeBytes = apkSizeBytes,
-                isUpdateAvailable = isAvailable,
-                isForceUpdate = isForce,
-                forceUpdateMessage = policy?.message ?: "",
-                publishedAt = publishedAt,
-                token = cleanToken.ifBlank { null }
-            )
-
-            Log.d(TAG, "Check complete: local=$currentVersionName (code=$currentVersionCode), remote=$cleanVersionName, isNewer=$isNewer, isForce=$isForce")
-            Result.success(updateInfo)
         } catch (e: Exception) {
             Log.e(TAG, "Error checking for update: ${e.message}", e)
             Result.failure(e)
@@ -268,35 +304,46 @@ class GitHubUpdateService private constructor() {
         isStaffApp: Boolean = false
     ): AppUpdateInfo {
         val fileName = "filtr-billing-v${policy.minVersionName}.apk"
-        val fallbackUrl = when {
-            policy.apkDownloadUrl.isNotBlank() -> policy.apkDownloadUrl
-            else -> "https://github.com/$cleanOwner/$cleanRepo/releases/download/v${policy.minVersionName}/$fileName"
+        val defaultGitHubUrl = "https://github.com/$cleanOwner/$cleanRepo/releases/download/v${policy.minVersionName}/$fileName"
+        val candidateUrl = policy.apkDownloadUrl.trim()
+        val safeUrl = if (candidateUrl.isNotBlank() && isAllowedGitHubHttpsUrl(candidateUrl)) {
+            candidateUrl
+        } else {
+            if (candidateUrl.isNotBlank()) {
+                Log.w(TAG, "Blocked disallowed policy apk_download_url; using GitHub release URL instead")
+            }
+            defaultGitHubUrl
         }
-        lastResolvedFallbackUrl = fallbackUrl
         return AppUpdateInfo(
             versionName = policy.minVersionName,
             releaseTitle = policy.title.ifBlank { "Mandatory Update Required ⚠️" },
             releaseNotes = policy.message,
-            apkDownloadUrl = fallbackUrl,
+            apkDownloadUrl = safeUrl,
             apkFileName = fileName,
             apkSizeBytes = policy.apkSizeBytes,
             isUpdateAvailable = true,
             isForceUpdate = true,
             forceUpdateMessage = policy.message,
-            token = null
+            token = null,
+            fallbackBrowserUrl = safeUrl
         )
     }
 
     /**
-     * Downloads the APK file in a chunked stream, notifying progress.
+     * Downloads the APK file in a chunked stream, notifying progress, and verifies the APK archive.
      */
     suspend fun downloadApk(
         context: Context,
         downloadUrl: String,
         token: String?,
+        fallbackBrowserUrl: String? = null,
         onProgress: (progressPercent: Int, bytesRead: Long, totalBytes: Long) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
         try {
+            if (!isAllowedGitHubHttpsUrl(downloadUrl)) {
+                return@withContext Result.failure(SecurityException("Blocked untrusted or insecure APK download URL"))
+            }
+
             val updatesDir = File(context.cacheDir, "updates")
             if (!updatesDir.exists()) updatesDir.mkdirs()
 
@@ -307,8 +354,7 @@ class GitHubUpdateService private constructor() {
                 .url(downloadUrl)
                 .header("User-Agent", "FILTR-Billing-App")
 
-            val cleanToken = token?.trim().takeIf { !it.isNullOrBlank() }
-                ?: lastResolvedToken.orEmpty()
+            val cleanToken = token?.trim().orEmpty()
             val isApiUrl = downloadUrl.contains("api.github.com/repos/")
             if (cleanToken.isNotBlank() && isApiUrl) {
                 requestBuilder.header("Authorization", "Bearer $cleanToken")
@@ -316,53 +362,46 @@ class GitHubUpdateService private constructor() {
                 requestBuilder.header("Accept", "application/octet-stream")
             }
 
-            var response = client.newCall(requestBuilder.build()).execute()
-            val browserFallbackUrl = lastResolvedFallbackUrl
-            if (!response.isSuccessful && cleanToken.isNotBlank() && isApiUrl && !browserFallbackUrl.isNullOrBlank()) {
-                response.close()
-                Log.w(TAG, "API download failed, falling back to direct CDN: $browserFallbackUrl")
-                val fallbackReq = Request.Builder()
-                    .url(browserFallbackUrl)
-                    .header("User-Agent", "FILTR-Billing-App")
-                    .build()
-                response = client.newCall(fallbackReq).execute()
-            }
-            if (!response.isSuccessful) {
-                return@withContext Result.failure(Exception("Failed to download APK (HTTP ${response.code})"))
-            }
-
-            val responseBody = response.body ?: return@withContext Result.failure(Exception("Empty response body"))
-            val totalBytes = responseBody.contentLength()
-
-            val inputStream = responseBody.byteStream()
-            val outputStream = FileOutputStream(outputFile)
-
-            val buffer = ByteArray(8 * 1024)
-            var bytesReadTotal = 0L
-            var read: Int
-            var lastReportedPercent = -1
-
-            outputStream.use { out ->
-                inputStream.use { input ->
-                    while (input.read(buffer).also { read = it } != -1) {
-                        out.write(buffer, 0, read)
-                        bytesReadTotal += read
-                        val percent = if (totalBytes > 0) {
-                            ((bytesReadTotal * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        } else {
-                            0
-                        }
-                        if (percent != lastReportedPercent) {
-                            lastReportedPercent = percent
-                            onProgress(percent, bytesReadTotal, totalBytes)
-                        }
+            var shouldTryFallback = false
+            client.newCall(requestBuilder.build()).execute().use { initialResponse ->
+                if (!initialResponse.isSuccessful &&
+                    cleanToken.isNotBlank() &&
+                    isApiUrl &&
+                    !fallbackBrowserUrl.isNullOrBlank() &&
+                    isAllowedGitHubHttpsUrl(fallbackBrowserUrl)
+                ) {
+                    shouldTryFallback = true
+                } else {
+                    val streamResult = streamApkResponse(initialResponse, outputFile, onProgress)
+                    if (streamResult.isFailure) {
+                        return@withContext Result.failure(streamResult.exceptionOrNull() ?: Exception("Download failed"))
                     }
-                    out.flush()
                 }
             }
 
-            onProgress(100, bytesReadTotal, if (totalBytes > 0) totalBytes else bytesReadTotal)
-            Log.d(TAG, "Download finished successfully: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
+            if (shouldTryFallback) {
+                Log.w(TAG, "API download failed, falling back to direct GitHub CDN")
+                val fallbackReq = Request.Builder()
+                    .url(fallbackBrowserUrl!!)
+                    .header("User-Agent", "FILTR-Billing-App")
+                    .build()
+                client.newCall(fallbackReq).execute().use { fallbackResponse ->
+                    val streamResult = streamApkResponse(fallbackResponse, outputFile, onProgress)
+                    if (streamResult.isFailure) {
+                        return@withContext Result.failure(streamResult.exceptionOrNull() ?: Exception("Download failed"))
+                    }
+                }
+            }
+
+            val verifyResult = verifyApkArchive(context, outputFile)
+            if (verifyResult.isFailure) {
+                outputFile.delete()
+                return@withContext Result.failure(
+                    verifyResult.exceptionOrNull() ?: SecurityException("APK verification failed")
+                )
+            }
+
+            Log.d(TAG, "Download finished & verified: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
             Result.success(outputFile)
         } catch (e: Exception) {
             Log.e(TAG, "Error downloading APK: ${e.message}", e)
@@ -370,13 +409,134 @@ class GitHubUpdateService private constructor() {
         }
     }
 
+    private fun streamApkResponse(
+        response: Response,
+        outputFile: File,
+        onProgress: (progressPercent: Int, bytesRead: Long, totalBytes: Long) -> Unit
+    ): Result<Unit> {
+        if (!response.isSuccessful) {
+            return Result.failure(Exception("Failed to download APK (HTTP ${response.code})"))
+        }
+
+        val responseBody = response.body ?: return Result.failure(Exception("Empty response body"))
+        val totalBytes = responseBody.contentLength()
+
+        val buffer = ByteArray(8 * 1024)
+        var bytesReadTotal = 0L
+        var read: Int
+        var lastReportedPercent = -1
+
+        FileOutputStream(outputFile).use { out ->
+            responseBody.byteStream().use { input ->
+                while (input.read(buffer).also { read = it } != -1) {
+                    out.write(buffer, 0, read)
+                    bytesReadTotal += read
+                    val percent = if (totalBytes > 0) {
+                        ((bytesReadTotal * 100) / totalBytes).toInt().coerceIn(0, 100)
+                    } else {
+                        0
+                    }
+                    if (percent != lastReportedPercent) {
+                        lastReportedPercent = percent
+                        onProgress(percent, bytesReadTotal, totalBytes)
+                    }
+                }
+                out.flush()
+            }
+        }
+
+        onProgress(100, bytesReadTotal, if (totalBytes > 0) totalBytes else bytesReadTotal)
+        return Result.success(Unit)
+    }
+
+    /**
+     * Verifies downloaded APK packageName, non-downgrade versionCode, and signing certificate SHA-256
+     * against the currently running app's signing certificates (supports both debug and release keys).
+     */
+    fun verifyApkArchive(context: Context, apkFile: File): Result<Unit> {
+        return try {
+            if (!apkFile.exists() || apkFile.length() == 0L) {
+                return Result.failure(Exception("APK file not found or empty"))
+            }
+
+            val pm = context.packageManager
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageManager.GET_SIGNING_CERTIFICATES
+            } else {
+                @Suppress("DEPRECATION")
+                PackageManager.GET_SIGNATURES
+            }
+
+            val archiveInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.PackageInfoFlags.of(flags.toLong()))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageArchiveInfo(apkFile.absolutePath, flags)
+            } ?: return Result.failure(SecurityException("Invalid or corrupted APK archive"))
+
+            if (archiveInfo.packageName != context.packageName) {
+                return Result.failure(
+                    SecurityException("APK package mismatch: expected ${context.packageName}, got ${archiveInfo.packageName}")
+                )
+            }
+
+            val installedInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(flags.toLong()))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(context.packageName, flags)
+            }
+
+            val installedVersionCode = PackageInfoCompat.getLongVersionCode(installedInfo)
+            val archiveVersionCode = PackageInfoCompat.getLongVersionCode(archiveInfo)
+            if (archiveVersionCode <= 0L || archiveVersionCode < installedVersionCode) {
+                return Result.failure(
+                    SecurityException("Blocked APK version downgrade (archive=$archiveVersionCode, installed=$installedVersionCode)")
+                )
+            }
+
+            val installedCerts = extractSigningCertSha256(installedInfo)
+            val archiveCerts = extractSigningCertSha256(archiveInfo)
+            if (installedCerts.isEmpty() || archiveCerts.isEmpty() || installedCerts.none { it in archiveCerts }) {
+                return Result.failure(
+                    SecurityException("APK signing certificate mismatch — update blocked for security")
+                )
+            }
+
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun extractSigningCertSha256(pkgInfo: PackageInfo): Set<String> {
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val signingInfo = pkgInfo.signingInfo
+            if (signingInfo != null) {
+                if (signingInfo.hasMultipleSigners()) signingInfo.apkContentsSigners
+                else signingInfo.signingCertificateHistory
+            } else {
+                null
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            pkgInfo.signatures
+        } ?: return emptySet()
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        return signatures.map { sig ->
+            digest.digest(sig.toByteArray()).joinToString("") { "%02x".format(it) }
+        }.toSet()
+    }
+
     /**
      * Triggers the Android system package installer for the downloaded APK.
      */
     fun installApk(context: Context, apkFile: File): Result<Unit> {
         return try {
-            if (!apkFile.exists() || apkFile.length() == 0L) {
-                return Result.failure(Exception("APK file not found or empty"))
+            val verifyResult = verifyApkArchive(context, apkFile)
+            if (verifyResult.isFailure) {
+                return verifyResult
             }
 
             // Check if app has permission to install packages on Android 8.0+ (API 26+)
@@ -413,31 +573,38 @@ class GitHubUpdateService private constructor() {
     }
 
     /**
-     * Compares two semantic version strings (e.g. "1.1.0" > "1.0.0" or "v2.0" > "1.9").
-     * Returns true if remoteVersion is strictly newer than currentVersion.
+     * Compares two semantic version strings (e.g. "1.1.0" > "1.0.0", "release-2.2" > "2.1").
+     * Returns true only if remoteVersion is strictly newer than currentVersion.
      */
     fun isNewerVersion(remoteTag: String, currentVersion: String): Boolean {
-        try {
-            val remoteClean = remoteTag.trim().removePrefix("v").removePrefix("V")
-            val currentClean = currentVersion.trim().removePrefix("v").removePrefix("V")
-
-            if (remoteClean == currentClean) return false
-
-            val remoteParts = remoteClean.split(".").mapNotNull { it.takeWhile { char -> char.isDigit() }.toIntOrNull() }
-            val currentParts = currentClean.split(".").mapNotNull { it.takeWhile { char -> char.isDigit() }.toIntOrNull() }
+        return try {
+            val remoteParts = parseVersionParts(remoteTag)
+            val currentParts = parseVersionParts(currentVersion)
+            if (remoteParts.isEmpty() || currentParts.isEmpty()) return false
 
             val maxLen = maxOf(remoteParts.size, currentParts.size)
             for (i in 0 until maxLen) {
-                val r = remoteParts.getOrElse(i) { 0 }
-                val c = currentParts.getOrElse(i) { 0 }
+                val r = remoteParts.getOrElse(i) { 0L }
+                val c = currentParts.getOrElse(i) { 0L }
                 if (r > c) return true
                 if (r < c) return false
             }
 
-            return false
+            false
         } catch (e: Exception) {
-            Log.w(TAG, "Version comparison fallback for remote=$remoteTag, current=$currentVersion: ${e.message}")
-            return remoteTag.trim() != currentVersion.trim()
+            Log.w(TAG, "Version comparison failed for remote=$remoteTag, current=$currentVersion: ${e.message}")
+            false
         }
+    }
+
+    private fun parseVersionParts(version: String): List<Long> {
+        val firstDigitIdx = version.indexOfFirst { it.isDigit() }
+        if (firstDigitIdx < 0) return emptyList()
+        val core = version.substring(firstDigitIdx)
+            .substringBefore('-')
+            .substringBefore('+')
+            .trim()
+        return core.split(".")
+            .mapNotNull { segment -> segment.takeWhile { it.isDigit() }.toLongOrNull() }
     }
 }

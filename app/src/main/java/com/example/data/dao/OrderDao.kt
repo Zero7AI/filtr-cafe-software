@@ -88,4 +88,11 @@ interface OrderDao {
 
     @Query("SELECT orderId FROM orders WHERE timestamp >= :startOfDayTimestamp")
     suspend fun getTodayOrderIds(startOfDayTimestamp: Long): List<String>
+
+    @Query("SELECT COUNT(*) FROM order_items WHERE (:menuItemId > 0 AND menuItemId = :menuItemId) OR LOWER(TRIM(itemName)) = LOWER(TRIM(:itemName))")
+    suspend fun countOrderItemsForMenuItem(menuItemId: Int, itemName: String): Int
+
+    @Transaction
+    @Query("SELECT * FROM orders WHERE orderId IN (:orderIds)")
+    suspend fun getOrdersByIds(orderIds: List<String>): List<OrderWithItems>
 }

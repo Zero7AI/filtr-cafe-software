@@ -27,6 +27,11 @@ import com.example.data.entity.UpiAccountEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Database(
     entities = [
@@ -188,6 +193,8 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        internal fun getInstanceOrNull(): FiltrDatabase? = INSTANCE
+
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -208,14 +215,18 @@ abstract class FiltrDatabase : RoomDatabase() {
     private class FiltrDatabaseCallback(
         private val scope: CoroutineScope
     ) : RoomDatabase.Callback() {
+        private val seedMutex = Mutex()
+
         override fun onCreate(db: SupportSQLiteDatabase) {
             super.onCreate(db)
             INSTANCE?.let { database ->
                 scope.launch(Dispatchers.IO) {
-                    populateInitialMenu(database.menuDao())
-                    populateInitialUpiAccount(database.upiAccountDao())
-                    populateInitialFixedCosts(database.fixedCostDao())
-                    populateInitialChecklistTasks(database.checklistDao())
+                    seedMutex.withLock {
+                        populateInitialMenu(database.menuDao())
+                        populateInitialUpiAccount(database.upiAccountDao())
+                        populateInitialFixedCosts(database.fixedCostDao())
+                        populateInitialChecklistTasks(database.checklistDao())
+                    }
                 }
             }
         }
@@ -224,17 +235,19 @@ abstract class FiltrDatabase : RoomDatabase() {
             super.onOpen(db)
             INSTANCE?.let { database ->
                 scope.launch(Dispatchers.IO) {
-                    populateInitialFixedCosts(database.fixedCostDao())
-                    populateInitialChecklistTasks(database.checklistDao())
+                    seedMutex.withLock {
+                        // Do not re-seed fixed_costs on every open so admin deletions persist
+                        populateInitialChecklistTasks(database.checklistDao())
+                    }
                 }
             }
         }
 
         suspend fun populateInitialFixedCosts(fixedCostDao: FixedCostDao) {
-            val sdf = java.text.SimpleDateFormat("yyyy-MM", java.util.Locale.getDefault())
-            val currentMonth = sdf.format(java.util.Date())
+            val sdf = SimpleDateFormat("yyyy-MM", Locale.US)
+            val currentMonth = sdf.format(Date())
             if (fixedCostDao.getFixedCostByMonth(currentMonth) == null) {
-                val defaultStaffJson = """[{"name":"Barista 1","salary":15000.0},{"name":"Barista 2","salary":15000.0}]"""
+                val defaultStaffJson = """[{"id":"staff_${currentMonth}_1","name":"Barista 1","salary":15000.0},{"id":"staff_${currentMonth}_2","name":"Barista 2","salary":15000.0}]"""
                 fixedCostDao.insertOrUpdate(
                     FixedCostEntity(
                         monthKey = currentMonth,
@@ -265,6 +278,7 @@ abstract class FiltrDatabase : RoomDatabase() {
         }
 
         suspend fun populateInitialMenu(menuDao: MenuDao) {
+            if (menuDao.getMenuItemCount() > 0) return
             val initialItems = listOf(
                 // ICED COFFEE
                 MenuItemEntity(name = "Americano", category = "ICED COFFEE", price = 79.0, description = "Milk + Whipped Cream + Flavour + Coffee"),

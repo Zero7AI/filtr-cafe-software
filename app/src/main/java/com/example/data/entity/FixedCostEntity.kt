@@ -1,5 +1,6 @@
 package com.example.data.entity
 
+import android.util.Log
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import org.json.JSONArray
@@ -41,25 +42,29 @@ data class FixedCostEntity(
                 val list = mutableListOf<StaffMember>()
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
+                    val fallbackId = "staff_${monthKey}_${i + 1}"
+                    val rawId = if (obj.isNull("id")) "" else obj.optString("id", "").let { if (it == "null") "" else it }
+                    val rawName = if (obj.isNull("name")) "" else obj.optString("name", "").let { if (it == "null") "" else it }
                     list.add(
                         StaffMember(
-                            id = obj.optString("id", UUID.randomUUID().toString()),
-                            name = obj.optString("name", "Staff ${i + 1}"),
+                            id = rawId.ifBlank { fallbackId },
+                            name = rawName.ifBlank { "Staff ${i + 1}" },
                             salary = obj.optDouble("salary", 0.0)
                         )
                     )
                 }
                 if (list.isNotEmpty()) return list
             } catch (e: Exception) {
-                // Fallback to generating from staffCount & staffSalaries
+                Log.w("FixedCostEntity", "Failed to parse staffMembersJson for $monthKey: ${e.message}")
             }
         }
 
-        // Fallback: Generate list based on staffCount and staffSalaries
+        // Fallback: Generate list with deterministic IDs based on staffCount and staffSalaries
         val count = if (staffCount > 0) staffCount else 1
         val perPerson = if (count > 0) staffSalaries / count else 0.0
         return (1..count).map { i ->
             StaffMember(
+                id = "staff_${monthKey}_$i",
                 name = "Staff $i",
                 salary = perPerson
             )

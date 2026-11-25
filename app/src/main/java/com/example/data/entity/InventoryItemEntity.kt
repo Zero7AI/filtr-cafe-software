@@ -2,6 +2,7 @@ package com.example.data.entity
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import java.util.Locale
 
 @Entity(tableName = "inventory_items")
 data class InventoryItemEntity(
@@ -16,28 +17,43 @@ data class InventoryItemEntity(
     val isActive: Boolean = true
 )
 
+private val CONTAINER_UNITS = setOf("packet", "packets", "pack", "packs", "can", "cans", "tin", "tins", "box", "boxes", "bottle", "bottles")
+private val KG_UNITS = setOf("kg", "kgs", "kilogram", "kilograms")
+private val LITER_UNITS = setOf("l", "liter", "liters", "litre", "litres")
+private val PCS_UNITS = setOf("pcs", "pc", "piece", "pieces")
+
 fun calculatePacksAndCost(
     quantity: Double,
     consumedUnit: String,
     item: InventoryItemEntity
 ): Pair<Double, Double> {
-    val u1 = consumedUnit.trim().lowercase()
-    val u2 = item.unit.trim().lowercase()
-    val isPackUnit = u2 in listOf("packet", "packets", "pack", "packs", "can", "tin", "box", "bottle", "pcs")
+    if (quantity <= 0.0) return Pair(0.0, 0.0)
 
-    val normalizedQtyInItemUnit = when {
-        u1 == u2 -> quantity
-        u1 == "g" && (u2 == "kg" || u2 == "kilogram" || u2 == "kgs") -> quantity / 1000.0
-        (u1 == "kg" || u1 == "kgs") && u2 == "g" -> quantity * 1000.0
-        (u1 == "kg" || u1 == "kgs") && isPackUnit && item.standardQuantity > 10.0 -> quantity * 1000.0
-        u1 == "ml" && (u2 == "l" || u2 == "liter" || u2 == "liters" || u2 == "litre" || u2 == "litres") -> quantity / 1000.0
-        (u1 == "l" || u1 == "liter" || u1 == "litres") && u2 == "ml" -> quantity * 1000.0
-        (u1 == "l" || u1 == "liter" || u1 == "litres") && isPackUnit && item.standardQuantity > 10.0 -> quantity * 1000.0
-        else -> quantity
+    val u1 = consumedUnit.trim().lowercase(Locale.US)
+    val u2 = item.unit.trim().lowercase(Locale.US)
+    val packSize = if (item.standardQuantity > 0.0) item.standardQuantity else 1.0
+    val isPackItem = u2 in CONTAINER_UNITS
+
+    val packs = when {
+        // Explicit container unit (pack, box, bottle, etc.) represents whole packs directly
+        u1 in CONTAINER_UNITS -> quantity
+        // Same base unit (e.g. kg->kg, g->g, L->L, ml->ml, pcs->pcs): divide by packSize
+        u1 == u2 || (u1 in KG_UNITS && u2 in KG_UNITS) || (u1 in LITER_UNITS && u2 in LITER_UNITS) || (u1 in PCS_UNITS && u2 in PCS_UNITS) -> {
+            quantity / packSize
+        }
+        u1 == "g" && u2 in KG_UNITS -> (quantity / 1000.0) / packSize
+        u1 in KG_UNITS && u2 == "g" -> (quantity * 1000.0) / packSize
+        u1 == "ml" && u2 in LITER_UNITS -> (quantity / 1000.0) / packSize
+        u1 in LITER_UNITS && u2 == "ml" -> (quantity * 1000.0) / packSize
+        isPackItem && (u1 in KG_UNITS || u1 in LITER_UNITS) -> {
+            if (packSize > 10.0) (quantity * 1000.0) / packSize else quantity / packSize
+        }
+        isPackItem && (u1 == "g" || u1 == "ml") -> {
+            if (packSize > 10.0) quantity / packSize else (quantity / 1000.0) / packSize
+        }
+        else -> quantity / packSize
     }
 
-    val packSize = if (item.standardQuantity > 0.0) item.standardQuantity else 1.0
-    val packs = normalizedQtyInItemUnit / packSize
     val cost = packs * item.defaultPrice
     return Pair(packs, cost)
 }

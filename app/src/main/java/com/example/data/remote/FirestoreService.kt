@@ -12,7 +12,9 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.PersistentCacheSettings
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.firestore.WriteBatch
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -45,6 +47,7 @@ class FirestoreService private constructor() {
     private var _isInitialized = false
 
     // Active listener registrations (for cleanup)
+    private val listenersLock = Any()
     private val activeListeners = mutableListOf<ListenerRegistration>()
 
     val isInitialized: Boolean get() = _isInitialized
@@ -89,9 +92,12 @@ class FirestoreService private constructor() {
 
             db = FirebaseFirestore.getInstance()
 
-            // Enable offline persistence with larger cache
+            // Enable offline persistence with PersistentCacheSettings
+            val cacheSettings = PersistentCacheSettings.newBuilder()
+                .setSizeBytes(FirebaseFirestoreSettings.CACHE_SIZE_UNLIMITED)
+                .build()
             val settings = FirebaseFirestoreSettings.Builder()
-                .setCacheSizeBytes(FirebaseFirestoreSettings.CACHE_SIZE_UNLIMITED)
+                .setLocalCacheSettings(cacheSettings)
                 .build()
             db?.firestoreSettings = settings
 
@@ -123,27 +129,38 @@ class FirestoreService private constructor() {
         return try {
             val order = orderWithItems.order
             val orderRef = firestore.collection(ORDERS_COLLECTION).document(order.orderId)
-
-            val orderData = orderToMap(order)
-            orderRef.set(orderData, SetOptions.merge()).await()
-
-            // Save items as subcollection
             val itemsRef = orderRef.collection(ORDER_ITEMS_SUBCOLLECTION)
 
-            // Delete existing items first to handle updates cleanly
             val existingItems = itemsRef.get().await()
+            val newDocIds = orderWithItems.items
+                .mapNotNull { if (it.id > 0) it.id.toString() else null }
+                .toSet()
+
+            val operations = mutableListOf<(WriteBatch) -> Unit>()
+            val orderData = orderToMap(order)
+            operations.add { batch -> batch.set(orderRef, orderData, SetOptions.merge()) }
+
             for (doc in existingItems.documents) {
-                doc.reference.delete().await()
+                if (doc.id !in newDocIds) {
+                    operations.add { batch -> batch.delete(doc.reference) }
+                }
             }
 
-            // Write new items
             for (item in orderWithItems.items) {
                 val itemData = orderItemToMap(item)
-                if (item.id > 0) {
-                    itemsRef.document(item.id.toString()).set(itemData).await()
+                val targetRef = if (item.id > 0) {
+                    itemsRef.document(item.id.toString())
                 } else {
-                    itemsRef.add(itemData).await()
+                    itemsRef.document()
                 }
+                operations.add { batch -> batch.set(targetRef, itemData) }
+            }
+
+            // Firestore limits a single WriteBatch to 500 operations
+            for (chunk in operations.chunked(450)) {
+                val batch = firestore.batch()
+                chunk.forEach { applyOp -> applyOp(batch) }
+                batch.commit().await()
             }
 
             Log.d(TAG, "Order ${order.orderId} saved to Firestore")
@@ -216,15 +233,19 @@ class FirestoreService private constructor() {
 
         return try {
             val orderRef = firestore.collection(ORDERS_COLLECTION).document(orderId)
-
-            // Delete subcollection items first
             val items = orderRef.collection(ORDER_ITEMS_SUBCOLLECTION).get().await()
-            for (doc in items.documents) {
-                doc.reference.delete().await()
-            }
 
-            // Delete order document
-            orderRef.delete().await()
+            val operations = mutableListOf<(WriteBatch) -> Unit>()
+            for (doc in items.documents) {
+                operations.add { batch -> batch.delete(doc.reference) }
+            }
+            operations.add { batch -> batch.delete(orderRef) }
+
+            for (chunk in operations.chunked(450)) {
+                val batch = firestore.batch()
+                chunk.forEach { applyOp -> applyOp(batch) }
+                batch.commit().await()
+            }
 
             Log.d(TAG, "Order $orderId deleted from Firestore")
             Result.success("Order deleted from Firestore")
@@ -273,10 +294,10 @@ class FirestoreService private constructor() {
                 }
             }
 
-        activeListeners.add(listener)
+        synchronized(listenersLock) { activeListeners.add(listener) }
         awaitClose {
             listener.remove()
-            activeListeners.remove(listener)
+            synchronized(listenersLock) { activeListeners.remove(listener) }
         }
     }
 
@@ -501,10 +522,10 @@ class FirestoreService private constructor() {
                 }
             }
 
-        activeListeners.add(listener)
+        synchronized(listenersLock) { activeListeners.add(listener) }
         awaitClose {
             listener.remove()
-            activeListeners.remove(listener)
+            synchronized(listenersLock) { activeListeners.remove(listener) }
         }
     }
 
@@ -577,10 +598,10 @@ class FirestoreService private constructor() {
                 }
             }
 
-        activeListeners.add(listener)
+        synchronized(listenersLock) { activeListeners.add(listener) }
         awaitClose {
             listener.remove()
-            activeListeners.remove(listener)
+            synchronized(listenersLock) { activeListeners.remove(listener) }
         }
     }
 
@@ -590,8 +611,12 @@ class FirestoreService private constructor() {
      * Remove all active listeners.
      */
     fun removeAllListeners() {
-        activeListeners.forEach { it.remove() }
-        activeListeners.clear()
+        val snapshot = synchronized(listenersLock) {
+            val copy = activeListeners.toList()
+            activeListeners.clear()
+            copy
+        }
+        snapshot.forEach { it.remove() }
     }
 
     // ==================== DATA MAPPERS ====================

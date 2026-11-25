@@ -11,8 +11,10 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -36,6 +38,52 @@ class GoogleSheetsSyncService {
     private val TAG = "SheetsSyncService"
     private val MAX_RETRIES = 3
     private val INITIAL_RETRY_DELAY_MS = 1000L // 1 second
+    private val HTTP_5XX_REGEX = Regex("""HTTP Error 5\d{2}""")
+
+    private val sheetDateFormat = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat =
+            SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+    }
+
+    private fun formatSheetDate(ts: Long): String =
+        sheetDateFormat.get()!!.format(Date(ts))
+
+    private fun parseSheetDate(dateStr: String, fallback: Long): Long {
+        if (dateStr.isBlank()) return fallback
+        return try {
+            sheetDateFormat.get()!!.parse(dateStr)?.time ?: fallback
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse date '$dateStr': ${e.message}")
+            fallback
+        }
+    }
+
+    private fun JSONObject.optNonNullString(key: String, fallback: String = ""): String {
+        if (isNull(key)) return fallback
+        val value = optString(key, fallback)
+        return if (value == "null") fallback else value
+    }
+
+    private fun parseMutationResponse(response: Response, successMessage: String): Result<String> {
+        val bodyStr = response.body?.string()?.trim().orEmpty()
+        if (!response.isSuccessful) {
+            return Result.failure(Exception("HTTP Error ${response.code}: ${response.message}"))
+        }
+        if (bodyStr.isBlank()) {
+            return Result.failure(Exception("Empty response from Google Sheets webhook"))
+        }
+        return try {
+            val json = JSONObject(bodyStr)
+            if (json.optNonNullString("result") == "success") {
+                Result.success(successMessage)
+            } else {
+                val msg = json.optNonNullString("message", "Google Sheets sync failed")
+                Result.failure(Exception(msg))
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("Invalid JSON response from Google Sheets webhook: ${e.message}"))
+        }
+    }
 
     /**
      * Execute an HTTP operation with exponential backoff retry.
@@ -81,14 +129,12 @@ class GoogleSheetsSyncService {
             error is java.net.ConnectException -> true
             error is java.net.UnknownHostException -> true
             error is java.io.IOException -> true
-            error.message?.contains("5", ignoreCase = false) == true
-                    && error.message?.contains("HTTP Error") == true -> true // 5xx server errors
+            error.message?.let { HTTP_5XX_REGEX.containsMatchIn(it) } == true -> true // 5xx server errors
             else -> false
         }
     }
 
     private fun buildOrderJsonObject(orderWithItems: OrderWithItems): JSONObject {
-        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
         val orderTs = orderWithItems.order.timestamp
 
         return JSONObject().apply {
@@ -100,7 +146,7 @@ class GoogleSheetsSyncService {
 
             val itemsArray = JSONArray()
             orderWithItems.items.forEach { item ->
-                val completedTsStr = if (item.completedTimestamp > 0L) sdf.format(Date(item.completedTimestamp)) else ""
+                val completedTsStr = if (item.completedTimestamp > 0L) formatSheetDate(item.completedTimestamp) else ""
                 val turnaroundStr = if (item.completedTimestamp > orderTs) {
                     val diffSec = (item.completedTimestamp - orderTs) / 1000
                     val mins = diffSec / 60
@@ -131,8 +177,8 @@ class GoogleSheetsSyncService {
             put("paymentMode", orderWithItems.order.paymentMode.ifBlank { if (orderWithItems.order.isPaid) "CASH" else "UNPAID" })
             put("isDelivered", if (orderWithItems.order.isDelivered) "YES" else "NO")
 
-            put("timestamp", sdf.format(Date(orderTs)))
-            val completedOrderTsStr = if (orderWithItems.order.completedTimestamp > 0L) sdf.format(Date(orderWithItems.order.completedTimestamp)) else ""
+            put("timestamp", formatSheetDate(orderTs))
+            val completedOrderTsStr = if (orderWithItems.order.completedTimestamp > 0L) formatSheetDate(orderWithItems.order.completedTimestamp) else ""
             put("completedTimestamp", completedOrderTsStr)
         }
     }
@@ -141,13 +187,14 @@ class GoogleSheetsSyncService {
         webhookUrl: String,
         orderWithItems: OrderWithItems
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
         }
 
         executeWithRetry("syncOrder(${orderWithItems.order.orderId})") {
             try {
-                val urlWithParams = if (webhookUrl.contains("?")) "$webhookUrl&action=syncOrder" else "$webhookUrl?action=syncOrder"
+                val urlWithParams = if (cleanUrl.contains("?")) "$cleanUrl&action=syncOrder" else "$cleanUrl?action=syncOrder"
                 val jsonObject = buildOrderJsonObject(orderWithItems).apply {
                     put("action", "syncOrder")
                 }
@@ -159,11 +206,7 @@ class GoogleSheetsSyncService {
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful || response.code == 302 || response.code == 200) {
-                        Result.success("Synced order successfully to Google Sheets")
-                    } else {
-                        Result.failure(Exception("HTTP Error ${response.code}: ${response.message}"))
-                    }
+                    parseMutationResponse(response, "Synced order successfully to Google Sheets")
                 }
             } catch (e: Exception) {
                 Result.failure(e)
@@ -176,13 +219,14 @@ class GoogleSheetsSyncService {
         ordersList: List<OrderWithItems>,
         datePrefix: String = ""
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
         }
 
         executeWithRetry("syncAllOrders(${ordersList.size})") {
             try {
-                val urlWithParams = if (webhookUrl.contains("?")) "$webhookUrl&action=syncAll" else "$webhookUrl?action=syncAll"
+                val urlWithParams = if (cleanUrl.contains("?")) "$cleanUrl&action=syncAll" else "$cleanUrl?action=syncAll"
                 val ordersArray = JSONArray()
                 ordersList.forEach { orderWithItems ->
                     ordersArray.put(buildOrderJsonObject(orderWithItems))
@@ -201,11 +245,7 @@ class GoogleSheetsSyncService {
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful || response.code == 302 || response.code == 200) {
-                        Result.success("Synced all orders successfully to Google Sheets")
-                    } else {
-                        Result.failure(Exception("HTTP Error ${response.code}: ${response.message}"))
-                    }
+                    parseMutationResponse(response, "Synced all orders successfully to Google Sheets")
                 }
             } catch (e: Exception) {
                 Result.failure(e)
@@ -217,7 +257,8 @@ class GoogleSheetsSyncService {
         webhookUrl: String,
         ordersList: List<OrderWithItems>
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
         }
         if (ordersList.isEmpty()) {
@@ -226,7 +267,7 @@ class GoogleSheetsSyncService {
 
         executeWithRetry("syncBatchOrders(${ordersList.size})") {
             try {
-                val urlWithParams = if (webhookUrl.contains("?")) "$webhookUrl&action=syncBatch" else "$webhookUrl?action=syncBatch"
+                val urlWithParams = if (cleanUrl.contains("?")) "$cleanUrl&action=syncBatch" else "$cleanUrl?action=syncBatch"
                 val ordersArray = JSONArray()
                 ordersList.forEach { orderWithItems ->
                     ordersArray.put(buildOrderJsonObject(orderWithItems))
@@ -244,11 +285,7 @@ class GoogleSheetsSyncService {
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful || response.code == 302 || response.code == 200) {
-                        Result.success("Synced ${ordersList.size} pending orders successfully to Google Sheets")
-                    } else {
-                        Result.failure(Exception("HTTP Error ${response.code}: ${response.message}"))
-                    }
+                    parseMutationResponse(response, "Synced ${ordersList.size} pending orders successfully to Google Sheets")
                 }
             } catch (e: Exception) {
                 Result.failure(e)
@@ -260,15 +297,16 @@ class GoogleSheetsSyncService {
         webhookUrl: String,
         orderId: String
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) return@withContext Result.success("No webhook configured")
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) return@withContext Result.success("No webhook configured")
 
         executeWithRetry("deleteOrder($orderId)") {
             try {
-                val encodedId = java.net.URLEncoder.encode(orderId, "UTF-8")
-                val urlWithParams = if (webhookUrl.contains("?")) {
-                    "$webhookUrl&action=deleteOrder&orderId=$encodedId"
+                val encodedId = URLEncoder.encode(orderId, "UTF-8")
+                val urlWithParams = if (cleanUrl.contains("?")) {
+                    "$cleanUrl&action=deleteOrder&orderId=$encodedId"
                 } else {
-                    "$webhookUrl?action=deleteOrder&orderId=$encodedId"
+                    "$cleanUrl?action=deleteOrder&orderId=$encodedId"
                 }
 
                 // Use GET request — Apps Script doGet handles deleteOrder
@@ -281,14 +319,7 @@ class GoogleSheetsSyncService {
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    val body = response.body?.string() ?: ""
-                    if (response.isSuccessful) {
-                        Log.d(TAG, "Delete order from Sheets: $orderId → $body")
-                        Result.success("Order deleted from Google Sheets")
-                    } else {
-                        Log.w(TAG, "Delete order failed: HTTP ${response.code} → $body")
-                        Result.failure(Exception("HTTP Error ${response.code}"))
-                    }
+                    parseMutationResponse(response, "Order deleted from Google Sheets")
                 }
             } catch (e: Exception) {
                 Result.failure(e)
@@ -300,7 +331,8 @@ class GoogleSheetsSyncService {
         webhookUrl: String,
         menuItems: List<MenuItemEntity>
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
         }
 
@@ -325,16 +357,12 @@ class GoogleSheetsSyncService {
 
                 val requestBody = jsonObject.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
                 val request = Request.Builder()
-                    .url(webhookUrl.trim())
+                    .url(cleanUrl)
                     .post(requestBody)
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful || response.code == 302 || response.code == 200) {
-                        Result.success("Item Master synced successfully to Google Sheets")
-                    } else {
-                        Result.failure(Exception("HTTP Error ${response.code}: ${response.message}"))
-                    }
+                    parseMutationResponse(response, "Item Master synced successfully to Google Sheets")
                 }
             } catch (e: Exception) {
                 Result.failure(e)
@@ -348,7 +376,8 @@ class GoogleSheetsSyncService {
         endDateStr: String,
         ordersList: List<OrderWithItems>
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
         }
 
@@ -370,16 +399,12 @@ class GoogleSheetsSyncService {
 
                 val requestBody = jsonObject.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
                 val request = Request.Builder()
-                    .url(webhookUrl.trim())
+                    .url(cleanUrl)
                     .post(requestBody)
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful || response.code == 302 || response.code == 200) {
-                        Result.success("Range analytics calculated and synced to Google Sheets")
-                    } else {
-                        Result.failure(Exception("HTTP Error ${response.code}: ${response.message}"))
-                    }
+                    parseMutationResponse(response, "Range analytics calculated and synced to Google Sheets")
                 }
             } catch (e: Exception) {
                 Result.failure(e)
@@ -391,15 +416,17 @@ class GoogleSheetsSyncService {
         webhookUrl: String,
         datePart: String
     ): Result<TodaySyncResult> = withContext(Dispatchers.IO) {
-        if (webhookUrl.isBlank()) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Webhook URL is blank"))
         }
 
         try {
-            val url = if (webhookUrl.contains("?")) {
-                "${webhookUrl.trim()}&action=getTodayMaxOrderId&date=$datePart"
+            val encodedDate = URLEncoder.encode(datePart, "UTF-8")
+            val url = if (cleanUrl.contains("?")) {
+                "$cleanUrl&action=getTodayMaxOrderId&date=$encodedDate"
             } else {
-                "${webhookUrl.trim()}?action=getTodayMaxOrderId&date=$datePart"
+                "$cleanUrl?action=getTodayMaxOrderId&date=$encodedDate"
             }
 
             val request = Request.Builder()
@@ -411,63 +438,70 @@ class GoogleSheetsSyncService {
 
             try {
                 client.newCall(request).execute().use { response ->
-                    val bodyString = response.body?.string() ?: ""
-                    if ((response.isSuccessful || response.code == 302 || response.code == 200) && bodyString.isNotBlank()) {
+                    val bodyString = response.body?.string()?.trim() ?: ""
+                    if (response.isSuccessful && bodyString.isNotBlank()) {
                         try {
                             responseJson = JSONObject(bodyString)
-                        } catch (_: Exception) { }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "GET getTodayMaxOrderId returned non-JSON: ${e.message}")
+                        }
+                    } else if (!response.isSuccessful) {
+                        Log.w(TAG, "GET getTodayMaxOrderId HTTP ${response.code}")
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.w(TAG, "GET getTodayMaxOrderId failed, will try POST fallback: ${e.message}")
+            }
 
-            if (responseJson == null || responseJson?.optString("result") != "success") {
+            if (responseJson == null || responseJson?.optNonNullString("result") != "success") {
                 val postPayload = JSONObject().apply {
                     put("action", "getTodayMaxOrderId")
                     put("date", datePart)
                 }
                 val postRequest = Request.Builder()
-                    .url(webhookUrl.trim())
+                    .url(cleanUrl)
                     .post(postPayload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
                     .build()
 
                 client.newCall(postRequest).execute().use { postResponse ->
-                    val bodyString = postResponse.body?.string() ?: ""
-                    if ((postResponse.isSuccessful || postResponse.code == 302 || postResponse.code == 200) && bodyString.isNotBlank()) {
-                        responseJson = JSONObject(bodyString)
+                    val bodyString = postResponse.body?.string()?.trim() ?: ""
+                    if (postResponse.isSuccessful && bodyString.isNotBlank()) {
+                        try {
+                            responseJson = JSONObject(bodyString)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "POST getTodayMaxOrderId returned non-JSON: ${e.message}")
+                        }
+                    } else if (!postResponse.isSuccessful) {
+                        return@withContext Result.failure(Exception("HTTP Error ${postResponse.code}: ${postResponse.message}"))
                     }
                 }
             }
 
             val json = responseJson ?: return@withContext Result.failure(Exception("Failed to fetch order sync info from Google Sheets"))
 
-            if (json.optString("result") == "success") {
+            if (json.optNonNullString("result") == "success") {
                 val maxSeq = json.optInt("maxSequence", 1000)
-                val maxOrderId = json.optString("maxOrderId", "")
+                val maxOrderId = json.optNonNullString("maxOrderId", "")
                 val todayOrdersArray = json.optJSONArray("todayOrders") ?: JSONArray()
 
                 val remoteOrders = mutableListOf<OrderWithItems>()
-                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
                 for (i in 0 until todayOrdersArray.length()) {
                     val orderObj = todayOrdersArray.getJSONObject(i)
-                    val orderId = orderObj.optString("orderId", "")
+                    val orderId = orderObj.optNonNullString("orderId", "")
                     if (orderId.isBlank()) continue
 
-                    val customerName = orderObj.optString("customerName", "Walk-in Customer")
-                    val contactNumber = orderObj.optString("contactNumber", "N/A")
+                    val customerName = orderObj.optNonNullString("customerName", "Walk-in Customer")
+                    val contactNumber = orderObj.optNonNullString("contactNumber", "N/A")
                     val totalAmount = orderObj.optDouble("totalAmount", 0.0)
-                    val isPaidStr = orderObj.optString("isPaid", "NO")
-                    val paymentMode = orderObj.optString("paymentMode", "UNPAID")
-                    val isMadeStr = orderObj.optString("isMade", "NO")
-                    val isDeliveredStr = orderObj.optString("isDelivered", "NO")
-                    val notes = orderObj.optString("notes", "")
-                    val timestampStr = orderObj.optString("timestamp", "")
+                    val isPaidStr = orderObj.optNonNullString("isPaid", "NO")
+                    val paymentMode = orderObj.optNonNullString("paymentMode", "UNPAID")
+                    val isMadeStr = orderObj.optNonNullString("isMade", "NO")
+                    val isDeliveredStr = orderObj.optNonNullString("isDelivered", "NO")
+                    val notes = orderObj.optNonNullString("notes", "")
+                    val timestampStr = orderObj.optNonNullString("timestamp", "")
 
-                    val ts = try {
-                        if (timestampStr.isNotBlank()) sdf.parse(timestampStr)?.time ?: System.currentTimeMillis() else System.currentTimeMillis()
-                    } catch (e: Exception) {
-                        System.currentTimeMillis()
-                    }
+                    val ts = parseSheetDate(timestampStr, System.currentTimeMillis())
 
                     val orderEntity = OrderEntity(
                         orderId = orderId,
@@ -487,14 +521,12 @@ class GoogleSheetsSyncService {
                     val itemEntities = mutableListOf<OrderItemEntity>()
                     for (j in 0 until itemsArray.length()) {
                         val itemObj = itemsArray.getJSONObject(j)
-                        val name = itemObj.optString("itemName", "Item")
+                        val name = itemObj.optNonNullString("itemName", "Item")
                         val unitPrice = itemObj.optDouble("unitPrice", 0.0)
                         val qty = itemObj.optInt("quantity", 1)
                         val completedQty = itemObj.optInt("completedQuantity", 0)
-                        val completedTsStr = itemObj.optString("completedTimestamp", "")
-                        val completedTs = try {
-                            if (completedTsStr.isNotBlank()) sdf.parse(completedTsStr)?.time ?: 0L else 0L
-                        } catch (_: Exception) { 0L }
+                        val completedTsStr = itemObj.optNonNullString("completedTimestamp", "")
+                        val completedTs = parseSheetDate(completedTsStr, 0L)
 
                         itemEntities.add(
                             OrderItemEntity(
@@ -515,7 +547,7 @@ class GoogleSheetsSyncService {
 
                 Result.success(TodaySyncResult(maxSeq, maxOrderId, remoteOrders))
             } else {
-                Result.failure(Exception(json.optString("message", "Error from Google Sheets")))
+                Result.failure(Exception(json.optNonNullString("message", "Error from Google Sheets")))
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -676,7 +708,8 @@ function doPost(e) {
     // ---- SYNC ALL ORDERS (FULL RESYNC) ----
     if (action === "syncAll" || action === "sync_all") {
       var allOrders = data.orders || [];
-      withLock_(function() { syncAllOrders_(ss, allOrders); });
+      var syncDatePrefix = data.datePrefix || data.date || urlParams.datePrefix || urlParams.date || "";
+      withLock_(function() { syncAllOrders_(ss, allOrders, syncDatePrefix); });
       logSync_(ss, "syncAll", allOrders.length + " orders", "OK", Date.now() - startTime);
       return successResponse_("Full sync completed: " + allOrders.length + " orders");
     }

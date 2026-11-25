@@ -1,6 +1,7 @@
 package com.example.data.remote
 
 import android.util.Log
+import com.example.BuildConfig
 import com.example.data.entity.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -16,6 +17,9 @@ import okhttp3.Response
 import okhttp3.logging.HttpLoggingInterceptor
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
+import java.util.Calendar
+import java.util.concurrent.TimeUnit
 
 class SupabaseService private constructor() {
 
@@ -23,7 +27,7 @@ class SupabaseService private constructor() {
         private const val TAG = "SupabaseService"
         private const val SUPABASE_URL = "https://bpeqfynknwuaqfjjqmlh.supabase.co"
         private const val SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJwZXFmeW5rbnd1YXFmampxbWxoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4Njk0MTcxMiwiZXhwIjoyMTAyNTE3NzEyfQ.FpXVlPZsro_Lvsw3UFKho_LLEH2Kqy4JOstP2VVCJAM"
-        
+
         @Volatile
         private var INSTANCE: SupabaseService? = null
 
@@ -34,23 +38,25 @@ class SupabaseService private constructor() {
 
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     private var client: OkHttpClient? = null
-    
+
     private var _isInitialized = false
     val isInitialized: Boolean get() = _isInitialized
 
     fun initialize(): Boolean {
         if (_isInitialized) return true
         return try {
-            val logging = HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BASIC
+            val builder = OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+            if (BuildConfig.DEBUG) {
+                val logging = HttpLoggingInterceptor().apply {
+                    level = HttpLoggingInterceptor.Level.BASIC
+                }
+                builder.addInterceptor(logging)
             }
-            client = OkHttpClient.Builder()
-                .addInterceptor(logging)
-                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .build()
-            
+            client = builder.build()
+
             _isInitialized = true
             Log.d(TAG, "Supabase initialized successfully")
             true
@@ -69,11 +75,56 @@ class SupabaseService private constructor() {
         }
     }
 
+    private fun executeMutation(request: Request, actionLabel: String): Result<Unit> {
+        val resp = executeRequest(request)
+            ?: return Result.failure(Exception("$actionLabel: network request failed"))
+        return resp.use { r ->
+            if (r.isSuccessful) {
+                Result.success(Unit)
+            } else {
+                val errBody = r.body?.string().orEmpty().take(300)
+                Log.w(TAG, "$actionLabel failed: HTTP ${r.code} $errBody")
+                Result.failure(Exception("$actionLabel failed with HTTP ${r.code}"))
+            }
+        }
+    }
+
+    private fun executeJsonArrayGet(request: Request, actionLabel: String): Result<JSONArray> {
+        val resp = executeRequest(request)
+            ?: return Result.failure(Exception("$actionLabel: network request failed"))
+        return resp.use { r ->
+            val bodyStr = r.body?.string().orEmpty()
+            if (!r.isSuccessful) {
+                Log.w(TAG, "$actionLabel failed: HTTP ${r.code} ${bodyStr.take(200)}")
+                Result.failure(Exception("$actionLabel failed with HTTP ${r.code}"))
+            } else if (bodyStr.isBlank()) {
+                Result.success(JSONArray())
+            } else {
+                try {
+                    Result.success(JSONArray(bodyStr))
+                } catch (e: Exception) {
+                    Log.w(TAG, "$actionLabel invalid JSON array: ${e.message}")
+                    Result.failure(e)
+                }
+            }
+        }
+    }
+
+    private fun encodeQueryParam(value: String): String =
+        URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
+    private fun JSONObject.optNonNullString(key: String, fallback: String = ""): String {
+        if (isNull(key)) return fallback
+        val value = optString(key, fallback)
+        return if (value == "null") fallback else value
+    }
+
     // ==================== ORDER OPERATIONS ====================
 
     suspend fun saveOrder(orderWithItems: OrderWithItems): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedOrderId = encodeQueryParam(orderWithItems.order.orderId)
             val orderObj = JSONObject().apply {
                 put("order_id", orderWithItems.order.orderId)
                 put("customer_name", orderWithItems.order.customerName)
@@ -88,7 +139,7 @@ class SupabaseService private constructor() {
                 put("payment_mode", orderWithItems.order.paymentMode)
                 put("completed_timestamp", orderWithItems.order.completedTimestamp)
             }
-            
+
             val upsertOrderReq = Request.Builder()
                 .url("$SUPABASE_URL/rest/v1/orders")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
@@ -96,26 +147,21 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(orderObj.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            val upsertResp = executeRequest(upsertOrderReq)
-            if (upsertResp?.isSuccessful != true) {
-                val code = upsertResp?.code
-                Log.w(TAG, "saveOrder upsert failed: $code")
-                upsertResp?.close()
-                return@withContext Result.failure(Exception("Supabase order upsert failed with HTTP $code"))
+            val upsertRes = executeMutation(upsertOrderReq, "saveOrder upsert")
+            if (upsertRes.isFailure) {
+                return@withContext Result.failure(upsertRes.exceptionOrNull() ?: Exception("Supabase order upsert failed"))
             }
-            upsertResp?.close()
 
             val deleteItemsReq = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.${orderWithItems.order.orderId}")
+                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            val delResp = executeRequest(deleteItemsReq)
-            if (delResp?.isSuccessful != true) {
-                Log.w(TAG, "saveOrder deleteItems failed: ${delResp?.code}")
+            val delRes = executeMutation(deleteItemsReq, "saveOrder deleteItems")
+            if (delRes.isFailure) {
+                return@withContext Result.failure(delRes.exceptionOrNull() ?: Exception("Supabase order items delete failed"))
             }
-            delResp?.close()
 
             if (orderWithItems.items.isNotEmpty()) {
                 val itemsArr = JSONArray()
@@ -138,11 +184,10 @@ class SupabaseService private constructor() {
                     .addHeader("Prefer", "return=minimal")
                     .post(itemsArr.toString().toRequestBody(JSON_MEDIA_TYPE))
                     .build()
-                val insResp = executeRequest(insertItemsReq)
-                if (insResp?.isSuccessful != true) {
-                    Log.w(TAG, "saveOrder insertItems failed: ${insResp?.code}")
+                val insRes = executeMutation(insertItemsReq, "saveOrder insertItems")
+                if (insRes.isFailure) {
+                    return@withContext Result.failure(insRes.exceptionOrNull() ?: Exception("Supabase order items insert failed"))
                 }
-                insResp?.close()
             }
             Result.success("Order saved")
         } catch (e: Exception) {
@@ -153,6 +198,7 @@ class SupabaseService private constructor() {
     suspend fun updateOrderFields(orderId: String, fields: Map<String, Any>): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedOrderId = encodeQueryParam(orderId)
             val json = JSONObject()
             for ((k, v) in fields) {
                 val snakeKey = when (k) {
@@ -167,20 +213,12 @@ class SupabaseService private constructor() {
                 json.put(snakeKey, v)
             }
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/orders?order_id=eq.$orderId")
+                .url("$SUPABASE_URL/rest/v1/orders?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .patch(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            val resp = executeRequest(req)
-            val isSuccess = resp?.isSuccessful == true
-            val code = resp?.code
-            resp?.close()
-            if (isSuccess) {
-                Result.success("Order fields updated")
-            } else {
-                Result.failure(Exception("Order fields update failed with HTTP $code"))
-            }
+            executeMutation(req, "updateOrderFields($orderId)").map { "Order fields updated" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -194,25 +232,43 @@ class SupabaseService private constructor() {
     ): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
-            val encodedName = java.net.URLEncoder.encode(itemName, "UTF-8").replace("+", "%20")
+            val encodedOrderId = encodeQueryParam(orderId)
+            val encodedName = encodeQueryParam(itemName)
             val json = JSONObject().apply {
                 put("completed_quantity", completedQuantity)
                 put("completed_timestamp", completedTimestamp)
             }
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.$orderId&item_name=eq.$encodedName")
+                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.$encodedOrderId&item_name=eq.$encodedName")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .patch(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            val resp = executeRequest(req)
-            val success = resp?.isSuccessful == true
-            resp?.close()
-            if (success) {
-                Result.success("Order item completion updated")
-            } else {
-                Result.failure(Exception("Update failed with code ${resp?.code}"))
+            executeMutation(req, "updateOrderItemCompletion($orderId, $itemName)").map { "Order item completion updated" }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun updateAllOrderItemsCompletion(
+        orderId: String,
+        completedQuantity: Int,
+        completedTimestamp: Long
+    ): Result<String> = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
+        try {
+            val encodedOrderId = encodeQueryParam(orderId)
+            val json = JSONObject().apply {
+                put("completed_quantity", completedQuantity)
+                put("completed_timestamp", completedTimestamp)
             }
+            val req = Request.Builder()
+                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.$encodedOrderId")
+                .addHeader("apikey", SERVICE_ROLE_KEY)
+                .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                .patch(json.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            executeMutation(req, "updateAllOrderItemsCompletion($orderId)").map { "Order items completion updated" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -221,22 +277,25 @@ class SupabaseService private constructor() {
     suspend fun deleteOrder(orderId: String): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedOrderId = encodeQueryParam(orderId)
             val delItems = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.$orderId")
+                .url("$SUPABASE_URL/rest/v1/order_items?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(delItems)?.close()
+            val delItemsRes = executeMutation(delItems, "deleteOrder items($orderId)")
+            if (delItemsRes.isFailure) {
+                return@withContext Result.failure(delItemsRes.exceptionOrNull() ?: Exception("Delete order items failed"))
+            }
 
             val delOrder = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/orders?order_id=eq.$orderId")
+                .url("$SUPABASE_URL/rest/v1/orders?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(delOrder)?.close()
-            Result.success("Order deleted")
+            executeMutation(delOrder, "deleteOrder($orderId)").map { "Order deleted" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -251,9 +310,7 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string() ?: return@withContext emptyList()
-            val arr = JSONArray(bodyStr)
+            val arr = executeJsonArrayGet(req, "fetchOrdersForDateRange").getOrNull() ?: return@withContext emptyList()
             val list = mutableListOf<OrderWithItems>()
             for (i in 0 until arr.length()) {
                 list.add(jsonToOrderWithItems(arr.getJSONObject(i)))
@@ -268,15 +325,14 @@ class SupabaseService private constructor() {
     suspend fun getOrderWithItems(orderId: String): OrderWithItems? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         try {
+            val encodedOrderId = encodeQueryParam(orderId)
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&order_id=eq.$orderId")
+                .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string() ?: return@withContext null
-            val arr = JSONArray(bodyStr)
+            val arr = executeJsonArrayGet(req, "getOrderWithItems($orderId)").getOrNull() ?: return@withContext null
             if (arr.length() > 0) {
                 jsonToOrderWithItems(arr.getJSONObject(0))
             } else null
@@ -299,28 +355,40 @@ class SupabaseService private constructor() {
                     val syncWindowMs = if (isFullReconcile) {
                         System.currentTimeMillis() - (48L * 60 * 60 * 1000)
                     } else {
-                        java.util.Calendar.getInstance().apply {
-                            set(java.util.Calendar.HOUR_OF_DAY, 0)
-                            set(java.util.Calendar.MINUTE, 0)
-                            set(java.util.Calendar.SECOND, 0)
-                            set(java.util.Calendar.MILLISECOND, 0)
+                        Calendar.getInstance().apply {
+                            set(Calendar.HOUR_OF_DAY, 0)
+                            set(Calendar.MINUTE, 0)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
                         }.timeInMillis
                     }
-                    val limit = if (isFullReconcile) 150 else 80
-                    val req = Request.Builder()
-                        .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=$limit")
-                        .addHeader("apikey", SERVICE_ROLE_KEY)
-                        .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
-                        .get()
-                        .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
-                        val list = mutableListOf<OrderWithItems>()
+                    val pageSize = 200
+                    val maxTotal = if (isFullReconcile) 1000 else 600
+                    val list = mutableListOf<OrderWithItems>()
+                    var offset = 0
+                    var pageFetchFailed = false
+
+                    while (offset < maxTotal) {
+                        val req = Request.Builder()
+                            .url("$SUPABASE_URL/rest/v1/orders?select=*,order_items(*)&timestamp=gte.$syncWindowMs&order=timestamp.desc&limit=$pageSize&offset=$offset")
+                            .addHeader("apikey", SERVICE_ROLE_KEY)
+                            .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                            .get()
+                            .build()
+                        val pageResult = executeJsonArrayGet(req, "listenToOrders")
+                        if (pageResult.isFailure) {
+                            pageFetchFailed = true
+                            break
+                        }
+                        val arr = pageResult.getOrNull() ?: break
                         for (i in 0 until arr.length()) {
                             list.add(jsonToOrderWithItems(arr.getJSONObject(i)))
                         }
+                        if (arr.length() < pageSize) break
+                        offset += pageSize
+                    }
+
+                    if (!pageFetchFailed) {
                         emit(list)
                     }
                 } catch (e: Exception) {
@@ -343,10 +411,17 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string() ?: return@withContext Result.failure(Exception("No response"))
-            val seq = bodyStr.toIntOrNull() ?: 1000
-            Result.success(seq)
+            val response = executeRequest(req) ?: return@withContext Result.failure(Exception("No response"))
+            response.use { resp ->
+                val bodyStr = resp.body?.string()?.trim().orEmpty()
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "getNextOrderSequence HTTP ${resp.code}: ${bodyStr.take(200)}")
+                    return@withContext Result.failure(Exception("Sequence RPC failed with HTTP ${resp.code}"))
+                }
+                val seq = bodyStr.toIntOrNull()
+                    ?: return@withContext Result.failure(Exception("Invalid sequence response: $bodyStr"))
+                Result.success(seq)
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -355,20 +430,17 @@ class SupabaseService private constructor() {
     suspend fun getCurrentMaxSequence(datePart: String): Int = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext 1000
         try {
+            val encodedDate = encodeQueryParam(datePart)
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.$datePart")
+                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.$encodedDate")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string()
-            if (bodyStr != null) {
-                val arr = JSONArray(bodyStr)
-                if (arr.length() > 0) {
-                    val valueStr = arr.getJSONObject(0).optString("value")
-                    return@withContext valueStr.toIntOrNull() ?: 1000
-                }
+            val arr = executeJsonArrayGet(req, "getCurrentMaxSequence").getOrNull() ?: return@withContext 1000
+            if (arr.length() > 0) {
+                val valueStr = arr.getJSONObject(0).optNonNullString("value", "")
+                return@withContext valueStr.toIntOrNull() ?: 1000
             }
             1000
         } catch (e: Exception) {
@@ -379,25 +451,50 @@ class SupabaseService private constructor() {
     suspend fun getTodayMaxOrderSequence(datePart: String): Int = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext 1000
         try {
+            val encodedDate = encodeQueryParam(datePart)
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/orders?select=order_id&order_id=like.FLT-$datePart-%25&order=order_id.desc&limit=1")
+                .url("$SUPABASE_URL/rest/v1/orders?select=order_id&order_id=like.FLT-$encodedDate-%25&limit=5000")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string()
-            if (bodyStr != null) {
-                val arr = JSONArray(bodyStr)
-                if (arr.length() > 0) {
-                    val orderId = arr.getJSONObject(0).optString("order_id", "")
-                    val seqStr = orderId.substringAfterLast("-", "")
-                    return@withContext seqStr.toIntOrNull() ?: 1000
+            val arr = executeJsonArrayGet(req, "getTodayMaxOrderSequence").getOrNull() ?: return@withContext 1000
+            var maxSeq = 1000
+            for (i in 0 until arr.length()) {
+                val orderId = arr.getJSONObject(i).optNonNullString("order_id", "")
+                val seq = orderId.substringAfterLast("-", "").toIntOrNull()
+                if (seq != null && seq > maxSeq) {
+                    maxSeq = seq
                 }
             }
-            1000
+            maxSeq
         } catch (e: Exception) {
             1000
+        }
+    }
+
+    suspend fun getTodayMaxInventoryOrderSequence(datePrefix: String): Int = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext 0
+        try {
+            val encodedDate = encodeQueryParam(datePrefix)
+            val req = Request.Builder()
+                .url("$SUPABASE_URL/rest/v1/inventory_orders?select=order_id&order_id=like.INV-$encodedDate-%25&limit=5000")
+                .addHeader("apikey", SERVICE_ROLE_KEY)
+                .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                .get()
+                .build()
+            val arr = executeJsonArrayGet(req, "getTodayMaxInventoryOrderSequence").getOrNull() ?: return@withContext 0
+            var maxSeq = 0
+            for (i in 0 until arr.length()) {
+                val orderId = arr.getJSONObject(i).optNonNullString("order_id", "")
+                val seq = orderId.substringAfterLast("-", "").toIntOrNull()
+                if (seq != null && seq > maxSeq) {
+                    maxSeq = seq
+                }
+            }
+            maxSeq
+        } catch (e: Exception) {
+            0
         }
     }
 
@@ -421,8 +518,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Menu item saved")
+            executeMutation(req, "saveMenuItem(${item.name})").map { "Menu item saved" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -437,8 +533,7 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Menu item deleted")
+            executeMutation(req, "deleteMenuItem($itemId)").map { "Menu item deleted" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -465,8 +560,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(arr.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("All menu items synced")
+            executeMutation(req, "syncAllMenuItems").map { "All menu items synced" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -482,20 +576,18 @@ class SupabaseService private constructor() {
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
                         .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
+                    val arr = executeJsonArrayGet(req, "listenToMenuItems").getOrNull()
+                    if (arr != null) {
                         val list = mutableListOf<MenuItemEntity>()
                         for (i in 0 until arr.length()) {
                             val obj = arr.getJSONObject(i)
                             list.add(
                                 MenuItemEntity(
                                     id = obj.optInt("id", 0),
-                                    name = obj.optString("name", ""),
-                                    category = obj.optString("category", ""),
+                                    name = obj.optNonNullString("name", ""),
+                                    category = obj.optNonNullString("category", ""),
                                     price = obj.optDouble("price", 0.0),
-                                    description = obj.optString("description", ""),
+                                    description = obj.optNonNullString("description", ""),
                                     isAvailable = obj.optBoolean("is_available", true)
                                 )
                             )
@@ -529,8 +621,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("UPI account saved")
+            executeMutation(req, "saveUpiAccount").map { "UPI account saved" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -545,8 +636,7 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(req)?.close()
-            Result.success("UPI account deleted")
+            executeMutation(req, "deleteUpiAccount($accountId)").map { "UPI account deleted" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -562,20 +652,18 @@ class SupabaseService private constructor() {
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
                         .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
+                    val arr = executeJsonArrayGet(req, "listenToUpiAccounts").getOrNull()
+                    if (arr != null) {
                         val list = mutableListOf<UpiAccountEntity>()
                         for (i in 0 until arr.length()) {
                             val obj = arr.getJSONObject(i)
                             list.add(
                                 UpiAccountEntity(
                                     id = obj.optInt("id", 0),
-                                    vpa = obj.optString("vpa", ""),
-                                    payeeName = obj.optString("payee_name", ""),
+                                    vpa = obj.optNonNullString("vpa", ""),
+                                    payeeName = obj.optNonNullString("payee_name", ""),
                                     isDefault = obj.optBoolean("is_default", false),
-                                    note = obj.optString("note", "")
+                                    note = obj.optNonNullString("note", "")
                                 )
                             )
                         }
@@ -611,8 +699,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Inventory item saved")
+            executeMutation(req, "saveInventoryItem(${item.name})").map { "Inventory item saved" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -627,8 +714,7 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Inventory item deleted")
+            executeMutation(req, "deleteInventoryItem($itemId)").map { "Inventory item deleted" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -646,8 +732,7 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .patch(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Inventory stock updated")
+            executeMutation(req, "updateInventoryStock($itemId)").map { "Inventory stock updated" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -656,6 +741,7 @@ class SupabaseService private constructor() {
     suspend fun saveInventoryOrder(order: InventoryOrderEntity, items: List<InventoryOrderItemEntity>): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedOrderId = encodeQueryParam(order.orderId)
             val orderJson = JSONObject().apply {
                 put("order_id", order.orderId)
                 put("timestamp", order.timestamp)
@@ -671,15 +757,21 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(orderJson.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(reqOrder)?.close()
+            val orderRes = executeMutation(reqOrder, "saveInventoryOrder(${order.orderId})")
+            if (orderRes.isFailure) {
+                return@withContext Result.failure(orderRes.exceptionOrNull() ?: Exception("Inventory order upsert failed"))
+            }
 
             val delItemsReq = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/inventory_order_items?order_id=eq.${order.orderId}")
+                .url("$SUPABASE_URL/rest/v1/inventory_order_items?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(delItemsReq)?.close()
+            val delRes = executeMutation(delItemsReq, "saveInventoryOrder deleteItems(${order.orderId})")
+            if (delRes.isFailure) {
+                return@withContext Result.failure(delRes.exceptionOrNull() ?: Exception("Inventory order items delete failed"))
+            }
 
             if (items.isNotEmpty()) {
                 val arr = JSONArray()
@@ -700,7 +792,10 @@ class SupabaseService private constructor() {
                     .addHeader("Prefer", "return=minimal")
                     .post(arr.toString().toRequestBody(JSON_MEDIA_TYPE))
                     .build()
-                executeRequest(reqItems)?.close()
+                val insRes = executeMutation(reqItems, "saveInventoryOrder insertItems(${order.orderId})")
+                if (insRes.isFailure) {
+                    return@withContext Result.failure(insRes.exceptionOrNull() ?: Exception("Inventory order items insert failed"))
+                }
             }
             Result.success("Inventory order saved")
         } catch (e: Exception) {
@@ -711,22 +806,25 @@ class SupabaseService private constructor() {
     suspend fun deleteInventoryOrder(orderId: String): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedOrderId = encodeQueryParam(orderId)
             val reqItems = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/inventory_order_items?order_id=eq.$orderId")
+                .url("$SUPABASE_URL/rest/v1/inventory_order_items?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(reqItems)?.close()
+            val delItemsRes = executeMutation(reqItems, "deleteInventoryOrder items($orderId)")
+            if (delItemsRes.isFailure) {
+                return@withContext Result.failure(delItemsRes.exceptionOrNull() ?: Exception("Delete inventory order items failed"))
+            }
 
             val reqOrder = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/inventory_orders?order_id=eq.$orderId")
+                .url("$SUPABASE_URL/rest/v1/inventory_orders?order_id=eq.$encodedOrderId")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(reqOrder)?.close()
-            Result.success("Inventory order deleted")
+            executeMutation(reqOrder, "deleteInventoryOrder($orderId)").map { "Inventory order deleted" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -751,8 +849,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Inventory usage saved")
+            executeMutation(req, "saveInventoryUsage").map { "Inventory usage saved" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -767,8 +864,22 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Inventory usage deleted")
+            executeMutation(req, "deleteInventoryUsage($usageId)").map { "Inventory usage deleted" }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteInventoryUsagesForMenuItem(menuItemId: Int): Result<String> = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
+        try {
+            val req = Request.Builder()
+                .url("$SUPABASE_URL/rest/v1/inventory_usage?menu_item_id=eq.$menuItemId")
+                .addHeader("apikey", SERVICE_ROLE_KEY)
+                .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
+                .delete()
+                .build()
+            executeMutation(req, "deleteInventoryUsagesForMenuItem($menuItemId)").map { "Inventory usages deleted for menu item" }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -788,19 +899,19 @@ class SupabaseService private constructor() {
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
                         .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
+                    val arr = executeJsonArrayGet(req, "listenToInventoryOrders").getOrNull()
+                    if (arr != null) {
                         val list = mutableListOf<Pair<InventoryOrderEntity, List<InventoryOrderItemEntity>>>()
                         for (i in 0 until arr.length()) {
                             val obj = arr.getJSONObject(i)
+                            val orderId = obj.optNonNullString("order_id", "")
+                            if (orderId.isBlank()) continue
                             val order = InventoryOrderEntity(
-                                orderId = obj.optString("order_id"),
+                                orderId = orderId,
                                 timestamp = obj.optLong("timestamp", 0L),
-                                supplierName = obj.optString("supplier_name", ""),
+                                supplierName = obj.optNonNullString("supplier_name", ""),
                                 totalAmount = obj.optDouble("total_amount", 0.0),
-                                notes = obj.optString("notes", ""),
+                                notes = obj.optNonNullString("notes", ""),
                                 syncStatus = "SYNCED"
                             )
                             val items = mutableListOf<InventoryOrderItemEntity>()
@@ -810,10 +921,10 @@ class SupabaseService private constructor() {
                                     val itemObj = itemsArr.getJSONObject(j)
                                     items.add(InventoryOrderItemEntity(
                                         id = itemObj.optInt("id", 0),
-                                        orderId = obj.optString("order_id"),
-                                        itemName = itemObj.optString("item_name", ""),
+                                        orderId = orderId,
+                                        itemName = itemObj.optNonNullString("item_name", ""),
                                         quantity = itemObj.optDouble("quantity", 0.0),
-                                        unit = itemObj.optString("unit", "pcs"),
+                                        unit = itemObj.optNonNullString("unit", "pcs"),
                                         unitPrice = itemObj.optDouble("unit_price", 0.0),
                                         subtotal = itemObj.optDouble("subtotal", 0.0)
                                     ))
@@ -841,18 +952,16 @@ class SupabaseService private constructor() {
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
                         .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
+                    val arr = executeJsonArrayGet(req, "listenToInventoryItems").getOrNull()
+                    if (arr != null) {
                         val list = mutableListOf<InventoryItemEntity>()
                         for (i in 0 until arr.length()) {
                             val obj = arr.getJSONObject(i)
                             list.add(InventoryItemEntity(
                                 id = obj.optInt("id", 0),
-                                name = obj.optString("name", ""),
-                                category = obj.optString("category", ""),
-                                unit = obj.optString("unit", "kg"),
+                                name = obj.optNonNullString("name", ""),
+                                category = obj.optNonNullString("category", ""),
+                                unit = obj.optNonNullString("unit", "kg"),
                                 standardQuantity = obj.optDouble("standard_quantity", 1.0),
                                 defaultPrice = obj.optDouble("default_price", 0.0),
                                 currentStock = obj.optDouble("current_stock", 0.0),
@@ -879,10 +988,8 @@ class SupabaseService private constructor() {
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
                         .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
+                    val arr = executeJsonArrayGet(req, "listenToInventoryUsage").getOrNull()
+                    if (arr != null) {
                         val list = mutableListOf<InventoryUsageEntity>()
                         for (i in 0 until arr.length()) {
                             val obj = arr.getJSONObject(i)
@@ -890,11 +997,11 @@ class SupabaseService private constructor() {
                                 InventoryUsageEntity(
                                     id = obj.optInt("id", 0),
                                     menuItemId = obj.optInt("menu_item_id", 0),
-                                    menuItemName = obj.optString("menu_item_name", ""),
+                                    menuItemName = obj.optNonNullString("menu_item_name", ""),
                                     inventoryItemId = obj.optInt("inventory_item_id", 0),
-                                    inventoryItemName = obj.optString("inventory_item_name", ""),
+                                    inventoryItemName = obj.optNonNullString("inventory_item_name", ""),
                                     quantityUsed = obj.optDouble("quantity_used", 0.0),
-                                    unit = obj.optString("unit", "g")
+                                    unit = obj.optNonNullString("unit", "g")
                                 )
                             )
                         }
@@ -911,19 +1018,19 @@ class SupabaseService private constructor() {
     // ==================== DATA MAPPERS ====================
 
     private fun jsonToOrderWithItems(json: JSONObject): OrderWithItems {
-        val orderId = json.optString("order_id")
+        val orderId = json.optNonNullString("order_id", "")
         val order = OrderEntity(
             orderId = orderId,
-            customerName = json.optString("customer_name", "Walk-in"),
-            contactNumber = json.optString("contact_number", ""),
+            customerName = json.optNonNullString("customer_name", "Walk-in").ifBlank { "Walk-in" },
+            contactNumber = json.optNonNullString("contact_number", ""),
             totalAmount = json.optDouble("total_amount", 0.0),
             timestamp = json.optLong("timestamp", 0L),
             isMade = json.optBoolean("is_made", false),
             isPaid = json.optBoolean("is_paid", false),
             isDelivered = json.optBoolean("is_delivered", false),
             syncStatus = "SYNCED",
-            notes = json.optString("notes", ""),
-            paymentMode = json.optString("payment_mode", "UNPAID"),
+            notes = json.optNonNullString("notes", ""),
+            paymentMode = json.optNonNullString("payment_mode", "UNPAID").ifBlank { "UNPAID" },
             completedTimestamp = json.optLong("completed_timestamp", 0L)
         )
 
@@ -937,7 +1044,7 @@ class SupabaseService private constructor() {
                         id = itemObj.optInt("id", 0),
                         orderId = orderId,
                         menuItemId = itemObj.optInt("menu_item_id", 0),
-                        itemName = itemObj.optString("item_name", ""),
+                        itemName = itemObj.optNonNullString("item_name", ""),
                         itemPrice = itemObj.optDouble("item_price", 0.0),
                         quantity = itemObj.optInt("quantity", 1),
                         subtotal = itemObj.optDouble("subtotal", 0.0),
@@ -972,8 +1079,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(json.toString().toRequestBody("application/json".toMediaType()))
                 .build()
-            executeRequest(req)
-            Result.success(customer.name)
+            executeMutation(req, "saveCustomer(${customer.name})").map { customer.name }
         } catch (e: Exception) {
             Log.e(TAG, "saveCustomer error: ${e.message}")
             Result.failure(e)
@@ -989,8 +1095,7 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            executeRequest(req)
-            Result.success("Deleted")
+            executeMutation(req, "deleteCustomer($customerId)").map { "Deleted" }
         } catch (e: Exception) {
             Log.e(TAG, "deleteCustomer error: ${e.message}")
             Result.failure(e)
@@ -1007,18 +1112,16 @@ class SupabaseService private constructor() {
                         .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                         .get()
                         .build()
-                    val response = executeRequest(req)
-                    val bodyStr = response?.body?.string()
-                    if (bodyStr != null) {
-                        val arr = JSONArray(bodyStr)
+                    val arr = executeJsonArrayGet(req, "listenToCustomers").getOrNull()
+                    if (arr != null) {
                         val list = mutableListOf<CustomerEntity>()
                         for (i in 0 until arr.length()) {
                             val obj = arr.getJSONObject(i)
                             list.add(
                                 CustomerEntity(
                                     id = obj.optInt("id", 0),
-                                    name = obj.optString("name", ""),
-                                    contactNumber = obj.optString("contact_number", ""),
+                                    name = obj.optNonNullString("name", ""),
+                                    contactNumber = obj.optNonNullString("contact_number", ""),
                                     totalOrders = obj.optInt("total_orders", 0),
                                     totalSpent = obj.optDouble("total_spent", 0.0),
                                     lastOrderTimestamp = obj.optLong("last_order_timestamp", 0L),
@@ -1050,24 +1153,27 @@ class SupabaseService private constructor() {
     suspend fun uploadStoryPhoto(fileName: String, imageBytes: ByteArray): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedFile = encodeQueryParam(fileName)
             val body = imageBytes.toRequestBody("image/jpeg".toMediaType())
             val req = Request.Builder()
-                .url("$STORAGE_BASE_URL/object/$STORAGE_BUCKET/$fileName")
+                .url("$STORAGE_BASE_URL/object/$STORAGE_BUCKET/$encodedFile")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .addHeader("Content-Type", "image/jpeg")
                 .addHeader("x-upsert", "true")
                 .post(body)
                 .build()
-            val response = executeRequest(req)
-            if (response?.isSuccessful == true) {
-                val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$STORAGE_BUCKET/$fileName"
-                Log.d(TAG, "Story photo uploaded: $publicUrl")
-                Result.success(publicUrl)
-            } else {
-                val errorBody = response?.body?.string() ?: "Unknown error"
-                Log.e(TAG, "Failed to upload story photo: $errorBody")
-                Result.failure(Exception("Upload failed: $errorBody"))
+            val response = executeRequest(req) ?: return@withContext Result.failure(Exception("Upload failed: no response"))
+            response.use { resp ->
+                if (resp.isSuccessful) {
+                    val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$STORAGE_BUCKET/$encodedFile"
+                    Log.d(TAG, "Story photo uploaded: $publicUrl")
+                    Result.success(publicUrl)
+                } else {
+                    val errorBody = resp.body?.string().orEmpty().ifBlank { "HTTP ${resp.code}" }
+                    Log.e(TAG, "Failed to upload story photo: $errorBody")
+                    Result.failure(Exception("Upload failed: $errorBody"))
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "uploadStoryPhoto error: ${e.message}")
@@ -1097,24 +1203,24 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string()
-            if (bodyStr != null) {
-                val arr = JSONArray(bodyStr)
-                val fileNames = mutableListOf<String>()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    val name = obj.optString("name", "")
-                    // Filter only image files, skip .emptyFolderPlaceholder
-                    if (name.isNotBlank() && !name.startsWith(".") &&
-                        (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png"))) {
-                        fileNames.add(name)
-                    }
-                }
-                Result.success(fileNames)
-            } else {
-                Result.failure(Exception("No response"))
+            val arrResult = executeJsonArrayGet(req, "listStoryPhotos")
+            if (arrResult.isFailure) {
+                return@withContext Result.failure(arrResult.exceptionOrNull() ?: Exception("Failed to list story photos"))
             }
+            val arr = arrResult.getOrThrow()
+            val fileNames = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val name = obj.optNonNullString("name", "")
+                // Filter only image files, skip .emptyFolderPlaceholder
+                if (name.isNotBlank() && !name.startsWith(".") &&
+                    (name.endsWith(".jpg", ignoreCase = true) ||
+                        name.endsWith(".jpeg", ignoreCase = true) ||
+                        name.endsWith(".png", ignoreCase = true))) {
+                    fileNames.add(name)
+                }
+            }
+            Result.success(fileNames)
         } catch (e: Exception) {
             Log.e(TAG, "listStoryPhotos error: ${e.message}")
             Result.failure(e)
@@ -1127,22 +1233,22 @@ class SupabaseService private constructor() {
     suspend fun deleteStoryPhoto(fileName: String): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
-            val body = JSONObject().apply {
-                put("prefixes", org.json.JSONArray().apply { put(fileName) })
-            }
+            val encodedFile = encodeQueryParam(fileName)
             val req = Request.Builder()
-                .url("$STORAGE_BASE_URL/object/$STORAGE_BUCKET/$fileName")
+                .url("$STORAGE_BASE_URL/object/$STORAGE_BUCKET/$encodedFile")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .delete()
                 .build()
-            val response = executeRequest(req)
-            if (response?.isSuccessful == true) {
-                Log.d(TAG, "Story photo deleted: $fileName")
-                Result.success(true)
-            } else {
-                val errorBody = response?.body?.string() ?: "Unknown error"
-                Result.failure(Exception("Delete failed: $errorBody"))
+            val response = executeRequest(req) ?: return@withContext Result.failure(Exception("Delete failed: no response"))
+            response.use { resp ->
+                if (resp.isSuccessful) {
+                    Log.d(TAG, "Story photo deleted: $fileName")
+                    Result.success(true)
+                } else {
+                    val errorBody = resp.body?.string().orEmpty().ifBlank { "HTTP ${resp.code}" }
+                    Result.failure(Exception("Delete failed: $errorBody"))
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "deleteStoryPhoto error: ${e.message}")
@@ -1156,20 +1262,23 @@ class SupabaseService private constructor() {
     suspend fun downloadStoryPhoto(fileName: String): Result<ByteArray> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Not initialized"))
         try {
+            val encodedFile = encodeQueryParam(fileName)
             val req = Request.Builder()
-                .url("$SUPABASE_URL/storage/v1/object/public/$STORAGE_BUCKET/$fileName")
+                .url("$SUPABASE_URL/storage/v1/object/public/$STORAGE_BUCKET/$encodedFile")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            if (response?.isSuccessful == true) {
-                val bytes = response.body?.bytes()
-                if (bytes != null) {
-                    Result.success(bytes)
+            val response = executeRequest(req) ?: return@withContext Result.failure(Exception("Download failed: no response"))
+            response.use { resp ->
+                if (resp.isSuccessful) {
+                    val bytes = resp.body?.bytes()
+                    if (bytes != null) {
+                        Result.success(bytes)
+                    } else {
+                        Result.failure(Exception("Empty response body"))
+                    }
                 } else {
-                    Result.failure(Exception("Empty response body"))
+                    Result.failure(Exception("Download failed: HTTP ${resp.code}"))
                 }
-            } else {
-                Result.failure(Exception("Download failed: ${response?.code}"))
             }
         } catch (e: Exception) {
             Log.e(TAG, "downloadStoryPhoto error: ${e.message}")
@@ -1181,7 +1290,7 @@ class SupabaseService private constructor() {
      * Get the public URL for a story photo.
      */
     fun getStoryPhotoUrl(fileName: String): String {
-        return "$SUPABASE_URL/storage/v1/object/public/$STORAGE_BUCKET/$fileName"
+        return "$SUPABASE_URL/storage/v1/object/public/$STORAGE_BUCKET/${encodeQueryParam(fileName)}"
     }
 
     // ==================== RECEIPT DESIGN CLOUD CONFIG ====================
@@ -1203,8 +1312,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Receipt design saved to cloud")
+            executeMutation(req, "saveReceiptDesignConfig").map { "Receipt design saved to cloud" }
         } catch (e: Exception) {
             Log.e(TAG, "saveReceiptDesignConfig error: ${e.message}")
             Result.failure(e)
@@ -1223,14 +1331,9 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string()
-            response?.close()
-            if (bodyStr != null) {
-                val arr = JSONArray(bodyStr)
-                if (arr.length() > 0) {
-                    return@withContext arr.getJSONObject(0).optString("value", null)
-                }
+            val arr = executeJsonArrayGet(req, "fetchReceiptDesignConfig").getOrNull() ?: return@withContext null
+            if (arr.length() > 0) {
+                return@withContext arr.getJSONObject(0).optNonNullString("value", "").ifBlank { null }
             }
             null
         } catch (e: Exception) {
@@ -1247,21 +1350,17 @@ class SupabaseService private constructor() {
             initialize()
         }
         try {
+            val encodedKey = encodeQueryParam(key)
             val req = Request.Builder()
-                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.$key&limit=1")
+                .url("$SUPABASE_URL/rest/v1/sync_metadata?key=eq.$encodedKey&limit=1")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string()
-            response?.close()
-            if (bodyStr != null) {
-                val arr = JSONArray(bodyStr)
-                if (arr.length() > 0) {
-                    val value = arr.getJSONObject(0).optString("value", "")
-                    if (value.isNotBlank()) return@withContext value
-                }
+            val arr = executeJsonArrayGet(req, "fetchSyncMetadata($key)").getOrNull() ?: return@withContext null
+            if (arr.length() > 0) {
+                val value = arr.getJSONObject(0).optNonNullString("value", "")
+                if (value.isNotBlank()) return@withContext value
             }
             null
         } catch (e: Exception) {
@@ -1290,8 +1389,7 @@ class SupabaseService private constructor() {
                 .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                 .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            executeRequest(req)?.close()
-            Result.success("Metadata $key saved to cloud")
+            executeMutation(req, "saveSyncMetadata($key)").map { "Metadata $key saved to cloud" }
         } catch (e: Exception) {
             Log.e(TAG, "saveSyncMetadata($key) error: ${e.message}")
             Result.failure(e)
@@ -1317,25 +1415,25 @@ class SupabaseService private constructor() {
     suspend fun uploadVoiceOrderAudio(fileName: String, audioBytes: ByteArray): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Supabase not initialized"))
         try {
+            val encodedFile = encodeQueryParam(fileName)
             val body = audioBytes.toRequestBody("audio/mp4".toMediaType())
             val req = Request.Builder()
-                .url("$STORAGE_BASE_URL/object/$VOICE_ORDERS_BUCKET/$fileName")
+                .url("$STORAGE_BASE_URL/object/$VOICE_ORDERS_BUCKET/$encodedFile")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .addHeader("Content-Type", "audio/mp4")
                 .addHeader("x-upsert", "true")
                 .post(body)
                 .build()
-            val response = executeRequest(req)
-            if (response?.isSuccessful == true) {
-                val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$VOICE_ORDERS_BUCKET/$fileName"
-                response.close()
-                Result.success(publicUrl)
-            } else {
-                val code = response?.code
-                val err = response?.body?.string() ?: "HTTP $code"
-                response?.close()
-                Result.failure(Exception("Voice audio upload failed: $err"))
+            val response = executeRequest(req) ?: return@withContext Result.failure(Exception("Voice audio upload failed: no response"))
+            response.use { resp ->
+                if (resp.isSuccessful) {
+                    val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$VOICE_ORDERS_BUCKET/$encodedFile"
+                    Result.success(publicUrl)
+                } else {
+                    val err = resp.body?.string().orEmpty().ifBlank { "HTTP ${resp.code}" }
+                    Result.failure(Exception("Voice audio upload failed: $err"))
+                }
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -1348,25 +1446,25 @@ class SupabaseService private constructor() {
     suspend fun uploadVoiceOrderDiagnostics(fileName: String, jsonDiagnostics: String): Result<String> = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext Result.failure(Exception("Supabase not initialized"))
         try {
+            val encodedFile = encodeQueryParam(fileName)
             val body = jsonDiagnostics.toRequestBody(JSON_MEDIA_TYPE)
             val req = Request.Builder()
-                .url("$STORAGE_BASE_URL/object/$VOICE_ORDERS_BUCKET/$fileName")
+                .url("$STORAGE_BASE_URL/object/$VOICE_ORDERS_BUCKET/$encodedFile")
                 .addHeader("apikey", SERVICE_ROLE_KEY)
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .addHeader("Content-Type", "application/json")
                 .addHeader("x-upsert", "true")
                 .post(body)
                 .build()
-            val response = executeRequest(req)
-            if (response?.isSuccessful == true) {
-                val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$VOICE_ORDERS_BUCKET/$fileName"
-                response.close()
-                Result.success(publicUrl)
-            } else {
-                val code = response?.code
-                val err = response?.body?.string() ?: "HTTP $code"
-                response?.close()
-                Result.failure(Exception("Diagnostics upload failed: $err"))
+            val response = executeRequest(req) ?: return@withContext Result.failure(Exception("Diagnostics upload failed: no response"))
+            response.use { resp ->
+                if (resp.isSuccessful) {
+                    val publicUrl = "$SUPABASE_URL/storage/v1/object/public/$VOICE_ORDERS_BUCKET/$encodedFile"
+                    Result.success(publicUrl)
+                } else {
+                    val err = resp.body?.string().orEmpty().ifBlank { "HTTP ${resp.code}" }
+                    Result.failure(Exception("Diagnostics upload failed: $err"))
+                }
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -1405,11 +1503,11 @@ class SupabaseService private constructor() {
                     return@withContext AppUpdatePolicy(
                         forceUpdate = force,
                         minVersionCode = minCode,
-                        minVersionName = json.optString("min_version_name", ""),
-                        title = json.optString("title", "Mandatory Update Required"),
-                        message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders."),
-                        apkDownloadUrl = json.optString("apk_download_url", ""),
-                        apkFileName = json.optString("apk_file_name", "filtr-billing-v1.3.apk"),
+                        minVersionName = json.optNonNullString("min_version_name", ""),
+                        title = json.optNonNullString("title", "Mandatory Update Required"),
+                        message = json.optNonNullString("message", "A new version of FILTR Billing is required. Please update to continue taking orders."),
+                        apkDownloadUrl = json.optNonNullString("apk_download_url", ""),
+                        apkFileName = json.optNonNullString("apk_file_name", "filtr-billing-v1.3.apk"),
                         apkSizeBytes = json.optLong("apk_size_bytes", 0L)
                     )
                 }
@@ -1422,11 +1520,11 @@ class SupabaseService private constructor() {
                 return@withContext AppUpdatePolicy(
                     forceUpdate = json.optBoolean("force_update", false),
                     minVersionCode = json.optInt("min_version_code", 0),
-                    minVersionName = json.optString("min_version_name", ""),
-                    title = json.optString("title", "Mandatory Update Required"),
-                    message = json.optString("message", "A new version of FILTR Billing is required. Please update to continue taking orders."),
-                    apkDownloadUrl = json.optString("apk_download_url", ""),
-                    apkFileName = json.optString("apk_file_name", "filtr-billing-v1.3.apk"),
+                    minVersionName = json.optNonNullString("min_version_name", ""),
+                    title = json.optNonNullString("title", "Mandatory Update Required"),
+                    message = json.optNonNullString("message", "A new version of FILTR Billing is required. Please update to continue taking orders."),
+                    apkDownloadUrl = json.optNonNullString("apk_download_url", ""),
+                    apkFileName = json.optNonNullString("apk_file_name", "filtr-billing-v1.3.apk"),
                     apkSizeBytes = json.optLong("apk_size_bytes", 0L)
                 )
             }
@@ -1469,9 +1567,9 @@ class SupabaseService private constructor() {
             if (!raw.startsWith("{")) return@withContext null
             val json = JSONObject(raw)
             DeepgramConfig(
-                apiKey = json.optString("api_key", ""),
-                model = json.optString("model", "nova-3").ifBlank { "nova-3" },
-                language = json.optString("language", "multi").ifBlank { "multi" }
+                apiKey = json.optNonNullString("api_key", ""),
+                model = json.optNonNullString("model", "nova-3").ifBlank { "nova-3" },
+                language = json.optNonNullString("language", "multi").ifBlank { "multi" }
             )
         } catch (e: Exception) {
             Log.w(TAG, "fetchDeepgramConfig failed: ${e.message}")
@@ -1509,8 +1607,8 @@ class SupabaseService private constructor() {
             if (!raw.isNullOrBlank() && raw.startsWith("{")) {
                 val json = JSONObject(raw)
                 return@withContext AccessPolicyConfig(
-                    adminPasscode = json.optString("admin_passcode", "FILTR007"),
-                    staffPasscode = json.optString("staff_passcode", "1234"),
+                    adminPasscode = json.optNonNullString("admin_passcode", "FILTR007"),
+                    staffPasscode = json.optNonNullString("staff_passcode", "1234"),
                     passcodeEpoch = json.optInt("passcode_epoch", 1),
                     requireOwnerApprovalForAdmin = json.optBoolean("require_owner_approval_for_admin", false)
                 )
@@ -1534,19 +1632,19 @@ class SupabaseService private constructor() {
     private fun parseDeviceRegistration(key: String, rawValue: String): DeviceRegistration? {
         return try {
             val json = JSONObject(rawValue)
-            val devId = json.optString("device_id", "").ifBlank {
+            val devId = json.optNonNullString("device_id", "").ifBlank {
                 key.removePrefix("device_reg_").substringAfterLast("_")
             }
             DeviceRegistration(
                 registryKey = key,
                 deviceId = devId,
-                appRole = json.optString("app_role", "STAFF"),
-                operatorName = json.optString("operator_name", "Unknown Device"),
-                deviceModel = json.optString("device_model", "Android"),
-                androidVersion = json.optString("android_version", ""),
-                appVersionName = json.optString("app_version_name", ""),
+                appRole = json.optNonNullString("app_role", "STAFF"),
+                operatorName = json.optNonNullString("operator_name", "Unknown Device"),
+                deviceModel = json.optNonNullString("device_model", "Android"),
+                androidVersion = json.optNonNullString("android_version", ""),
+                appVersionName = json.optNonNullString("app_version_name", ""),
                 appVersionCode = json.optInt("app_version_code", 0),
-                status = json.optString("status", "ACTIVE"),
+                status = json.optNonNullString("status", "ACTIVE"),
                 passcodeEpoch = json.optInt("passcode_epoch", 1),
                 firstSeenMs = json.optLong("first_seen_ms", System.currentTimeMillis()),
                 lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis())
@@ -1574,7 +1672,7 @@ class SupabaseService private constructor() {
 
     /**
      * Registers or updates device heartbeat while preserving remote REVOKED/PENDING status
-     * set by the Owner/Admin.
+     * set by the Owner/Admin. Client heartbeats can never self-promote PENDING -> ACTIVE.
      */
     suspend fun syncDeviceHeartbeat(
         deviceId: String,
@@ -1594,11 +1692,11 @@ class SupabaseService private constructor() {
                 ?: fetchSyncMetadata("device_reg_${appRole.lowercase()}_$deviceId")
             val existing = if (!existingRaw.isNullOrBlank()) parseDeviceRegistration(key, existingRaw) else null
 
-            // Remote REVOKED always overrides local session; PENDING stays PENDING unless locally approved or remote ACTIVE
+            // Remote REVOKED and PENDING always take precedence; clients cannot self-promote PENDING -> ACTIVE
             val resolvedStatus = when {
                 existing?.status == "REVOKED" -> "REVOKED"
+                existing?.status == "PENDING" -> "PENDING"
                 existing?.status == "ACTIVE" && localStatus == "PENDING" -> "ACTIVE"
-                existing?.status == "PENDING" && localStatus != "ACTIVE" -> "PENDING"
                 else -> localStatus
             }
 
@@ -1616,8 +1714,13 @@ class SupabaseService private constructor() {
                 firstSeenMs = existing?.firstSeenMs ?: System.currentTimeMillis(),
                 lastSeenMs = System.currentTimeMillis()
             )
-            saveSyncMetadata(key, deviceRegistrationToJson(updated))
-            updated
+            val saveRes = saveSyncMetadata(key, deviceRegistrationToJson(updated))
+            if (saveRes.isFailure) {
+                Log.w(TAG, "syncDeviceHeartbeat save failed: ${saveRes.exceptionOrNull()?.message}")
+                null
+            } else {
+                updated
+            }
         } catch (e: Exception) {
             Log.w(TAG, "syncDeviceHeartbeat failed: ${e.message}")
             null
@@ -1633,16 +1736,12 @@ class SupabaseService private constructor() {
                 .addHeader("Authorization", "Bearer $SERVICE_ROLE_KEY")
                 .get()
                 .build()
-            val response = executeRequest(req)
-            val bodyStr = response?.body?.string()
-            response?.close()
-            if (bodyStr.isNullOrBlank()) return@withContext emptyList()
-            val arr = JSONArray(bodyStr)
+            val arr = executeJsonArrayGet(req, "fetchAllRegisteredDevices").getOrNull() ?: return@withContext emptyList()
             val deviceMap = mutableMapOf<String, DeviceRegistration>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
-                val key = obj.optString("key", "")
-                val value = obj.optString("value", "")
+                val key = obj.optNonNullString("key", "")
+                val value = obj.optNonNullString("value", "")
                 parseDeviceRegistration(key, value)?.let { reg ->
                     val dedupId = reg.deviceId.ifBlank { key }
                     val current = deviceMap[dedupId]

@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.example.MainActivity
@@ -59,7 +60,7 @@ object AppUpdateNotificationHelper {
         }
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
@@ -78,8 +79,8 @@ object AppUpdateNotificationHelper {
     fun cancelUpdateNotification(context: Context) {
         try {
             NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID)
-        } catch (_: Exception) {
-            // Ignore
+        } catch (e: Exception) {
+            Log.w("AppUpdateNotification", "Failed to cancel update notification: ${e.message}")
         }
     }
 }

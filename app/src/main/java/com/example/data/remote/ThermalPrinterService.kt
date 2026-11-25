@@ -18,9 +18,12 @@ import com.example.data.entity.OrderWithItems
 import com.example.util.EscPosBuilder
 import com.example.util.ThermalImageProcessor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -31,8 +34,13 @@ class ThermalPrinterService(private val context: Context) {
 
     companion object {
         private const val TAG = "ThermalPrinterService"
-        const val ACTION_USB_PERMISSION = "filtr.coffee.staff.USB_PERMISSION"
     }
+
+    private val actionUsbPermission: String
+        get() = "${context.packageName}.USB_PERMISSION"
+
+    private val usbLock = Any()
+    private val printMutex = Mutex()
 
     private val usbManager: UsbManager by lazy {
         context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -62,8 +70,10 @@ class ThermalPrinterService(private val context: Context) {
     // USB permission receiver
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == ACTION_USB_PERMISSION) {
-                synchronized(this) {
+            if (intent.action == actionUsbPermission) {
+                var callbackToInvoke: ((Boolean) -> Unit)? = null
+                var result = false
+                synchronized(usbLock) {
                     val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                     } else {
@@ -74,18 +84,19 @@ class ThermalPrinterService(private val context: Context) {
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                     _permissionPending.value = false
 
-                    if (granted && targetDevice != null) {
+                    result = if (granted && targetDevice != null) {
                         Log.d(TAG, "USB permission granted for ${targetDevice.deviceName}")
-                        val success = openConnection(targetDevice)
-                        pendingPermissionCallback?.invoke(success)
+                        openConnection(targetDevice)
                     } else {
                         Log.w(TAG, "USB permission denied or target device null (granted=$granted)")
-                        pendingPermissionCallback?.invoke(false)
+                        false
                     }
+                    callbackToInvoke = pendingPermissionCallback
                     pendingPermissionCallback = null
                     pendingDevice = null
-                    refreshPrinters()
                 }
+                callbackToInvoke?.invoke(result)
+                refreshPrinters()
             }
         }
     }
@@ -105,7 +116,10 @@ class ThermalPrinterService(private val context: Context) {
                         @Suppress("DEPRECATION")
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     }
-                    if (device != null && device.deviceName == connectedDevice?.deviceName) {
+                    val shouldDisconnect = synchronized(usbLock) {
+                        device != null && device.deviceName == connectedDevice?.deviceName
+                    }
+                    if (shouldDisconnect && device != null) {
                         Log.d(TAG, "Printer disconnected: ${device.deviceName}")
                         disconnect()
                     }
@@ -120,7 +134,7 @@ class ThermalPrinterService(private val context: Context) {
      */
     fun register() {
         try {
-            val permFilter = IntentFilter(ACTION_USB_PERMISSION)
+            val permFilter = IntentFilter(actionUsbPermission)
             val deviceFilter = IntentFilter().apply {
                 addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
                 addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
@@ -217,12 +231,14 @@ class ThermalPrinterService(private val context: Context) {
                 val opened = openConnection(device)
                 callback?.invoke(opened)
             } else {
-                pendingPermissionCallback = callback
-                pendingDevice = device
-                _permissionPending.value = true
+                synchronized(usbLock) {
+                    pendingPermissionCallback = callback
+                    pendingDevice = device
+                    _permissionPending.value = true
+                }
 
                 // On Android 14+ (Target U+), PendingIntent with FLAG_MUTABLE MUST have an explicit intent (setPackage)
-                val intent = Intent(ACTION_USB_PERMISSION).apply {
+                val intent = Intent(actionUsbPermission).apply {
                     setPackage(context.packageName)
                 }
                 val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -235,9 +251,11 @@ class ThermalPrinterService(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in connectToPrinter: ${e.message}", e)
-            _permissionPending.value = false
-            pendingPermissionCallback = null
-            pendingDevice = null
+            synchronized(usbLock) {
+                _permissionPending.value = false
+                pendingPermissionCallback = null
+                pendingDevice = null
+            }
             callback?.invoke(false)
         }
     }
@@ -245,9 +263,14 @@ class ThermalPrinterService(private val context: Context) {
     /**
      * Open USB connection to the device.
      */
-    fun openConnection(device: UsbDevice): Boolean {
+    fun openConnection(device: UsbDevice): Boolean = synchronized(usbLock) {
         try {
             disconnect()
+
+            val connection = usbManager.openDevice(device) ?: run {
+                Log.w(TAG, "usbManager.openDevice returned null")
+                return false
+            }
 
             // Find a suitable interface with a bulk OUT endpoint
             for (i in 0 until device.interfaceCount) {
@@ -256,9 +279,7 @@ class ThermalPrinterService(private val context: Context) {
                     val ep = iface.getEndpoint(j)
                     if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
                         ep.direction == UsbConstants.USB_DIR_OUT) {
-
-                        val connection = usbManager.openDevice(device)
-                        if (connection != null && connection.claimInterface(iface, true)) {
+                        if (connection.claimInterface(iface, true)) {
                             usbConnection = connection
                             usbInterface = iface
                             usbEndpoint = ep
@@ -272,7 +293,8 @@ class ThermalPrinterService(private val context: Context) {
                     }
                 }
             }
-            Log.w(TAG, "No suitable bulk OUT endpoint found on device")
+            connection.close()
+            Log.w(TAG, "No suitable bulk OUT endpoint found or claimInterface failed")
             return false
         } catch (e: Exception) {
             Log.e(TAG, "Failed to connect: ${e.message}", e)
@@ -283,7 +305,7 @@ class ThermalPrinterService(private val context: Context) {
     /**
      * Disconnect from the printer.
      */
-    fun disconnect() {
+    fun disconnect() = synchronized(usbLock) {
         try {
             usbInterface?.let { usbConnection?.releaseInterface(it) }
             usbConnection?.close()
@@ -299,23 +321,24 @@ class ThermalPrinterService(private val context: Context) {
     }
 
     /**
-     * Send raw bytes to the printer.
+     * Send raw bytes to the printer using 5-arg offset bulkTransfer without per-chunk copies.
      */
     private fun sendData(data: ByteArray): Boolean {
-        val connection = usbConnection ?: return false
-        val endpoint = usbEndpoint ?: return false
+        val (connection, endpoint) = synchronized(usbLock) {
+            Pair(usbConnection, usbEndpoint)
+        }
+        if (connection == null || endpoint == null) return false
 
         var offset = 0
         val chunkSize = endpoint.maxPacketSize.coerceAtLeast(64)
         while (offset < data.size) {
             val length = minOf(chunkSize, data.size - offset)
-            val chunk = data.copyOfRange(offset, offset + length)
-            val transferred = connection.bulkTransfer(endpoint, chunk, chunk.size, 5000)
-            if (transferred < 0) {
-                Log.e(TAG, "Bulk transfer failed at offset $offset")
+            val transferred = connection.bulkTransfer(endpoint, data, offset, length, 5000)
+            if (transferred <= 0) {
+                Log.e(TAG, "Bulk transfer failed at offset $offset (transferred=$transferred)")
                 return false
             }
-            offset += length
+            offset += transferred
         }
         return true
     }
@@ -336,62 +359,64 @@ class ThermalPrinterService(private val context: Context) {
         footerLine2: String = "Tag your cup on Instagram @filtr.coffeee",
         footerLine3: String = "Made fresh - Crafted with obsession"
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (!_isConnected.value) {
-            return@withContext Result.failure(Exception("Printer not connected"))
-        }
-
-        try {
-            // === STEP 1: Print Kitchen Token (compact, no pricing) ===
-            val tokenData = EscPosBuilder.buildKitchenToken(orderWithItems)
-            val tokenSent = sendData(tokenData)
-            if (!tokenSent) {
-                return@withContext Result.failure(Exception("Failed to print kitchen token"))
-            }
-            Log.d(TAG, "Kitchen token printed for ${orderWithItems.order.orderId}")
-
-            // Small delay to let printer process and cut
-            Thread.sleep(500)
-
-            // === STEP 2: Print Customer Receipt (full with story photo) ===
-            var photoBytes: ByteArray? = null
-            var photoWidthBytes = 0
-            var photoHeight = 0
-
-            if (storyPhoto != null) {
-                // Full-width 384-dot edge-to-edge printing with 7:4 aspect ratio (compact height)
-                val processed = ThermalImageProcessor.processForThermalAspectRatio(storyPhoto, targetWidth = 384, aspectNumerator = 7, aspectDenominator = 4)
-                photoBytes = processed.data
-                photoWidthBytes = processed.widthBytes
-                photoHeight = processed.heightDots
+        printMutex.withLock {
+            if (!_isConnected.value) {
+                return@withContext Result.failure(Exception("Printer not connected"))
             }
 
-            // Build ESC/POS customer receipt
-            val receiptData = EscPosBuilder.buildReceipt(
-                orderWithItems = orderWithItems,
-                storyPhotoBytes = photoBytes,
-                storyPhotoWidthBytes = photoWidthBytes,
-                storyPhotoHeight = photoHeight,
-                storyTitle = storyTitle,
-                storyCaption = storyCaption,
-                storyDate = storyDate,
-                headerSubtitle = headerSubtitle,
-                tagline = tagline,
-                footerLine1 = footerLine1,
-                footerLine2 = footerLine2,
-                footerLine3 = footerLine3
-            )
+            try {
+                // === STEP 1: Print Kitchen Token (compact, no pricing) ===
+                val tokenData = EscPosBuilder.buildKitchenToken(orderWithItems)
+                val tokenSent = sendData(tokenData)
+                if (!tokenSent) {
+                    return@withContext Result.failure(Exception("Failed to print kitchen token"))
+                }
+                Log.d(TAG, "Kitchen token printed for ${orderWithItems.order.orderId}")
 
-            // Send to printer
-            val success = sendData(receiptData)
-            if (success) {
-                Log.d(TAG, "Customer receipt printed for ${orderWithItems.order.orderId}")
-                Result.success("Token + Receipt printed successfully")
-            } else {
-                Result.failure(Exception("Failed to send receipt data to printer"))
+                // Small delay to let printer process and cut without blocking IO thread pool
+                delay(500)
+
+                // === STEP 2: Print Customer Receipt (full with story photo) ===
+                var photoBytes: ByteArray? = null
+                var photoWidthBytes = 0
+                var photoHeight = 0
+
+                if (storyPhoto != null) {
+                    // Full-width 384-dot edge-to-edge printing with 7:4 aspect ratio (compact height)
+                    val processed = ThermalImageProcessor.processForThermalAspectRatio(storyPhoto, targetWidth = 384, aspectNumerator = 7, aspectDenominator = 4)
+                    photoBytes = processed.data
+                    photoWidthBytes = processed.widthBytes
+                    photoHeight = processed.heightDots
+                }
+
+                // Build ESC/POS customer receipt
+                val receiptData = EscPosBuilder.buildReceipt(
+                    orderWithItems = orderWithItems,
+                    storyPhotoBytes = photoBytes,
+                    storyPhotoWidthBytes = photoWidthBytes,
+                    storyPhotoHeight = photoHeight,
+                    storyTitle = storyTitle,
+                    storyCaption = storyCaption,
+                    storyDate = storyDate,
+                    headerSubtitle = headerSubtitle,
+                    tagline = tagline,
+                    footerLine1 = footerLine1,
+                    footerLine2 = footerLine2,
+                    footerLine3 = footerLine3
+                )
+
+                // Send to printer
+                val success = sendData(receiptData)
+                if (success) {
+                    Log.d(TAG, "Customer receipt printed for ${orderWithItems.order.orderId}")
+                    Result.success("Token + Receipt printed successfully")
+                } else {
+                    Result.failure(Exception("Failed to send receipt data to printer"))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Print error: ${e.message}")
+                Result.failure(e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Print error: ${e.message}")
-            Result.failure(e)
         }
     }
 
@@ -399,34 +424,36 @@ class ThermalPrinterService(private val context: Context) {
      * Print a test page to verify printer connection.
      */
     suspend fun printTestPage(): Result<String> = withContext(Dispatchers.IO) {
-        if (!_isConnected.value) {
-            return@withContext Result.failure(Exception("Printer not connected"))
-        }
+        printMutex.withLock {
+            if (!_isConnected.value) {
+                return@withContext Result.failure(Exception("Printer not connected"))
+            }
 
-        try {
-            val out = java.io.ByteArrayOutputStream()
-            // Init
-            out.write(byteArrayOf(0x1B, 0x40))
-            // Center
-            out.write(byteArrayOf(0x1B, 0x61, 0x01))
-            // Double size
-            out.write(byteArrayOf(0x1D, 0x21, 0x11))
-            out.write("FILTR COFFEE\n".toByteArray())
-            // Normal size
-            out.write(byteArrayOf(0x1D, 0x21, 0x00))
-            out.write("where coffee meets vibe\n\n".toByteArray())
-            out.write("================================\n".toByteArray())
-            out.write("Printer Test Successful!\n".toByteArray())
-            out.write("================================\n\n\n".toByteArray())
-            // Feed + cut
-            out.write(byteArrayOf(0x1B, 0x64, 0x04))
-            out.write(byteArrayOf(0x1D, 0x56, 0x01))
+            try {
+                val out = java.io.ByteArrayOutputStream()
+                // Init
+                out.write(byteArrayOf(0x1B, 0x40))
+                // Center
+                out.write(byteArrayOf(0x1B, 0x61, 0x01))
+                // Double size
+                out.write(byteArrayOf(0x1D, 0x21, 0x11))
+                out.write("FILTR COFFEE\n".toByteArray())
+                // Normal size
+                out.write(byteArrayOf(0x1D, 0x21, 0x00))
+                out.write("where coffee meets vibe\n\n".toByteArray())
+                out.write("================================\n".toByteArray())
+                out.write("Printer Test Successful!\n".toByteArray())
+                out.write("================================\n\n\n".toByteArray())
+                // Feed + cut
+                out.write(byteArrayOf(0x1B, 0x64, 0x04))
+                out.write(byteArrayOf(0x1D, 0x56, 0x01))
 
-            val success = sendData(out.toByteArray())
-            if (success) Result.success("Test page printed")
-            else Result.failure(Exception("Failed to send test data"))
-        } catch (e: Exception) {
-            Result.failure(e)
+                val success = sendData(out.toByteArray())
+                if (success) Result.success("Test page printed")
+                else Result.failure(Exception("Failed to send test data"))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
         }
     }
 }
