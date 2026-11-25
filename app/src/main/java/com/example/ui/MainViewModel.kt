@@ -33,16 +33,23 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import com.example.data.entity.AttendanceLogEntity
 import com.example.data.entity.ChecklistCompletionEntity
 import com.example.data.entity.ChecklistTaskEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryItemEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
+import com.example.domain.attendance.AttendanceCalculator
+import com.example.domain.attendance.GeofenceCheckResult
+import com.example.domain.attendance.MonthlyAttendanceSummary
+import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.kitchen.KitchenCountingMode
 import com.example.domain.kitchen.KitchenInventoryCalculator
 import com.example.domain.kitchen.KitchenSection
 import com.example.domain.kitchen.KitchenShiftType
 import com.example.domain.kitchen.KitchenStockStatus
+import com.example.util.KitchenLocationHelper
+import com.example.util.LocationSample
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -67,6 +74,7 @@ val STAFF_ALLOWED_TABS: Set<FiltrTab> = setOf(
     FiltrTab.ORDERS,
     FiltrTab.CHECKLIST,
     FiltrTab.KITCHEN_INVENTORY,
+    FiltrTab.ATTENDANCE,
     FiltrTab.MANUAL_INVENTORY
 )
 
@@ -92,6 +100,7 @@ enum class FiltrTab {
     VOICE_ORDER,
     CHECKLIST,
     KITCHEN_INVENTORY,
+    ATTENDANCE,
     MANUAL_INVENTORY
 }
 
@@ -242,7 +251,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = FiltrRepository(
         database.menuDao(), database.orderDao(), database.upiAccountDao(),
         database.inventoryDao(), database.customerDao(), database.fixedCostDao(),
-        database.checklistDao(), database.kitchenInventoryDao()
+        database.checklistDao(), database.kitchenInventoryDao(), database.attendanceDao()
     )
 
     private val prefs = application.getSharedPreferences("filtr_prefs", Context.MODE_PRIVATE)
@@ -594,6 +603,183 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
 
+    // ==================== STAFF ATTENDANCE STATE ====================
+
+    private fun loadStoreGeofenceConfigFromPrefs(): StoreGeofenceConfig {
+        val lat = prefs.getString("attendance_store_lat", null)?.toDoubleOrNull() ?: 0.0
+        val lng = prefs.getString("attendance_store_lng", null)?.toDoubleOrNull() ?: 0.0
+        val radius = prefs.getString("attendance_store_radius_m", null)?.toDoubleOrNull() ?: 100.0
+        val label = prefs.getString("attendance_store_label", "FILTR Coffee") ?: "FILTR Coffee"
+        val updatedAt = prefs.getLong("attendance_store_updated_at", 0L)
+        return StoreGeofenceConfig(
+            latitude = lat,
+            longitude = lng,
+            radiusMeters = if (radius > 0.0) radius else 100.0,
+            storeLabel = label.ifBlank { "FILTR Coffee" },
+            updatedAt = updatedAt
+        )
+    }
+
+    private fun persistStoreGeofenceConfig(config: StoreGeofenceConfig) {
+        prefs.edit()
+            .putString("attendance_store_lat", config.latitude.toString())
+            .putString("attendance_store_lng", config.longitude.toString())
+            .putString("attendance_store_radius_m", config.radiusMeters.toString())
+            .putString("attendance_store_label", config.storeLabel.trim().ifBlank { "FILTR Coffee" })
+            .putLong("attendance_store_updated_at", config.updatedAt)
+            .apply()
+    }
+
+    private val _storeGeofenceConfig = MutableStateFlow(loadStoreGeofenceConfigFromPrefs())
+    val storeGeofenceConfig: StateFlow<StoreGeofenceConfig> = _storeGeofenceConfig.asStateFlow()
+
+    private val _hasLocationPermission = MutableStateFlow(
+        KitchenLocationHelper.hasLocationPermission(application)
+    )
+    val hasLocationPermission: StateFlow<Boolean> = _hasLocationPermission.asStateFlow()
+
+    private val _isFetchingLocation = MutableStateFlow(false)
+    val isFetchingLocation: StateFlow<Boolean> = _isFetchingLocation.asStateFlow()
+
+    private val _currentLocationSample = MutableStateFlow<LocationSample?>(null)
+    val currentLocationSample: StateFlow<LocationSample?> = _currentLocationSample.asStateFlow()
+
+    private val _attendanceLocationError = MutableStateFlow<String?>(null)
+    val attendanceLocationError: StateFlow<String?> = _attendanceLocationError.asStateFlow()
+
+    val geofenceCheckResult: StateFlow<GeofenceCheckResult?> = combine(
+        _currentLocationSample,
+        _storeGeofenceConfig
+    ) { sample, config ->
+        if (sample != null && config.isConfigured) {
+            AttendanceCalculator.evaluateGeofence(sample.latitude, sample.longitude, config)
+        } else {
+            null
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    private val _selectedAttendanceMonthKey = MutableStateFlow(currentFormattedDateKey().substring(0, 7))
+    val selectedAttendanceMonthKey: StateFlow<String> = _selectedAttendanceMonthKey.asStateFlow()
+
+    val availableAttendanceStaffNames: StateFlow<List<String>> = combine(
+        repository.allFixedCosts,
+        _uiState.map { it.operatorName to it.registeredDevices }.distinctUntilChanged(),
+        repository.allAttendanceLogs
+    ) { fixedCostsList, (operatorName, registeredDevices), attendanceLogs ->
+        val fromFixedCosts = fixedCostsList.flatMap { fc ->
+            if (fc.staffMembersJson.isNotBlank()) {
+                fc.parseStaffMembers().map { it.name.trim() }
+            } else {
+                emptyList()
+            }
+        }
+        val fromDevices = registeredDevices
+            .filter { it.appRole == "STAFF" }
+            .map { it.operatorName.trim() }
+        val fromLogs = attendanceLogs.map { it.staffName.trim() }
+
+        val combined = (fromFixedCosts + fromDevices + fromLogs + listOf(operatorName.trim()))
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase(Locale.US) }
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+
+        combined.ifEmpty {
+            listOf(operatorName.trim().ifBlank { "Staff" })
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _selectedManagerAttendanceStaff = MutableStateFlow("")
+    val selectedManagerAttendanceStaff: StateFlow<String> = combine(
+        _selectedManagerAttendanceStaff,
+        availableAttendanceStaffNames
+    ) { selected, available ->
+        val cleanSelected = selected.trim()
+        if (cleanSelected.isNotBlank()) {
+            available.firstOrNull { it.equals(cleanSelected, ignoreCase = true) } ?: cleanSelected
+        } else {
+            available.firstOrNull().orEmpty()
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val todayPersonalAttendanceLog: StateFlow<AttendanceLogEntity?> = combine(
+        _activeDateKey,
+        _uiState.map { it.operatorName.trim().ifBlank { "Staff" } }.distinctUntilChanged()
+    ) { activeDateKey, operatorName ->
+        activeDateKey to operatorName
+    }.flatMapLatest { (activeDateKey, operatorName) ->
+        val todayMonthKey = if (activeDateKey.length >= 7) activeDateKey.substring(0, 7) else currentFormattedDateKey().substring(0, 7)
+        val expectedId = AttendanceCalculator.buildLogId(activeDateKey, operatorName)
+        repository.getAttendanceLogsForMonth(todayMonthKey).map { logs ->
+            logs.firstOrNull { it.id == expectedId }
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val personalAttendanceSummary: StateFlow<MonthlyAttendanceSummary> = combine(
+        _selectedAttendanceMonthKey,
+        _uiState.map { it.operatorName.trim().ifBlank { "Staff" } }.distinctUntilChanged(),
+        repository.allAttendanceLogs,
+        _activeDateKey
+    ) { monthKey, staffName, allLogs, activeDateKey ->
+        val targetStaffKey = AttendanceCalculator.normalizeStaffKey(staffName)
+        val logsForStaff = allLogs.filter {
+            AttendanceCalculator.normalizeStaffKey(it.staffName) == targetStaffKey
+        }
+        val trackingStartDateKey = logsForStaff
+            .mapNotNull { it.dateKey.takeIf { key -> key.isNotBlank() } }
+            .minOrNull() ?: "$monthKey-01"
+        AttendanceCalculator.buildMonthlySummary(
+            monthKey = monthKey,
+            staffName = staffName,
+            logs = allLogs,
+            trackingStartDateKey = trackingStartDateKey,
+            todayDateKey = activeDateKey
+        )
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        AttendanceCalculator.buildMonthlySummary(
+            monthKey = currentFormattedDateKey().substring(0, 7),
+            staffName = "Staff",
+            logs = emptyList(),
+            trackingStartDateKey = "${currentFormattedDateKey().substring(0, 7)}-01",
+            todayDateKey = currentFormattedDateKey()
+        )
+    )
+
+    val managerAttendanceSummary: StateFlow<MonthlyAttendanceSummary> = combine(
+        _selectedAttendanceMonthKey,
+        selectedManagerAttendanceStaff,
+        repository.allAttendanceLogs,
+        _activeDateKey
+    ) { monthKey, staffName, allLogs, activeDateKey ->
+        val effectiveStaffName = staffName.trim().ifBlank { "Staff" }
+        val targetStaffKey = AttendanceCalculator.normalizeStaffKey(effectiveStaffName)
+        val logsForStaff = allLogs.filter {
+            AttendanceCalculator.normalizeStaffKey(it.staffName) == targetStaffKey
+        }
+        val trackingStartDateKey = logsForStaff
+            .mapNotNull { it.dateKey.takeIf { key -> key.isNotBlank() } }
+            .minOrNull() ?: "$monthKey-01"
+        AttendanceCalculator.buildMonthlySummary(
+            monthKey = monthKey,
+            staffName = effectiveStaffName,
+            logs = allLogs,
+            trackingStartDateKey = trackingStartDateKey,
+            todayDateKey = activeDateKey
+        )
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        AttendanceCalculator.buildMonthlySummary(
+            monthKey = currentFormattedDateKey().substring(0, 7),
+            staffName = "Staff",
+            logs = emptyList(),
+            trackingStartDateKey = "${currentFormattedDateKey().substring(0, 7)}-01",
+            todayDateKey = currentFormattedDateKey()
+        )
+    )
+
     private var customerSearchJob: Job? = null
     private val connectivityManager =
         application.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
@@ -662,6 +848,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     repository.reconcileChecklistFromCloud(todayDateKey)
                     repository.reconcileKitchenInventoryFromCloud(todayDateKey)
                     refreshPreviousClosingReferenceInternal(todayDateKey)
+                    reconcileAttendanceStoreConfigFromCloud()
+                    repository.reconcileAttendanceFromCloud(todayDateKey.substring(0, 7))
                 } else {
                     Log.w("MainViewModel", "Supabase init failed — falling back to Firestore")
                     initFirestoreFallback()
@@ -708,6 +896,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 try {
                     repository.reconcileChecklistFromCloud(_activeDateKey.value)
                     repository.reconcileKitchenInventoryFromCloud(_activeDateKey.value)
+                    reconcileAttendanceStoreConfigFromCloud()
+                    repository.reconcileAttendanceFromCloud(_activeDateKey.value.substring(0, 7))
                 } catch (e: Exception) {
                     Log.w("MainViewModel", "Periodic checklist reconcile failed: ${e.message}")
                 }
@@ -4144,6 +4334,248 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repository.reconcileKitchenInventoryFromCloud(key)
             refreshPreviousClosingReferenceInternal(key)
         }
+    }
+
+    // ==========================================
+    // STAFF ATTENDANCE ACTIONS
+    // ==========================================
+
+    private suspend fun reconcileAttendanceStoreConfigFromCloud() {
+        try {
+            val cloud = repository.fetchAttendanceStoreConfig()
+            val local = _storeGeofenceConfig.value
+            if (cloud != null) {
+                if (cloud.updatedAt > local.updatedAt || (!local.isConfigured && cloud.isConfigured)) {
+                    persistStoreGeofenceConfig(cloud)
+                    _storeGeofenceConfig.value = cloud
+                } else if (local.isConfigured && local.updatedAt > cloud.updatedAt) {
+                    repository.saveAttendanceStoreConfig(local)
+                }
+            } else if (local.isConfigured) {
+                repository.saveAttendanceStoreConfig(local)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "reconcileAttendanceStoreConfigFromCloud failed: ${e.message}")
+        }
+    }
+
+    fun refreshAttendanceLocationAndSync() {
+        refreshDateKeyIfNeeded()
+        val permitted = KitchenLocationHelper.hasLocationPermission(getApplication())
+        _hasLocationPermission.value = permitted
+
+        viewModelScope.launch {
+            if (permitted) {
+                _isFetchingLocation.value = true
+                _attendanceLocationError.value = null
+                val locResult = KitchenLocationHelper.fetchCurrentLocation(getApplication())
+                _isFetchingLocation.value = false
+                locResult.onSuccess { sample ->
+                    _currentLocationSample.value = sample
+                    _attendanceLocationError.value = null
+                }.onFailure { err ->
+                    _attendanceLocationError.value = err.message ?: "Unable to fetch GPS location"
+                }
+            } else {
+                _isFetchingLocation.value = false
+                _attendanceLocationError.value = null
+            }
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            reconcileAttendanceStoreConfigFromCloud()
+            val selectedMonth = _selectedAttendanceMonthKey.value
+            val todayMonth = _activeDateKey.value.substring(0, 7)
+            repository.reconcileAttendanceFromCloud(selectedMonth)
+            if (todayMonth != selectedMonth) {
+                repository.reconcileAttendanceFromCloud(todayMonth)
+            }
+        }
+    }
+
+    fun onLocationPermissionResult() {
+        _hasLocationPermission.value = KitchenLocationHelper.hasLocationPermission(getApplication())
+        refreshAttendanceLocationAndSync()
+    }
+
+    fun setStoreLocationFromCurrentGps() {
+        if (!requireAdmin("Setting store GPS location")) return
+        val permitted = KitchenLocationHelper.hasLocationPermission(getApplication())
+        _hasLocationPermission.value = permitted
+        if (!permitted) {
+            _uiState.update { it.copy(snackbarMessage = "Location permission is required to set store GPS location.") }
+            return
+        }
+
+        viewModelScope.launch {
+            _isFetchingLocation.value = true
+            _attendanceLocationError.value = null
+            val locResult = KitchenLocationHelper.fetchCurrentLocation(getApplication())
+            _isFetchingLocation.value = false
+            locResult.onSuccess { sample ->
+                _currentLocationSample.value = sample
+                val now = System.currentTimeMillis()
+                val current = _storeGeofenceConfig.value
+                val updated = StoreGeofenceConfig(
+                    latitude = sample.latitude,
+                    longitude = sample.longitude,
+                    radiusMeters = current.radiusMeters,
+                    storeLabel = "FILTR Coffee",
+                    updatedAt = now
+                )
+                persistStoreGeofenceConfig(updated)
+                _storeGeofenceConfig.value = updated
+
+                val saveRes = withContext(Dispatchers.IO) {
+                    repository.saveAttendanceStoreConfig(updated)
+                }
+                val coords = String.format(Locale.US, "%.5f, %.5f", sample.latitude, sample.longitude)
+                val msg = if (saveRes.isSuccess) {
+                    "Store GPS location saved ($coords)"
+                } else {
+                    "Store GPS saved locally ($coords); cloud sync pending"
+                }
+                _uiState.update { it.copy(snackbarMessage = msg) }
+            }.onFailure { err ->
+                val msg = err.message ?: "Failed to obtain current GPS fix"
+                _attendanceLocationError.value = msg
+                _uiState.update { it.copy(snackbarMessage = msg) }
+            }
+        }
+    }
+
+    fun updateStoreRadiusMeters(radiusMeters: Double) {
+        if (!requireAdmin("Updating geofence radius")) return
+        val safeRadius = radiusMeters.coerceAtLeast(10.0)
+        val now = System.currentTimeMillis()
+        val updated = _storeGeofenceConfig.value.copy(
+            radiusMeters = safeRadius,
+            updatedAt = now
+        )
+        persistStoreGeofenceConfig(updated)
+        _storeGeofenceConfig.value = updated
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val saveRes = repository.saveAttendanceStoreConfig(updated)
+            val msg = if (saveRes.isSuccess) {
+                "Geofence radius updated to ${safeRadius.toInt()}m"
+            } else {
+                "Radius updated locally to ${safeRadius.toInt()}m; cloud sync pending"
+            }
+            _uiState.update { it.copy(snackbarMessage = msg) }
+        }
+    }
+
+    fun performStaffCheckIn() {
+        if (!ensureAppAllowed()) return
+        refreshDateKeyIfNeeded()
+        val permitted = KitchenLocationHelper.hasLocationPermission(getApplication())
+        _hasLocationPermission.value = permitted
+        if (!permitted) {
+            _uiState.update { it.copy(snackbarMessage = "Location permission is required for check-in.") }
+            return
+        }
+
+        viewModelScope.launch {
+            _isFetchingLocation.value = true
+            _attendanceLocationError.value = null
+            val locResult = KitchenLocationHelper.fetchCurrentLocation(getApplication())
+            _isFetchingLocation.value = false
+            val sample = locResult.getOrElse { err ->
+                val msg = err.message ?: "Unable to fetch GPS location for check-in"
+                _attendanceLocationError.value = msg
+                _uiState.update { it.copy(snackbarMessage = msg) }
+                return@launch
+            }
+            _currentLocationSample.value = sample
+
+            val dateKey = _activeDateKey.value
+            val monthKey = dateKey.substring(0, 7)
+            val staffName = _uiState.value.operatorName.trim().ifBlank { "Staff" }
+            val config = _storeGeofenceConfig.value
+
+            val res = withContext(Dispatchers.IO) {
+                repository.recordStaffCheckIn(
+                    dateKey = dateKey,
+                    monthKey = monthKey,
+                    staffName = staffName,
+                    deviceId = currentDeviceId,
+                    userLat = sample.latitude,
+                    userLng = sample.longitude,
+                    config = config
+                )
+            }
+            res.onSuccess { log ->
+                _uiState.update {
+                    it.copy(snackbarMessage = "Checked in! (${log.checkInDistanceMeters.toInt()}m from store)")
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(snackbarMessage = err.message ?: "Check-in failed")
+                }
+            }
+        }
+    }
+
+    fun performStaffCheckOut() {
+        if (!ensureAppAllowed()) return
+        refreshDateKeyIfNeeded()
+        val permitted = KitchenLocationHelper.hasLocationPermission(getApplication())
+        _hasLocationPermission.value = permitted
+        if (!permitted) {
+            _uiState.update { it.copy(snackbarMessage = "Location permission is required for check-out.") }
+            return
+        }
+
+        viewModelScope.launch {
+            _isFetchingLocation.value = true
+            _attendanceLocationError.value = null
+            val locResult = KitchenLocationHelper.fetchCurrentLocation(getApplication())
+            _isFetchingLocation.value = false
+            val sample = locResult.getOrElse { err ->
+                val msg = err.message ?: "Unable to fetch GPS location for check-out"
+                _attendanceLocationError.value = msg
+                _uiState.update { it.copy(snackbarMessage = msg) }
+                return@launch
+            }
+            _currentLocationSample.value = sample
+
+            val dateKey = _activeDateKey.value
+            val staffName = _uiState.value.operatorName.trim().ifBlank { "Staff" }
+            val config = _storeGeofenceConfig.value
+
+            val res = withContext(Dispatchers.IO) {
+                repository.recordStaffCheckOut(
+                    dateKey = dateKey,
+                    staffName = staffName,
+                    userLat = sample.latitude,
+                    userLng = sample.longitude,
+                    config = config
+                )
+            }
+            res.onSuccess { log ->
+                val duration = AttendanceCalculator.formatWorkedDuration(log.workedMinutes)
+                _uiState.update {
+                    it.copy(snackbarMessage = "Checked out! Worked $duration today")
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(snackbarMessage = err.message ?: "Check-out failed")
+                }
+            }
+        }
+    }
+
+    fun selectAttendanceMonth(monthKey: String) {
+        refreshDateKeyIfNeeded()
+        _selectedAttendanceMonthKey.value = monthKey
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.reconcileAttendanceFromCloud(monthKey)
+        }
+    }
+
+    fun selectManagerAttendanceStaff(staffName: String) {
+        _selectedManagerAttendanceStaff.value = staffName
     }
 
     companion object {

@@ -1,6 +1,8 @@
 package com.example.domain.attendance
 
 import com.example.data.entity.AttendanceLogEntity
+import com.example.ui.FiltrTab
+import com.example.ui.STAFF_ALLOWED_TABS
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -182,5 +184,10 @@ class AttendanceDomainTest {
         )
         assertTrue(invalidSummary.days.isEmpty())
         assertEquals(0, invalidSummary.attendancePercent)
+    }
+
+    @Test
+    fun `attendance tab is included in staff allowed tabs`() {
+        assertTrue(FiltrTab.ATTENDANCE in STAFF_ALLOWED_TABS)
     }
 }

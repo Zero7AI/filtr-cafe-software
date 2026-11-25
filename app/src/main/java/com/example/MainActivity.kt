@@ -45,6 +45,7 @@ import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Inventory
 import androidx.compose.material.icons.filled.Kitchen
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.People
@@ -111,6 +112,7 @@ import com.example.ui.components.SettingsDialog
 import com.example.ui.components.VoiceOrderMicButton
 import com.example.ui.components.VoiceOrderReviewDialog
 import com.example.ui.screens.AddStockDialog
+import com.example.ui.screens.AttendanceScreen
 import com.example.ui.screens.BillingScreen
 import com.example.ui.screens.ChecklistScreen
 import com.example.ui.screens.CustomersScreen
@@ -171,6 +173,9 @@ class MainActivity : ComponentActivity() {
                 val permissionsLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
                 ) { _ -> }
+                val locationPermissionsLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestMultiplePermissions()
+                ) { viewModel.onLocationPermissionResult() }
                 LaunchedEffect(uiState.deviceAccessStatus) {
                     if (uiState.deviceAccessStatus == "ACTIVE") {
                         val neededPermissions = buildList {
@@ -204,6 +209,12 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(isStaffMode, uiState.currentTab) {
                     if (isStaffMode && uiState.currentTab !in STAFF_ALLOWED_TABS) {
                         viewModel.selectTab(FiltrTab.BILLING)
+                    }
+                }
+
+                LaunchedEffect(uiState.currentTab) {
+                    if (uiState.currentTab == FiltrTab.ATTENDANCE) {
+                        viewModel.refreshAttendanceLocationAndSync()
                     }
                 }
 
@@ -323,6 +334,25 @@ class MainActivity : ComponentActivity() {
                                         colors = NavigationDrawerItemDefaults.colors(
                                             selectedContainerColor = Color(0xFF38BDF8).copy(alpha = 0.2f),
                                             selectedIconColor = Color(0xFF38BDF8),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Staff Attendance", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.LocationOn, contentDescription = null, tint = Color(0xFF34D399)) },
+                                        selected = uiState.currentTab == FiltrTab.ATTENDANCE,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.ATTENDANCE)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFF34D399).copy(alpha = 0.2f),
+                                            selectedIconColor = Color(0xFF34D399),
                                             selectedTextColor = Color.White,
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
@@ -509,6 +539,25 @@ class MainActivity : ComponentActivity() {
                                         colors = NavigationDrawerItemDefaults.colors(
                                             selectedContainerColor = Color(0xFF38BDF8).copy(alpha = 0.2f),
                                             selectedIconColor = Color(0xFF38BDF8),
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Staff Attendance", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.LocationOn, contentDescription = null, tint = Color(0xFF34D399)) },
+                                        selected = uiState.currentTab == FiltrTab.ATTENDANCE,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.ATTENDANCE)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFF34D399).copy(alpha = 0.2f),
+                                            selectedIconColor = Color(0xFF34D399),
                                             selectedTextColor = Color.White,
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
@@ -1262,6 +1311,52 @@ class MainActivity : ComponentActivity() {
                                             )
                                         },
                                         onRefresh = { viewModel.refreshKitchenInventory() }
+                                    )
+                                }
+                                FiltrTab.ATTENDANCE -> {
+                                    val storeConfig by viewModel.storeGeofenceConfig.collectAsStateWithLifecycle()
+                                    val hasLocationPermission by viewModel.hasLocationPermission.collectAsStateWithLifecycle()
+                                    val isFetchingLocation by viewModel.isFetchingLocation.collectAsStateWithLifecycle()
+                                    val currentLocation by viewModel.currentLocationSample.collectAsStateWithLifecycle()
+                                    val geofenceResult by viewModel.geofenceCheckResult.collectAsStateWithLifecycle()
+                                    val locationError by viewModel.attendanceLocationError.collectAsStateWithLifecycle()
+                                    val selectedMonthKey by viewModel.selectedAttendanceMonthKey.collectAsStateWithLifecycle()
+                                    val availableStaffNames by viewModel.availableAttendanceStaffNames.collectAsStateWithLifecycle()
+                                    val selectedManagerStaffName by viewModel.selectedManagerAttendanceStaff.collectAsStateWithLifecycle()
+                                    val personalSummary by viewModel.personalAttendanceSummary.collectAsStateWithLifecycle()
+                                    val managerSummary by viewModel.managerAttendanceSummary.collectAsStateWithLifecycle()
+                                    val todayPersonalLog by viewModel.todayPersonalAttendanceLog.collectAsStateWithLifecycle()
+
+                                    AttendanceScreen(
+                                        isManager = !isStaffMode,
+                                        currentStaffName = uiState.operatorName.ifBlank { uiState.currentRole },
+                                        storeConfig = storeConfig,
+                                        hasLocationPermission = hasLocationPermission,
+                                        isFetchingLocation = isFetchingLocation,
+                                        currentLocation = currentLocation,
+                                        geofenceResult = geofenceResult,
+                                        locationError = locationError,
+                                        selectedMonthKey = selectedMonthKey,
+                                        availableStaffNames = availableStaffNames,
+                                        selectedManagerStaffName = selectedManagerStaffName,
+                                        personalSummary = personalSummary,
+                                        managerSummary = managerSummary,
+                                        todayPersonalLog = todayPersonalLog,
+                                        onRequestLocationPermission = {
+                                            locationPermissionsLauncher.launch(
+                                                arrayOf(
+                                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                                )
+                                            )
+                                        },
+                                        onRefreshLocationAndSync = { viewModel.refreshAttendanceLocationAndSync() },
+                                        onCheckIn = { viewModel.performStaffCheckIn() },
+                                        onCheckOut = { viewModel.performStaffCheckOut() },
+                                        onSelectMonth = { viewModel.selectAttendanceMonth(it) },
+                                        onSelectManagerStaff = { viewModel.selectManagerAttendanceStaff(it) },
+                                        onSetStoreLocationHere = { viewModel.setStoreLocationFromCurrentGps() },
+                                        onChangeRadiusMeters = { viewModel.updateStoreRadiusMeters(it) }
                                     )
                                 }
                                 FiltrTab.MANUAL_INVENTORY -> {
