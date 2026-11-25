@@ -1582,6 +1582,24 @@ class SupabaseService private constructor() {
         saveSyncMetadata("kitchen_inv_shift_index", json)
     }
 
+    // ==================== STAFF ATTENDANCE CLOUD SYNC (via sync_metadata) ====================
+
+    suspend fun fetchAttendanceStoreConfig(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("attendance_store_config")
+    }
+
+    suspend fun saveAttendanceStoreConfig(json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("attendance_store_config", json)
+    }
+
+    suspend fun fetchAttendanceMonthLogs(monthKey: String): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("attendance_month_$monthKey")
+    }
+
+    suspend fun saveAttendanceMonthLogs(monthKey: String, json: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("attendance_month_$monthKey", json)
+    }
+
     // ==================== DEEPGRAM REMOTE CONFIG ====================
 
     data class DeepgramConfig(
