@@ -88,4 +88,7 @@ interface OrderDao {
 
     @Query("SELECT orderId FROM orders WHERE timestamp >= :startOfDayTimestamp")
     suspend fun getTodayOrderIds(startOfDayTimestamp: Long): List<String>
+
+    @Query("SELECT * FROM orders WHERE timestamp >= :startTimestamp")
+    suspend fun getOrdersSince(startTimestamp: Long): List<OrderEntity>
 }

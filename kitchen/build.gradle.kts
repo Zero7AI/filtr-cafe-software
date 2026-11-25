@@ -10,27 +10,33 @@ android {
 
   defaultConfig {
     applicationId = "filtr.coffee.kitchen"
-    minSdk = 22
+    minSdk = 24
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"
   }
 
+  val debugKeystoreFile = file("${rootDir}/debug.keystore")
+
   signingConfigs {
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+    if (debugKeystoreFile.exists()) {
+      create("debugConfig") {
+        storeFile = debugKeystoreFile
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
   }
 
   buildTypes {
     release {
       isMinifyEnabled = false
-      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      signingConfigs.findByName("debugConfig")?.let { signingConfig = it }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -38,6 +44,12 @@ android {
   }
   buildFeatures {
     compose = true
+    buildConfig = true
+  }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+    }
   }
 }
 
@@ -62,4 +74,10 @@ dependencies {
   implementation(libs.okhttp)
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
+
+  testImplementation(libs.junit)
+  testImplementation(libs.kotlinx.coroutines.test)
+  testImplementation(libs.androidx.core)
+  testImplementation(libs.androidx.junit)
+  testImplementation(libs.robolectric)
 }

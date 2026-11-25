@@ -1,40 +1,75 @@
 package com.example.kitchen.ui.screens
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.ShoppingCart
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.kitchen.data.entity.MenuItemEntity
-import com.example.kitchen.ui.theme.*
+import com.example.kitchen.ui.theme.CreamBackground
+import com.example.kitchen.ui.theme.ShadcnBlack
+import com.example.kitchen.ui.theme.ShadcnBorder
+import com.example.kitchen.ui.theme.ShadcnMutedBg
+import com.example.kitchen.ui.theme.ShadcnMutedText
+import com.example.kitchen.ui.theme.ShadcnWhite
+import com.example.kitchen.ui.theme.StatusGreen
+import com.example.kitchen.ui.theme.StatusRed
 
 @Composable
 fun OrderScreen(
     menuItems: List<MenuItemEntity>,
-    cartItems: Map<MenuItemEntity, Int>,
+    cartItems: Map<Int, Int>,
     customerName: String,
     contactNumber: String,
     orderNotes: String,
@@ -61,11 +96,23 @@ fun OrderScreen(
         else menuItems.filter { it.category.equals(selectedCategory, ignoreCase = true) }
     }
 
-    val totalAmount = remember(cartItems) {
-        cartItems.entries.sumOf { (item, qty) -> item.price * qty }
+    val menuById = remember(menuItems) {
+        menuItems.associateBy { it.id }
     }
-    val totalItemCount = remember(cartItems) {
-        cartItems.values.sum()
+
+    val resolvedCartEntries = remember(cartItems, menuById) {
+        cartItems.entries.mapNotNull { (menuItemId, qty) ->
+            if (qty <= 0) return@mapNotNull null
+            val item = menuById[menuItemId] ?: return@mapNotNull null
+            item to qty
+        }
+    }
+
+    val totalAmount = remember(resolvedCartEntries) {
+        resolvedCartEntries.sumOf { (item, qty) -> item.price * qty }
+    }
+    val totalItemCount = remember(resolvedCartEntries) {
+        resolvedCartEntries.sumOf { (_, qty) -> qty }
     }
 
     Row(
@@ -85,12 +132,12 @@ fun OrderScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                items(categories) { category ->
+                items(categories, key = { it }) { category ->
                     val isSelected = selectedCategory == category
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = if (isSelected) ShadcnBlack else ShadcnWhite,
-                        border = androidx.compose.foundation.BorderStroke(
+                        border = BorderStroke(
                             1.dp,
                             if (isSelected) ShadcnBlack else ShadcnBorder
                         ),
@@ -119,7 +166,7 @@ fun OrderScreen(
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(filteredItems, key = { it.id }) { item ->
-                    val currentQty = cartItems[item] ?: 0
+                    val currentQty = cartItems[item.id] ?: 0
 
                     Card(
                         modifier = Modifier
@@ -260,7 +307,7 @@ fun OrderScreen(
                         )
                     }
 
-                    if (cartItems.isNotEmpty()) {
+                    if (resolvedCartEntries.isNotEmpty()) {
                         TextButton(
                             onClick = onClearCart,
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
@@ -286,7 +333,6 @@ fun OrderScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Customer Name Input
                     OutlinedTextField(
                         value = customerName,
                         onValueChange = onCustomerNameChange,
@@ -301,7 +347,6 @@ fun OrderScreen(
                         )
                     )
 
-                    // Contact Phone Input
                     OutlinedTextField(
                         value = contactNumber,
                         onValueChange = onContactNumberChange,
@@ -316,7 +361,6 @@ fun OrderScreen(
                         )
                     )
 
-                    // Notes Input
                     OutlinedTextField(
                         value = orderNotes,
                         onValueChange = onOrderNotesChange,
@@ -339,7 +383,7 @@ fun OrderScreen(
                         color = ShadcnMutedText
                     )
 
-                    if (cartItems.isEmpty()) {
+                    if (resolvedCartEntries.isEmpty()) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -348,13 +392,13 @@ fun OrderScreen(
                         ) {
                             Text(
                                 text = "Cart is empty.\nTap items on the left to add.",
-                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                textAlign = TextAlign.Center,
                                 color = ShadcnMutedText,
                                 fontSize = 13.sp
                             )
                         }
                     } else {
-                        cartItems.forEach { (item, qty) ->
+                        resolvedCartEntries.forEach { (item, qty) ->
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -434,7 +478,7 @@ fun OrderScreen(
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp,
                             modifier = Modifier.padding(vertical = 10.dp),
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            textAlign = TextAlign.Center
                         )
                     }
 
@@ -453,7 +497,7 @@ fun OrderScreen(
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp,
                             modifier = Modifier.padding(vertical = 10.dp),
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            textAlign = TextAlign.Center
                         )
                     }
                 }
@@ -478,7 +522,7 @@ fun OrderScreen(
 
                     Button(
                         onClick = onSubmitOrder,
-                        enabled = cartItems.isNotEmpty() && !isPlacingOrder,
+                        enabled = resolvedCartEntries.isNotEmpty() && !isPlacingOrder,
                         shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = StatusGreen,

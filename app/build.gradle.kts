@@ -11,7 +11,7 @@ plugins {
 
 android {
   namespace = "com.example"
-  compileSdk { version = release(36) { minorApiLevel = 1 } }
+  compileSdk = 36
 
   defaultConfig {
     applicationId = "filtr.coffee"
@@ -23,19 +23,32 @@ android {
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
+  val releaseKeystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
+  val releaseKeystoreFile = file(releaseKeystorePath)
+  val releaseStorePassword = System.getenv("STORE_PASSWORD")
+  val releaseKeyPassword = System.getenv("KEY_PASSWORD")
+  val hasReleaseSigning =
+    releaseKeystoreFile.exists() &&
+      !releaseStorePassword.isNullOrBlank() &&
+      !releaseKeyPassword.isNullOrBlank()
+  val debugKeystoreFile = file("${rootDir}/debug.keystore")
+
   signingConfigs {
-    create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+    if (hasReleaseSigning) {
+      create("release") {
+        storeFile = releaseKeystoreFile
+        storePassword = releaseStorePassword
+        keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
+        keyPassword = releaseKeyPassword
+      }
     }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+    if (debugKeystoreFile.exists()) {
+      create("debugConfig") {
+        storeFile = debugKeystoreFile
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
   }
 
@@ -44,9 +57,13 @@ android {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      if (hasReleaseSigning) {
+        signingConfig = signingConfigs.getByName("release")
+      }
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      signingConfigs.findByName("debugConfig")?.let { signingConfig = it }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -99,8 +116,6 @@ dependencies {
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
   implementation(libs.coil.compose)
-  implementation(libs.converter.moshi)
-  implementation(libs.firebase.ai)
   implementation(libs.firebase.firestore)
 
   implementation(libs.firebase.auth)
@@ -108,12 +123,11 @@ dependencies {
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.logging.interceptor)
-  implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
   implementation(libs.zxing.core)
   // implementation(libs.play.services.location)
   // On-Device Neural Voice Activity Detector (Silero VAD v5 ONNX - 2.3 MB, <0.5ms inference)
-  implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
+  implementation(libs.onnxruntime.android)
 
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
@@ -132,5 +146,4 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
-  "ksp"(libs.moshi.kotlin.codegen)
 }

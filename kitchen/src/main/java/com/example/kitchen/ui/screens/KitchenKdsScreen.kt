@@ -103,7 +103,7 @@ fun KitchenKdsScreen(
                 // Right: Helper instruction
                 Text(
                     text = if (selectedSubTab == KdsSubTab.PENDING)
-                        "👆 Touch any order card to mark it READY"
+                        "👆 Tap 'Mark Ready' on an order when finished"
                     else
                         "Orders finished today in the kitchen",
                     color = ShadcnMutedText,

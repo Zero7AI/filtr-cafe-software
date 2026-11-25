@@ -48,7 +48,12 @@ fun KitchenTopBar(
         }
     }
 
-    Column(modifier = Modifier.fillMaxWidth()) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(ShadcnBlack)
+            .statusBarsPadding()
+    ) {
         // Prominent Alert Banner when NOT connected
         AnimatedVisibility(
             visible = connectionStatus != CloudConnectionStatus.CONNECTED,

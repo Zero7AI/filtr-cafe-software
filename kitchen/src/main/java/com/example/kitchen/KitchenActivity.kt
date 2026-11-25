@@ -1,8 +1,11 @@
 package com.example.kitchen
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -31,6 +34,10 @@ class KitchenActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         setContent {
             FiltrKitchenTheme {
@@ -100,7 +107,9 @@ class KitchenActivity : ComponentActivity() {
 
                         // Settings Dialog (Google Sheets Webhook Configuration)
                         if (uiState.showSettingsDialog) {
-                            var tempUrl by remember { mutableStateOf(uiState.sheetsWebhookUrl) }
+                            var tempUrl by remember(uiState.showSettingsDialog, uiState.sheetsWebhookUrl) {
+                                mutableStateOf(uiState.sheetsWebhookUrl)
+                            }
 
                             AlertDialog(
                                 onDismissRequest = { viewModel.closeSettings() },
