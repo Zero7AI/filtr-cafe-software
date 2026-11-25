@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Calendar
 import kotlin.math.cos
 
 class AttendanceDomainTest {
@@ -137,7 +138,7 @@ class AttendanceDomainTest {
         )
 
         // Tracking started on 2026-11-10, today is 2026-11-12:
-        // Days 1..9 -> UPCOMING, Day 10 -> PRESENT, Day 11 -> ABSENT (RED), Day 12 -> ON_DUTY, Days 13..30 -> UPCOMING
+        // Days 1..9 -> NOT_JOINED, Day 10 -> PRESENT, Day 11 -> ABSENT (RED), Day 12 -> ON_DUTY, Days 13..30 -> UPCOMING
         val summary = AttendanceCalculator.buildMonthlySummary(
             monthKey = "2026-11",
             staffName = "Rohan",
@@ -147,7 +148,7 @@ class AttendanceDomainTest {
         )
 
         assertEquals(30, summary.days.size)
-        assertEquals(DayAttendanceStatus.UPCOMING, summary.days[8].status) // Nov 9
+        assertEquals(DayAttendanceStatus.NOT_JOINED, summary.days[8].status) // Nov 9
         assertEquals(DayAttendanceStatus.PRESENT, summary.days[9].status)  // Nov 10
         assertEquals(DayAttendanceStatus.ABSENT, summary.days[10].status)  // Nov 11
         assertEquals(DayAttendanceStatus.ON_DUTY, summary.days[11].status) // Nov 12
@@ -184,6 +185,47 @@ class AttendanceDomainTest {
         )
         assertTrue(invalidSummary.days.isEmpty())
         assertEquals(0, invalidSummary.attendancePercent)
+    }
+
+    @Test
+    fun `weeklyOffDayOfWeek marks unpunched Sundays as WEEKLY_OFF and punched Sundays as PRESENT`() {
+        // In Nov 2026, Sundays are Nov 1, 8, 15, 22, 29.
+        val logs = listOf(
+            // Nov 15 (Sunday): worked 6h -> should still mark PRESENT (GREEN), not WEEKLY_OFF
+            AttendanceLogEntity(
+                id = "2026-11-15_rohan",
+                dateKey = "2026-11-15",
+                monthKey = "2026-11",
+                staffName = "Rohan",
+                checkInTimestamp = 1_000_000L,
+                checkOutTimestamp = 1_000_000L + 360 * 60_000L,
+                workedMinutes = 360,
+                updatedAt = 2_000_000L
+            )
+        )
+
+        val summary = AttendanceCalculator.buildMonthlySummary(
+            monthKey = "2026-11",
+            staffName = "Rohan",
+            logs = logs,
+            trackingStartDateKey = "2026-11-02",
+            todayDateKey = "2026-11-16",
+            weeklyOffDayOfWeek = Calendar.SUNDAY
+        )
+
+        assertEquals(DayAttendanceStatus.NOT_JOINED, summary.days[0].status)  // Nov 1 (Sunday before join)
+        assertEquals(DayAttendanceStatus.ABSENT, summary.days[1].status)      // Nov 2 (Mon)
+        assertEquals(DayAttendanceStatus.WEEKLY_OFF, summary.days[7].status)  // Nov 8 (Sunday unpunched)
+        assertEquals(DayAttendanceStatus.PRESENT, summary.days[14].status)    // Nov 15 (Sunday worked)
+        assertEquals(DayAttendanceStatus.ABSENT, summary.days[15].status)     // Nov 16 (Mon)
+        assertEquals(DayAttendanceStatus.UPCOMING, summary.days[21].status)   // Nov 22 (Future Sunday)
+
+        // Evaluated days from Nov 2..16 = 15 days; Nov 8 is WEEKLY_OFF (excluded), Nov 15 is PRESENT -> 13 ABSENT
+        assertEquals(1, summary.presentDays)
+        assertEquals(13, summary.absentDays)
+        assertEquals(1, summary.completedShifts)
+        assertEquals(360, summary.totalWorkedMinutes)
+        assertEquals(7, summary.attendancePercent) // (1 * 100) / 14
     }
 
     @Test

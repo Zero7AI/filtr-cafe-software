@@ -35,6 +35,7 @@ import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
+import com.example.data.entity.StaffRosterEntity
 import com.example.data.entity.UpiAccountEntity
 import com.example.data.remote.DeepgramVoiceService
 import com.example.data.remote.FirestoreService
@@ -131,6 +132,8 @@ class FiltrRepository(
     val allKitchenShifts: Flow<List<KitchenInventoryShiftEntity>> = kitchenInventoryDao?.getAllShifts() ?: flowOf(emptyList())
     val allKitchenEntries: Flow<List<KitchenInventoryEntryEntity>> = kitchenInventoryDao?.getAllEntries() ?: flowOf(emptyList())
     val allAttendanceLogs: Flow<List<AttendanceLogEntity>> = attendanceDao?.getAllLogs() ?: flowOf(emptyList())
+    val allStaffRoster: Flow<List<StaffRosterEntity>> = attendanceDao?.getAllRosterMembers() ?: flowOf(emptyList())
+    val activeStaffRoster: Flow<List<StaffRosterEntity>> = attendanceDao?.getActiveRosterMembers() ?: flowOf(emptyList())
 
     fun getAttendanceLogsForMonth(monthKey: String): Flow<List<AttendanceLogEntity>> {
         return attendanceDao?.getLogsForMonth(monthKey) ?: flowOf(emptyList())
@@ -2992,6 +2995,131 @@ class FiltrRepository(
             } catch (e: Exception) {
                 Log.w(TAG, "reconcileAttendanceFromCloud($monthKey) failed: ${e.message}")
             }
+            reconcileStaffRosterFromCloudLocked()
+        }
+    }
+
+    // ==================== STAFF ROSTER ====================
+
+    suspend fun saveStaffRosterMember(member: StaffRosterEntity): Result<Unit> {
+        val dao = attendanceDao ?: return Result.failure(IllegalStateException("AttendanceDao unavailable"))
+        return try {
+            val cleanName = member.name.trim()
+            if (cleanName.isBlank()) {
+                return Result.failure(IllegalArgumentException("Staff name cannot be blank"))
+            }
+            val resolvedId = member.id.trim().ifBlank {
+                AttendanceCalculator.normalizeStaffKey(cleanName)
+            }
+            val updatedMember = member.copy(
+                id = resolvedId,
+                name = cleanName,
+                roleTitle = member.roleTitle.trim().ifBlank { "Barista" },
+                shiftLabel = member.shiftLabel.trim().ifBlank { "Full Day" },
+                joinedDateKey = member.joinedDateKey.trim(),
+                updatedAt = if (member.updatedAt > 0L) member.updatedAt else System.currentTimeMillis()
+            )
+            dao.upsertRosterMember(updatedMember)
+            launchManagedSync {
+                attendanceSyncMutex.withLock {
+                    syncStaffRosterToCloud()
+                }
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveStaffRosterMember error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    private fun staffRosterToJson(member: StaffRosterEntity): JSONObject {
+        return JSONObject().apply {
+            put("id", member.id)
+            put("name", member.name)
+            put("roleTitle", member.roleTitle)
+            put("shiftLabel", member.shiftLabel)
+            put("weeklyOffDayOfWeek", member.weeklyOffDayOfWeek)
+            put("joinedDateKey", member.joinedDateKey)
+            put("isActive", member.isActive)
+            put("updatedAt", member.updatedAt)
+        }
+    }
+
+    private fun staffRosterFromJson(o: JSONObject): StaffRosterEntity? {
+        val id = o.optNonNullString("id", "").trim()
+        val name = o.optNonNullString("name", "").trim()
+        if (id.isBlank() || name.isBlank()) return null
+        return StaffRosterEntity(
+            id = id,
+            name = name,
+            roleTitle = o.optNonNullString("roleTitle", "Barista").ifBlank { "Barista" },
+            shiftLabel = o.optNonNullString("shiftLabel", "Full Day").ifBlank { "Full Day" },
+            weeklyOffDayOfWeek = o.optInt("weeklyOffDayOfWeek", 0),
+            joinedDateKey = o.optNonNullString("joinedDateKey", ""),
+            isActive = o.optBoolean("isActive", true),
+            updatedAt = o.optLong("updatedAt", 0L)
+        )
+    }
+
+    private suspend fun syncStaffRosterToCloud() {
+        val dao = attendanceDao ?: return
+        try {
+            val members = dao.getAllRosterMembersSync()
+            val arr = JSONArray()
+            for (member in members) {
+                arr.put(staffRosterToJson(member))
+            }
+            supabaseService.saveAttendanceStaffRoster(arr.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "syncStaffRosterToCloud failed: ${e.message}")
+        }
+    }
+
+    suspend fun reconcileStaffRosterFromCloud() {
+        attendanceDao ?: return
+        attendanceSyncMutex.withLock {
+            reconcileStaffRosterFromCloudLocked()
+        }
+    }
+
+    private suspend fun reconcileStaffRosterFromCloudLocked() {
+        val dao = attendanceDao ?: return
+        try {
+            val rawJson = supabaseService.fetchAttendanceStaffRoster()
+            val localMembers = dao.getAllRosterMembersSync()
+            if (!rawJson.isNullOrBlank() && rawJson.startsWith("[")) {
+                val arr = JSONArray(rawJson)
+                val localById = localMembers.associateBy { it.id }
+                val cloudIds = mutableSetOf<String>()
+                val toUpsert = mutableListOf<StaffRosterEntity>()
+                var localHasNewer = false
+
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val cloudMember = staffRosterFromJson(o) ?: continue
+                    cloudIds.add(cloudMember.id)
+                    val local = localById[cloudMember.id]
+                    if (local == null || cloudMember.updatedAt > local.updatedAt) {
+                        toUpsert.add(cloudMember)
+                    } else if (local.updatedAt > cloudMember.updatedAt) {
+                        localHasNewer = true
+                    }
+                }
+
+                if (toUpsert.isNotEmpty()) {
+                    dao.upsertRosterMembers(toUpsert)
+                }
+                if (localMembers.any { it.id !in cloudIds }) {
+                    localHasNewer = true
+                }
+                if (localHasNewer) {
+                    syncStaffRosterToCloud()
+                }
+            } else if (localMembers.isNotEmpty()) {
+                syncStaffRosterToCloud()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "reconcileStaffRosterFromCloud failed: ${e.message}")
         }
     }
 }

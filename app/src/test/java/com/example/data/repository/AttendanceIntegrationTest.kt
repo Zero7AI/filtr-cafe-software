@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.database.FiltrDatabase
 import com.example.data.entity.AttendanceLogEntity
+import com.example.data.entity.StaffRosterEntity
 import com.example.data.remote.SupabaseService
 import com.example.domain.attendance.StoreGeofenceConfig
 import kotlinx.coroutines.CoroutineScope
@@ -32,6 +33,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.net.URLDecoder
+import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.cos
 
@@ -401,5 +403,144 @@ class AttendanceIntegrationTest {
         assertEquals(360, uploadedMap["2026-11-21_asha"]!!.getInt("workedMinutes"))
         assertEquals(9000L, uploadedMap["2026-11-22_vikram"]!!.getLong("updatedAt"))
         assertEquals(7000L, uploadedMap["2026-11-23_priya"]!!.getLong("updatedAt"))
+    }
+
+    @Test
+    fun `saveStaffRosterMember filters activeStaffRoster and reconcileStaffRosterFromCloud merges by updatedAt`() = runTest {
+        val dao = db.attendanceDao()
+
+        // 1. Save active and inactive members through repository
+        val saveRohan = repository.saveStaffRosterMember(
+            StaffRosterEntity(
+                id = "rohan",
+                name = "  Rohan ",
+                roleTitle = "Barista",
+                shiftLabel = "Morning",
+                weeklyOffDayOfWeek = Calendar.SUNDAY,
+                joinedDateKey = "2026-11-01",
+                isActive = true,
+                updatedAt = 1000L
+            )
+        )
+        assertTrue(saveRohan.isSuccess)
+
+        val saveInactive = repository.saveStaffRosterMember(
+            StaffRosterEntity(
+                id = "kiran",
+                name = "Kiran",
+                roleTitle = "Helper",
+                shiftLabel = "Evening",
+                weeklyOffDayOfWeek = Calendar.MONDAY,
+                joinedDateKey = "2026-10-01",
+                isActive = false,
+                updatedAt = 0L // Should auto-populate > 0L
+            )
+        )
+        assertTrue(saveInactive.isSuccess)
+
+        val saveAsha = repository.saveStaffRosterMember(
+            StaffRosterEntity(
+                id = "asha",
+                name = "Asha",
+                roleTitle = "Manager",
+                shiftLabel = "Full Day",
+                weeklyOffDayOfWeek = Calendar.WEDNESDAY,
+                joinedDateKey = "2026-10-15",
+                isActive = true,
+                updatedAt = 8000L
+            )
+        )
+        assertTrue(saveAsha.isSuccess)
+
+        val activeList = repository.activeStaffRoster.first()
+        assertEquals(listOf("Asha", "Rohan"), activeList.map { it.name })
+        assertTrue(dao.getRosterMemberById("kiran")!!.updatedAt > 0L)
+
+        // 2. Seed cloud roster:
+        //    - rohan (updatedAt = 5000 > local 1000) -> cloud wins in Room
+        //    - asha (updatedAt = 3000 < local 8000) -> local wins and pushes to cloud
+        //    - priya (cloud-only, updatedAt = 7000) -> inserted into Room
+        val cloudArr = JSONArray().apply {
+            put(JSONObject().apply {
+                put("id", "rohan")
+                put("name", "Rohan")
+                put("roleTitle", "Senior Barista")
+                put("shiftLabel", "Full Day")
+                put("weeklyOffDayOfWeek", Calendar.TUESDAY)
+                put("joinedDateKey", "2026-11-01")
+                put("isActive", true)
+                put("updatedAt", 5000L)
+            })
+            put(JSONObject().apply {
+                put("id", "asha")
+                put("name", "Asha")
+                put("roleTitle", "Barista")
+                put("shiftLabel", "Morning")
+                put("weeklyOffDayOfWeek", 0)
+                put("joinedDateKey", "2026-10-15")
+                put("isActive", true)
+                put("updatedAt", 3000L)
+            })
+            put(JSONObject().apply {
+                put("id", "priya")
+                put("name", "Priya")
+                put("roleTitle", "Kitchen")
+                put("shiftLabel", "Morning")
+                put("weeklyOffDayOfWeek", Calendar.FRIDAY)
+                put("joinedDateKey", "2026-11-10")
+                put("isActive", true)
+                put("updatedAt", 7000L)
+            })
+        }
+        fakeMetadataStore["attendance_staff_roster"] = cloudArr.toString()
+
+        repository.reconcileStaffRosterFromCloud()
+
+        val rohan = dao.getRosterMemberById("rohan")!!
+        assertEquals(5000L, rohan.updatedAt)
+        assertEquals("Senior Barista", rohan.roleTitle)
+        assertEquals(Calendar.TUESDAY, rohan.weeklyOffDayOfWeek)
+
+        val asha = dao.getRosterMemberById("asha")!!
+        assertEquals(8000L, asha.updatedAt)
+        assertEquals("Manager", asha.roleTitle)
+        assertEquals(Calendar.WEDNESDAY, asha.weeklyOffDayOfWeek)
+
+        val priya = dao.getRosterMemberById("priya")!!
+        assertEquals(7000L, priya.updatedAt)
+        assertEquals("Kitchen", priya.roleTitle)
+
+        // Verify cloud was updated with merged 4 entries (asha, kiran, priya, rohan)
+        val uploadedJson = fakeMetadataStore["attendance_staff_roster"]!!
+        val uploadedArr = JSONArray(uploadedJson)
+        assertEquals(4, uploadedArr.length())
+        val uploadedMap = (0 until uploadedArr.length())
+            .map { uploadedArr.getJSONObject(it) }
+            .associateBy { it.getString("id") }
+        assertEquals("Senior Barista", uploadedMap["rohan"]!!.getString("roleTitle"))
+        assertEquals("Manager", uploadedMap["asha"]!!.getString("roleTitle"))
+        assertEquals(8000L, uploadedMap["asha"]!!.getLong("updatedAt"))
+        assertEquals(7000L, uploadedMap["priya"]!!.getLong("updatedAt"))
+        assertTrue(!uploadedMap["kiran"]!!.getBoolean("isActive"))
+
+        // 3. Verify reconcileAttendanceFromCloud also reconciles staff roster updates
+        val updatedCloudArr = JSONArray().apply {
+            put(JSONObject().apply {
+                put("id", "priya")
+                put("name", "Priya")
+                put("roleTitle", "Head Barista")
+                put("shiftLabel", "Full Day")
+                put("weeklyOffDayOfWeek", Calendar.SATURDAY)
+                put("joinedDateKey", "2026-11-10")
+                put("isActive", true)
+                put("updatedAt", 9500L)
+            })
+        }
+        fakeMetadataStore["attendance_staff_roster"] = updatedCloudArr.toString()
+        repository.reconcileAttendanceFromCloud("2026-11")
+        val priyaAfterMonthReconcile = dao.getRosterMemberById("priya")!!
+        assertEquals(9500L, priyaAfterMonthReconcile.updatedAt)
+        assertEquals("Head Barista", priyaAfterMonthReconcile.roleTitle)
+        assertEquals(Calendar.SATURDAY, priyaAfterMonthReconcile.weeklyOffDayOfWeek)
     }
 }
