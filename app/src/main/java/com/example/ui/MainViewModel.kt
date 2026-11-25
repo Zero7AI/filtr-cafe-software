@@ -48,6 +48,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
@@ -2269,28 +2270,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Fetches a receipt story note and surfaces errors instead of masking failures with a fallback. */
+    private suspend fun fetchStoryNote(
+        title: String,
+        date: String,
+        updateReceiptStoryState: Boolean
+    ): String? {
+        return try {
+            var generatedNote: String? = null
+            repository.generateStoryNote(title, date)
+                .onSuccess { note ->
+                    generatedNote = note
+                    _uiState.update { state ->
+                        state.copy(
+                            receiptStoryCaption = if (updateReceiptStoryState) note else state.receiptStoryCaption,
+                            isGeneratingStoryNote = if (updateReceiptStoryState) false else state.isGeneratingStoryNote,
+                            snackbarMessage = "AI note generated!"
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    _uiState.update { state ->
+                        state.copy(
+                            isGeneratingStoryNote = if (updateReceiptStoryState) false else state.isGeneratingStoryNote,
+                            snackbarMessage = "AI note generation failed: ${err.message ?: "Unknown error"}"
+                        )
+                    }
+                }
+            generatedNote
+        } catch (e: CancellationException) {
+            if (updateReceiptStoryState) {
+                _uiState.update { it.copy(isGeneratingStoryNote = false) }
+            }
+            throw e
+        } catch (e: Exception) {
+            _uiState.update { state ->
+                state.copy(
+                    isGeneratingStoryNote = if (updateReceiptStoryState) false else state.isGeneratingStoryNote,
+                    snackbarMessage = "AI note generation failed: ${e.message ?: "Unknown error"}"
+                )
+            }
+            null
+        }
+    }
+
     fun generateReceiptStoryNote(title: String, date: String) {
         if (!requireAdmin("Generating receipt story note")) return
         viewModelScope.launch {
             _uiState.update { it.copy(isGeneratingStoryNote = true) }
-            try {
-                val result = repository.generateStoryNote(title, date)
-                val note = result.getOrDefault("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
-                _uiState.update {
-                    it.copy(
-                        receiptStoryCaption = note,
-                        isGeneratingStoryNote = false,
-                        snackbarMessage = "AI note generated!"
-                    )
-                }
-            } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(
-                        isGeneratingStoryNote = false,
-                        snackbarMessage = "AI note generation failed: ${e.message}"
-                    )
-                }
-            }
+            fetchStoryNote(title, date, updateReceiptStoryState = true)
         }
     }
 
@@ -2439,12 +2467,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     suspend fun generateStoryNoteAsync(title: String, date: String): String {
-        return try {
-            val result = repository.generateStoryNote(title, date)
-            result.getOrDefault("Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.")
-        } catch (e: Exception) {
-            "Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you."
-        }
+        if (!requireAdmin("Generating receipt story note")) return ""
+        return fetchStoryNote(title, date, updateReceiptStoryState = false) ?: ""
     }
 
     fun uploadStoryPhoto(imageBytes: ByteArray, title: String = "", date: String = "", caption: String = "") {

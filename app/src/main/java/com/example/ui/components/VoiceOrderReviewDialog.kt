@@ -145,7 +145,7 @@ fun VoiceOrderReviewDialog(
                 ) {
                     itemsIndexed(
                         items = parsedVoiceOrder.items,
-                        key = { index, item -> "${index}_${item.menuItemId}_${item.menuItemName}" }
+                        key = { index, item -> "${index}_${item.menuItemName}" }
                     ) { _, item ->
                         Surface(
                             shape = RoundedCornerShape(8.dp),

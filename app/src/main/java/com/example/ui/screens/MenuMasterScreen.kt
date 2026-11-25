@@ -98,6 +98,7 @@ fun MenuMasterScreen(
     val categories = (listOf("All") + defaultCategories + dynamicCategories + customCats).distinct()
 
     var itemToSetPosition by remember { mutableStateOf<Pair<MenuItemEntity, Int>?>(null) }
+    var showRestoreConfirmDialog by remember { mutableStateOf(false) }
 
     Box(modifier = modifier.fillMaxSize().background(Color(0xFFFAFAFA))) {
         Column(
@@ -107,7 +108,6 @@ fun MenuMasterScreen(
                 .padding(12.dp)
                 .testTag("menu_master_screen")
         ) {
-            var showRestoreConfirmDialog by remember { mutableStateOf(false) }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,

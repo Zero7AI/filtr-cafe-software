@@ -296,12 +296,14 @@ fun CustomersScreen(
 
 // ==================== CUSTOMER DETAIL VIEW ====================
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CustomerDetailView(
     customer: CustomerEntity,
     customerOrders: List<OrderWithItems>,
     onBack: () -> Unit,
     onMarkOrderPaid: (OrderWithItems, String) -> Unit,
+    onSettleAllOrders: (List<OrderWithItems>, String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val totalAmount = customerOrders.sumOf { it.order.totalAmount }
