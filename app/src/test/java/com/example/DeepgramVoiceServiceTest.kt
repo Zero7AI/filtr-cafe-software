@@ -66,4 +66,47 @@ class DeepgramVoiceServiceTest {
         val result = DeepgramVoiceService.getInstance().parseTranscriptToOrder("   ", sampleMenu)
         assertTrue(result.isFailure)
     }
+
+    @Test
+    fun parseTranscriptToOrder_skipsTableStopWordAndExtractsPlus91Phone() {
+        val transcript = "One OG Vietnamese for table 3 +91 9876543210"
+        val result = DeepgramVoiceService.getInstance().parseTranscriptToOrder(transcript, sampleMenu)
+
+        assertTrue(result.isSuccess)
+        val order = result.getOrThrow()
+        assertEquals("Walk-in Customer", order.customerName)
+        assertEquals("9876543210", order.contactNumber)
+        assertEquals(1, order.items.find { it.menuItemName == "OG VIETNAMESE" }?.quantity)
+    }
+
+    @Test
+    fun parseTranscriptToOrder_extractsHinglishCustomerNameAndFormattedPhone() {
+        val transcript = "Ek Hazelnut Frappe Priya ke naam pe +91 98765-43210"
+        val result = DeepgramVoiceService.getInstance().parseTranscriptToOrder(transcript, sampleMenu)
+
+        assertTrue(result.isSuccess)
+        val order = result.getOrThrow()
+        assertEquals("Priya", order.customerName)
+        assertEquals("9876543210", order.contactNumber)
+        assertEquals(1, order.items.find { it.menuItemName == "HAZELNUT FRAPPE" }?.quantity)
+    }
+
+    @Test
+    fun parseTranscriptToOrder_ignoresMenuWordAsCustomerNameAndUnavailableItems() {
+        val mixedMenu = sampleMenu.map { item ->
+            if (item.name == "PERI PERI FRIES") item.copy(isAvailable = false) else item
+        }
+        val transcript = "One OG Vietnamese and one peri peri fries for bombay"
+        val result = DeepgramVoiceService.getInstance().parseTranscriptToOrder(transcript, mixedMenu)
+
+        assertTrue(result.isSuccess)
+        val order = result.getOrThrow()
+        assertEquals("Walk-in Customer", order.customerName)
+        assertEquals("", order.contactNumber)
+        assertTrue(order.items.none { it.menuItemName == "PERI PERI FRIES" })
+
+        val unavailableOnly = sampleMenu.map { it.copy(isAvailable = false) }
+        val failureResult = DeepgramVoiceService.getInstance().parseTranscriptToOrder("One OG Vietnamese", unavailableOnly)
+        assertTrue(failureResult.isFailure)
+    }
 }
