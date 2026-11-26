@@ -47,6 +47,7 @@ import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
+import com.example.domain.inventory.ParsedRawMaterialReceipt
 import com.example.domain.kds.KdsBaristaColorPalette
 import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kds.KdsQueueUnitItem
@@ -250,7 +251,11 @@ data class BillingUiState(
     val showActiveDevicesDialog: Boolean = false,
     val registeredDevices: List<SupabaseService.DeviceRegistration> = emptyList(),
     val isLoadingDevices: Boolean = false,
-    val accessPolicyConfig: SupabaseService.AccessPolicyConfig = SupabaseService.AccessPolicyConfig()
+    val accessPolicyConfig: SupabaseService.AccessPolicyConfig = SupabaseService.AccessPolicyConfig(),
+    // Shared Raw Material Receipt Intake (WhatsApp / PDF / Photo)
+    val isParsingSharedReceipt: Boolean = false,
+    val sharedReceiptSourceLabel: String = "",
+    val parsedSharedReceipt: ParsedRawMaterialReceipt? = null
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -718,7 +723,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (cleanSelected.isNotBlank()) {
             available.firstOrNull { it.equals(cleanSelected, ignoreCase = true) } ?: cleanSelected
         } else {
-            available.firstOrNull { it.equals(operatorName, ignoreCase = true) } ?: operatorName
+            available.firstOrNull { it.equals(operatorName, ignoreCase = true) }
+                ?: available.firstOrNull()
+                ?: operatorName
         }
     }.stateIn(
         viewModelScope,
@@ -736,7 +743,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (cleanSelected.isNotBlank()) {
             available.firstOrNull { it.equals(cleanSelected, ignoreCase = true) } ?: cleanSelected
         } else {
-            available.firstOrNull { it.equals(operatorName, ignoreCase = true) } ?: operatorName
+            available.firstOrNull { it.equals(operatorName, ignoreCase = true) }
+                ?: available.firstOrNull()
+                ?: operatorName
         }
     }.stateIn(
         viewModelScope,
@@ -4913,6 +4922,83 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(snackbarMessage = "Failed to release item: ${e.message}") }
             }
         }
+    }
+
+    // ==================== RAW MATERIAL SHARE RECEIPT INTAKE ====================
+
+    fun importSharedRawMaterialReceipt(
+        attachments: List<Pair<ByteArray, String>>,
+        sharedText: String,
+        sourceLabel: String
+    ) {
+        val label = sourceLabel.trim().ifBlank { "Shared Receipt" }
+        _uiState.update {
+            it.copy(
+                isParsingSharedReceipt = true,
+                sharedReceiptSourceLabel = label
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = repository.parseSharedRawMaterialReceipt(
+                attachments = attachments,
+                sharedText = sharedText,
+                sourceLabel = label
+            )
+            result.onSuccess { parsed ->
+                _uiState.update {
+                    it.copy(
+                        isParsingSharedReceipt = false,
+                        parsedSharedReceipt = parsed
+                    )
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(
+                        isParsingSharedReceipt = false,
+                        parsedSharedReceipt = ParsedRawMaterialReceipt(
+                            supplierName = "",
+                            notes = buildString {
+                                append("Imported from $label")
+                                val txt = sharedText.trim()
+                                if (txt.isNotBlank()) {
+                                    append(" • ")
+                                    append(txt.take(120))
+                                }
+                            },
+                            items = emptyList(),
+                            sourceLabel = label,
+                            parseError = err.message ?: "Could not auto-extract line items"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissSharedReceiptDialog() {
+        _uiState.update {
+            it.copy(
+                isParsingSharedReceipt = false,
+                sharedReceiptSourceLabel = "",
+                parsedSharedReceipt = null
+            )
+        }
+    }
+
+    fun saveSharedReceiptOrder(
+        supplierName: String,
+        notes: String,
+        items: List<InventoryOrderItemInput>
+    ) {
+        if (!requireAdmin("Saving raw material receipt")) return
+        _uiState.update {
+            it.copy(
+                parsedSharedReceipt = null,
+                sharedReceiptSourceLabel = "",
+                currentTab = FiltrTab.INVENTORY_ORDER
+            )
+        }
+        saveInventoryOrder(supplierName = supplierName, notes = notes, items = items)
     }
 
     companion object {

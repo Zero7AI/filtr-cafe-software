@@ -26,6 +26,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -67,7 +68,8 @@ fun InventoryOrderScreen(
     onDismissInventoryMaster: () -> Unit,
     onDismissAddInventoryItem: () -> Unit,
     onSearchQueryChanged: (String) -> Unit,
-    onUpdateInventoryItem: (InventoryItemEntity) -> Unit = {}
+    onUpdateInventoryItem: (InventoryItemEntity) -> Unit = {},
+    onImportReceiptClick: (() -> Unit)? = null
 ) {
     // Date filter state
     var dateFilter by remember { mutableStateOf("THIS_MONTH") } // TODAY, YESTERDAY, LAST_7_DAYS, THIS_MONTH, ALL_TIME, CUSTOM
@@ -529,6 +531,28 @@ fun InventoryOrderScreen(
                     singleLine = true
                 )
 
+                if (onImportReceiptClick != null) {
+                    OutlinedButton(
+                        onClick = onImportReceiptClick,
+                        modifier = Modifier
+                            .height(50.dp)
+                            .testTag("import_receipt_pdf_button"),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                        border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.6f)),
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Description,
+                            contentDescription = "Import Receipt PDF or Image",
+                            tint = AmberAccent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("PDF", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+
                 Button(
                     onClick = onOpenAddOrder,
                     modifier = Modifier.height(50.dp),
@@ -950,11 +974,18 @@ fun InventoryOrderCard(
 fun AddInventoryOrderDialog(
     inventoryItems: List<InventoryItemEntity>,
     onDismiss: () -> Unit,
-    onSave: (supplierName: String, notes: String, items: List<InventoryOrderItemInput>) -> Unit
+    onSave: (supplierName: String, notes: String, items: List<InventoryOrderItemInput>) -> Unit,
+    initialSupplierName: String = "",
+    initialNotes: String = "",
+    initialItems: List<InventoryOrderItemInput> = emptyList(),
+    sharedBannerText: String? = null,
+    sharedErrorText: String? = null,
+    requiresAdminUnlock: Boolean = false,
+    onRequestAdminUnlock: () -> Unit = {}
 ) {
-    var supplierName by remember { mutableStateOf("") }
-    var notes by remember { mutableStateOf("") }
-    
+    var supplierName by remember(initialSupplierName) { mutableStateOf(initialSupplierName) }
+    var notes by remember(initialNotes) { mutableStateOf(initialNotes) }
+
     data class OrderRow(
         val rowId: String = UUID.randomUUID().toString(),
         var name: String = "",
@@ -962,7 +993,32 @@ fun AddInventoryOrderDialog(
         var unit: String = "kg",
         var rate: String = ""
     )
-    var rows by remember { mutableStateOf(listOf(OrderRow())) }
+    var rows by remember(initialItems) {
+        mutableStateOf(
+            if (initialItems.isNotEmpty()) {
+                initialItems.map { item ->
+                    val qtyText = if (item.quantity % 1.0 == 0.0) {
+                        item.quantity.toInt().toString()
+                    } else {
+                        item.quantity.toString()
+                    }
+                    val rateText = if (item.unitPrice > 0.0) {
+                        if (item.unitPrice % 1.0 == 0.0) item.unitPrice.toInt().toString() else item.unitPrice.toString()
+                    } else {
+                        ""
+                    }
+                    OrderRow(
+                        name = item.itemName,
+                        qty = qtyText,
+                        unit = item.unit.ifBlank { "kg" },
+                        rate = rateText
+                    )
+                }
+            } else {
+                listOf(OrderRow())
+            }
+        )
+    }
 
     val unitOptions = listOf("kg", "L", "g", "ml", "pcs", "pack")
 
@@ -982,7 +1038,7 @@ fun AddInventoryOrderDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Add Inventory Order",
+                        text = if (sharedBannerText != null) "Review Shared Receipt" else "Add Inventory Order",
                         color = Color.White,
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold
@@ -1001,6 +1057,34 @@ fun AddInventoryOrderDialog(
                         .verticalScroll(rememberScrollState())
                         .padding(16.dp)
                 ) {
+                    if (!sharedBannerText.isNullOrBlank()) {
+                        Surface(
+                            color = AmberAccent.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.4f)),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 12.dp)
+                                .testTag("shared_receipt_banner")
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    text = sharedBannerText,
+                                    color = AmberAccent,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (!sharedErrorText.isNullOrBlank()) {
+                                    Text(
+                                        text = "Could not auto-read everything ($sharedErrorText) — please verify or enter items below.",
+                                        color = Color(0xFFFCA5A5),
+                                        fontSize = 11.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     OutlinedTextField(
                         value = supplierName,
                         onValueChange = { supplierName = it },
@@ -1275,27 +1359,34 @@ fun AddInventoryOrderDialog(
                             }
                             Button(
                                 onClick = {
-                                    val mappedItems = rows.mapNotNull { row ->
-                                        val q = row.qty.toDoubleOrNull() ?: 0.0
-                                        val r = (row.rate.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
-                                        if (row.name.isNotBlank() && q > 0.0) {
-                                            InventoryOrderItemInput(
-                                                itemName = row.name.trim(),
-                                                quantity = q,
-                                                unit = row.unit,
-                                                unitPrice = r
-                                            )
-                                        } else null
-                                    }
-                                    if (mappedItems.isNotEmpty()) {
-                                        onSave(supplierName.trim(), notes.trim(), mappedItems)
+                                    if (requiresAdminUnlock) {
+                                        onRequestAdminUnlock()
+                                    } else {
+                                        val mappedItems = rows.mapNotNull { row ->
+                                            val q = row.qty.toDoubleOrNull() ?: 0.0
+                                            val r = (row.rate.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0)
+                                            if (row.name.isNotBlank() && q > 0.0) {
+                                                InventoryOrderItemInput(
+                                                    itemName = row.name.trim(),
+                                                    quantity = q,
+                                                    unit = row.unit,
+                                                    unitPrice = r
+                                                )
+                                            } else null
+                                        }
+                                        if (mappedItems.isNotEmpty()) {
+                                            onSave(supplierName.trim(), notes.trim(), mappedItems)
+                                        }
                                     }
                                 },
-                                enabled = hasValidRow,
+                                enabled = requiresAdminUnlock || hasValidRow,
                                 colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = DarkBackground),
                                 shape = RoundedCornerShape(8.dp)
                             ) {
-                                Text("Save Order", fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = if (requiresAdminUnlock) "Unlock Admin & Save" else "Save Order",
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
                     }

@@ -31,6 +31,7 @@ import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.domain.attendance.AttendanceCalculator
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.StoreGeofenceConfig
+import com.example.domain.inventory.ParsedRawMaterialReceipt
 import com.example.domain.kds.KdsBaristaColorPalette
 import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kitchen.KitchenInventoryCalculator
@@ -51,6 +52,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -3470,6 +3472,26 @@ class FiltrRepository(
                 Log.w(TAG, "reconcileKdsClaimsFromCloud failed: ${e.message}")
             }
         }
+    }
+
+    // ==================== RAW MATERIAL RECEIPT EXTRACTION ====================
+
+    suspend fun parseSharedRawMaterialReceipt(
+        attachments: List<Pair<ByteArray, String>>,
+        sharedText: String,
+        sourceLabel: String
+    ): Result<ParsedRawMaterialReceipt> {
+        val currentItems = try {
+            allInventoryItems.first()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        return geminiVoiceService.parseRawMaterialReceipt(
+            attachments = attachments,
+            sharedText = sharedText,
+            availableInventoryItems = currentItems,
+            sourceLabel = sourceLabel
+        )
     }
 }
 

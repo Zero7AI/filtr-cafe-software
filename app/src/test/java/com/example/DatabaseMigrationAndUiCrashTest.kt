@@ -13,6 +13,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.database.FiltrDatabase
 import com.example.data.entity.AttendanceLogEntity
+import com.example.data.entity.InventoryItemEntity
 import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
@@ -30,8 +31,10 @@ import com.example.domain.kitchen.KitchenInventorySeedCatalog
 import com.example.domain.kitchen.KitchenSection
 import com.example.domain.kitchen.KitchenShiftType
 import com.example.ui.BillingUiState
+import com.example.ui.InventoryOrderItemInput
 import com.example.ui.KitchenInventoryDashboardSummary
 import com.example.ui.KitchenInventoryViewRoute
+import com.example.ui.screens.AddInventoryOrderDialog
 import com.example.ui.screens.AttendanceScreen
 import com.example.ui.screens.KdsScreen
 import com.example.ui.screens.KitchenInventoryScreen
@@ -518,5 +521,52 @@ class DatabaseMigrationAndUiCrashTest {
 
         composeTestRule.onNodeWithText("Made by Somesh ✓").assertExists()
         composeTestRule.onNodeWithText("Making: Kanha").assertExists()
+    }
+
+    @Test
+    fun `shared raw material receipt review dialog prefills extracted items and saves safely`() {
+        var savedSupplier = ""
+        var savedCount = 0
+
+        composeTestRule.setContent {
+            FiltrTheme {
+                AddInventoryOrderDialog(
+                    inventoryItems = listOf(
+                        InventoryItemEntity(
+                            id = 1,
+                            name = "Full Cream Milk",
+                            category = "Dairy",
+                            unit = "L",
+                            standardQuantity = 1.0,
+                            defaultPrice = 65.0
+                        )
+                    ),
+                    initialSupplierName = "Blinkit Wholesale",
+                    initialNotes = "Invoice #BLK-101 • File: blinkit_bill.pdf",
+                    initialItems = listOf(
+                        InventoryOrderItemInput(
+                            itemName = "Full Cream Milk",
+                            quantity = 10.0,
+                            unit = "L",
+                            unitPrice = 65.0
+                        )
+                    ),
+                    sharedBannerText = "Extracted 1 items (₹650) from blinkit_bill.pdf",
+                    requiresAdminUnlock = false,
+                    onDismiss = {},
+                    onSave = { supplier, _, items ->
+                        savedSupplier = supplier
+                        savedCount = items.size
+                    }
+                )
+            }
+        }
+
+        composeTestRule.onNodeWithText("Review Shared Receipt").assertExists()
+        composeTestRule.onNodeWithText("Extracted 1 items (₹650) from blinkit_bill.pdf").assertExists()
+        composeTestRule.onNodeWithText("Blinkit Wholesale").assertExists()
+        composeTestRule.onNodeWithText("Save Order").performClick()
+        assertEquals("Blinkit Wholesale", savedSupplier)
+        assertEquals(1, savedCount)
     }
 }

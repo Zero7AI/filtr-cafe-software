@@ -1,10 +1,12 @@
 package com.example
 
-import android.os.Bundle
-import android.os.Build
-import android.content.Intent
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -12,6 +14,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
@@ -112,6 +116,7 @@ import com.example.ui.components.ReceiptStoryDialog
 import com.example.ui.components.SettingsDialog
 import com.example.ui.components.VoiceOrderMicButton
 import com.example.ui.components.VoiceOrderReviewDialog
+import com.example.ui.screens.AddInventoryOrderDialog
 import com.example.ui.screens.AddStockDialog
 import com.example.ui.screens.AttendanceScreen
 import com.example.ui.screens.BillingScreen
@@ -133,7 +138,9 @@ import com.example.ui.theme.AmberAccentSecondary
 import com.example.ui.theme.CoffeeBrownPrimary
 import com.example.ui.theme.CoffeeOnPrimary
 import com.example.ui.theme.FiltrTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
@@ -157,6 +164,9 @@ class MainActivity : ComponentActivity() {
         if (intent?.getBooleanExtra("EXTRA_OPEN_UPDATE_DIALOG", false) == true) {
             viewModel.showMandatoryUpdateDialog()
         }
+        if (savedInstanceState == null) {
+            handleIncomingShareIntent(intent)
+        }
 
         setContent {
             FiltrTheme {
@@ -177,6 +187,13 @@ class MainActivity : ComponentActivity() {
                 val locationPermissionsLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
                 ) { viewModel.onLocationPermissionResult() }
+                val receiptDocumentPickerLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.OpenMultipleDocuments()
+                ) { uris ->
+                    if (uris.isNotEmpty()) {
+                        processSharedReceiptUris(uris, sharedText = "")
+                    }
+                }
                 LaunchedEffect(uiState.deviceAccessStatus) {
                     if (uiState.deviceAccessStatus == "ACTIVE") {
                         val neededPermissions = buildList {
@@ -1079,7 +1096,12 @@ class MainActivity : ComponentActivity() {
                                             onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
                                             onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
                                             onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) },
-                                            onUpdateInventoryItem = { viewModel.updateInventoryItem(it) }
+                                            onUpdateInventoryItem = { viewModel.updateInventoryItem(it) },
+                                            onImportReceiptClick = {
+                                                receiptDocumentPickerLauncher.launch(
+                                                    arrayOf("application/pdf", "image/*")
+                                                )
+                                            }
                                         )
                                     }
                                 }
@@ -1744,6 +1766,49 @@ class MainActivity : ComponentActivity() {
                                     onDismiss = { viewModel.closeReceiptStoryDialog() }
                                 )
                             }
+
+                            if (uiState.isParsingSharedReceipt) {
+                                AlertDialog(
+                                    onDismissRequest = { viewModel.dismissSharedReceiptDialog() },
+                                    title = { Text("Reading Receipt...", fontWeight = FontWeight.Bold) },
+                                    text = {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                        ) {
+                                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.5.dp)
+                                            Text(
+                                                text = "Extracting raw-material items from ${uiState.sharedReceiptSourceLabel.ifBlank { "shared file" }} via Gemini AI..."
+                                            )
+                                        }
+                                    },
+                                    confirmButton = {
+                                        TextButton(onClick = { viewModel.dismissSharedReceiptDialog() }) {
+                                            Text("Cancel")
+                                        }
+                                    }
+                                )
+                            }
+
+                            uiState.parsedSharedReceipt?.let { sharedReceipt ->
+                                val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                AddInventoryOrderDialog(
+                                    inventoryItems = inventoryItemsList,
+                                    initialSupplierName = sharedReceipt.supplierName,
+                                    initialNotes = sharedReceipt.notes,
+                                    initialItems = sharedReceipt.items,
+                                    sharedBannerText = sharedReceipt.extractionSummary.ifBlank {
+                                        "Imported from ${sharedReceipt.sourceLabel.ifBlank { "Shared Receipt" }}"
+                                    },
+                                    sharedErrorText = sharedReceipt.parseError,
+                                    requiresAdminUnlock = isStaffMode,
+                                    onRequestAdminUnlock = { showAdminUnlockDialog = true },
+                                    onDismiss = { viewModel.dismissSharedReceiptDialog() },
+                                    onSave = { supplier, notes, items ->
+                                        viewModel.saveSharedReceiptOrder(supplier, notes, items)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -1761,6 +1826,145 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         if (intent.getBooleanExtra("EXTRA_OPEN_UPDATE_DIALOG", false)) {
             viewModel.showMandatoryUpdateDialog()
+        }
+        handleIncomingShareIntent(intent)
+    }
+
+    private fun handleIncomingShareIntent(incomingIntent: Intent?) {
+        val intent = incomingIntent ?: return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE && action != Intent.ACTION_VIEW) {
+            return
+        }
+
+        val uris = LinkedHashSet<Uri>()
+        when (action) {
+            Intent.ACTION_SEND -> {
+                IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let { uris.add(it) }
+                intent.clipData?.let { clip ->
+                    for (i in 0 until clip.itemCount) {
+                        clip.getItemAt(i)?.uri?.let { uris.add(it) }
+                    }
+                }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.forEach {
+                    uris.add(it)
+                }
+                intent.clipData?.let { clip ->
+                    for (i in 0 until clip.itemCount) {
+                        clip.getItemAt(i)?.uri?.let { uris.add(it) }
+                    }
+                }
+            }
+            Intent.ACTION_VIEW -> {
+                intent.data?.let { uris.add(it) }
+            }
+        }
+
+        val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty().trim()
+        if (uris.isEmpty() && sharedText.isBlank()) {
+            return
+        }
+
+        // Prevent re-importing on configuration changes
+        intent.action = Intent.ACTION_MAIN
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        intent.data = null
+
+        processSharedReceiptUris(uris.toList(), sharedText, intent.type)
+    }
+
+    private fun processSharedReceiptUris(
+        uris: List<Uri>,
+        sharedText: String,
+        fallbackIntentMimeType: String? = null
+    ) {
+        lifecycleScope.launch {
+            val (attachments, sourceNames) = withContext(Dispatchers.IO) {
+                val collected = mutableListOf<Pair<ByteArray, String>>()
+                val names = mutableListOf<String>()
+                val maxBytesPerFile = 15 * 1024 * 1024
+
+                for (uri in uris.take(3)) {
+                    try {
+                        val displayName = resolveUriDisplayName(uri)
+                        val detectedMime = resolveUriMimeType(uri, displayName, fallbackIntentMimeType)
+                        if (detectedMime.startsWith("image/") || detectedMime == "application/pdf") {
+                            val bytes = contentResolver.openInputStream(uri)?.use { input ->
+                                val buffer = java.io.ByteArrayOutputStream()
+                                val chunk = ByteArray(16 * 1024)
+                                var total = 0
+                                while (total < maxBytesPerFile) {
+                                    val read = input.read(chunk)
+                                    if (read <= 0) break
+                                    val allowed = minOf(read, maxBytesPerFile - total)
+                                    buffer.write(chunk, 0, allowed)
+                                    total += allowed
+                                }
+                                buffer.toByteArray()
+                            } ?: ByteArray(0)
+
+                            if (bytes.isNotEmpty()) {
+                                collected.add(bytes to detectedMime)
+                                names.add(displayName.ifBlank { if (detectedMime == "application/pdf") "receipt.pdf" else "receipt.jpg" })
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // Continue trying other attachments or shared text
+                    }
+                }
+                collected to names
+            }
+
+            if (attachments.isEmpty() && sharedText.isBlank()) {
+                viewModel.showSnackbar("Unsupported shared file — please share a PDF bill, image receipt, or text.")
+                return@launch
+            }
+
+            val sourceLabel = when {
+                sourceNames.size == 1 -> sourceNames.first()
+                sourceNames.size > 1 -> "${sourceNames.first()} (+${sourceNames.size - 1} more)"
+                else -> "Shared WhatsApp Text"
+            }
+            viewModel.importSharedRawMaterialReceipt(
+                attachments = attachments,
+                sharedText = sharedText,
+                sourceLabel = sourceLabel
+            )
+        }
+    }
+
+    private fun resolveUriDisplayName(uri: Uri): String {
+        try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val name = cursor.getString(idx)?.trim().orEmpty()
+                        if (name.isNotBlank()) return name
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')?.trim().orEmpty()
+    }
+
+    private fun resolveUriMimeType(uri: Uri, displayName: String, fallbackType: String?): String {
+        val resolved = contentResolver.getType(uri)?.trim().orEmpty()
+        if (resolved.isNotBlank() && resolved != "application/octet-stream" && resolved != "*/*") {
+            return resolved
+        }
+        val lowerName = displayName.lowercase()
+        return when {
+            lowerName.endsWith(".pdf") -> "application/pdf"
+            lowerName.endsWith(".png") -> "image/png"
+            lowerName.endsWith(".webp") -> "image/webp"
+            lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") -> "image/jpeg"
+            !fallbackType.isNullOrBlank() && fallbackType != "*/*" -> fallbackType
+            else -> "application/pdf"
         }
     }
 

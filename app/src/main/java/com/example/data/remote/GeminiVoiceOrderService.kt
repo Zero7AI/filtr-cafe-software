@@ -1,7 +1,11 @@
 package com.example.data.remote
 
+import android.util.Base64
 import com.example.BuildConfig
+import com.example.data.entity.InventoryItemEntity
 import com.example.data.entity.MenuItemEntity
+import com.example.domain.inventory.ParsedRawMaterialReceipt
+import com.example.domain.inventory.RawMaterialReceiptParser
 import com.example.voice.engine.LocalOrderEngine
 import com.example.voice.engine.MenuCatalog
 import com.example.voice.model.VoiceOrderState
@@ -468,6 +472,127 @@ class GeminiVoiceOrderService {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Parses a raw-material purchase bill / invoice PDF, image, or WhatsApp text message
+     * into structured InventoryOrder fields using Gemini 2.5 Flash multimodal vision/document understanding.
+     */
+    suspend fun parseRawMaterialReceipt(
+        attachments: List<Pair<ByteArray, String>>,
+        sharedText: String = "",
+        availableInventoryItems: List<InventoryItemEntity>,
+        sourceLabel: String = "Shared Receipt"
+    ): Result<ParsedRawMaterialReceipt> = withContext(Dispatchers.IO) {
+        val cleanText = sharedText.trim()
+        val apiKey = resolveApiKey()
+        if (apiKey == null) {
+            return@withContext if (cleanText.isNotBlank()) {
+                RawMaterialReceiptParser.parsePlainTextReceipt(cleanText, availableInventoryItems, sourceLabel)
+            } else {
+                Result.failure(IllegalStateException("Gemini API key is not configured for PDF/image extraction"))
+            }
+        }
+
+        if (attachments.isEmpty() && cleanText.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("No receipt file or text provided"))
+        }
+
+        try {
+            val catalogSummary = if (availableInventoryItems.isEmpty()) {
+                "(No existing master items yet — infer concise, clean raw material item names)"
+            } else {
+                availableInventoryItems.take(80).joinToString("\n") {
+                    "- ${it.name} (default unit: ${it.unit}, default rate: ${it.defaultPrice})"
+                }
+            }
+
+            val promptText = """
+                You are extracting raw-material purchase bill / supplier invoice details for "FILTR Coffee" cafe inventory.
+
+                Existing Inventory Item Master:
+                $catalogSummary
+
+                ${if (cleanText.isNotBlank()) "Additional caption/text shared with the receipt:\n\"$cleanText\"\n" else ""}
+                Instructions:
+                - Read all attached PDF document(s) / receipt image(s) carefully.
+                - Extract the supplier/vendor name (e.g. "Blinkit", "Metro Cash & Carry", "Third Wave Roasters", "Amul Dairy", etc.).
+                - Extract invoice number, bill date, and any tax/delivery notes.
+                - Extract every purchased raw material line item cleanly.
+                - Match item names to the closest existing Inventory Item Master name where appropriate; otherwise keep a clean singular/clear item name.
+                - Normalize `unit` strictly to ONE of: "kg", "L", "g", "ml", "pcs", "pack".
+                - Provide numeric `quantity`, per-unit `unitPrice` (rate per single unit), and numeric `totalPrice` (line subtotal in INR).
+                - Do not invent line items that aren't in the receipt.
+
+                Return strictly a valid JSON object matching this exact schema:
+                {
+                  "supplierName": "Supplier Name",
+                  "invoiceNumber": "INV-123",
+                  "invoiceDate": "2026-11-26",
+                  "notes": "GST / delivery charges / payment note",
+                  "items": [
+                    {
+                      "name": "Item Name",
+                      "quantity": 2.0,
+                      "unit": "kg",
+                      "unitPrice": 450.0,
+                      "totalPrice": 900.0
+                    }
+                  ]
+                }
+            """.trimIndent()
+
+            val parts = JSONArray()
+            for ((bytes, mimeType) in attachments.take(3)) {
+                if (bytes.isEmpty()) continue
+                val base64Data = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                parts.put(JSONObject().apply {
+                    put("inlineData", JSONObject().apply {
+                        put("mimeType", mimeType)
+                        put("data", base64Data)
+                    })
+                })
+            }
+            parts.put(JSONObject().apply {
+                put("text", promptText)
+            })
+
+            val requestJson = JSONObject().apply {
+                put("contents", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("parts", parts)
+                    })
+                })
+                put("generationConfig", JSONObject().apply {
+                    put("temperature", 0.1)
+                    put("responseMimeType", "application/json")
+                })
+            }
+
+            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
+            if (!response.isSuccessful) {
+                if (cleanText.isNotBlank()) {
+                    val offline = RawMaterialReceiptParser.parsePlainTextReceipt(cleanText, availableInventoryItems, sourceLabel)
+                    if (offline.isSuccess) return@withContext offline
+                }
+                return@withContext Result.failure(Exception("Gemini API error (HTTP ${response.code})"))
+            }
+
+            val textResponse = extractGeminiText(response.body)
+            if (textResponse.isBlank()) {
+                return@withContext Result.failure(Exception("Gemini returned an empty response"))
+            }
+
+            RawMaterialReceiptParser.parseGeminiReceiptJson(textResponse, availableInventoryItems, sourceLabel)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (cleanText.isNotBlank()) {
+                val offline = RawMaterialReceiptParser.parsePlainTextReceipt(cleanText, availableInventoryItems, sourceLabel)
+                if (offline.isSuccess) return@withContext offline
+            }
             Result.failure(e)
         }
     }
