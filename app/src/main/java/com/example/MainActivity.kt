@@ -1079,10 +1079,12 @@ class MainActivity : ComponentActivity() {
                                     if (!isStaffMode) {
                                         val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
                                         val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
+                                        val pricingSummaries by viewModel.ingredientPricingSummaries.collectAsStateWithLifecycle()
                                         InventoryOrderScreen(
                                             state = uiState,
                                             inventoryOrders = inventoryOrdersList,
                                             inventoryItems = inventoryItemsList,
+                                            pricingSummaries = pricingSummaries,
                                             onOpenAddOrder = { viewModel.openAddInventoryOrderDialog() },
                                             onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
                                             onDeleteOrder = { viewModel.requestDeleteInventoryOrder(it) },
@@ -1101,6 +1103,13 @@ class MainActivity : ComponentActivity() {
                                                 receiptDocumentPickerLauncher.launch(
                                                     arrayOf("application/pdf", "image/*")
                                                 )
+                                            },
+                                            onRetryQueuedReceipt = { viewModel.retryQueuedReceipt(it) },
+                                            onDismissQueuedReceipt = { viewModel.dismissQueuedReceipt(it) },
+                                            onSyncPricingToSheets = { viewModel.syncIngredientPricingToSheets() },
+                                            onExportPricingCsv = {
+                                                val csvFile = viewModel.buildIngredientPricingCsvFile(context)
+                                                shareIngredientPricingCsv(csvFile)
                                             }
                                         )
                                     }
@@ -1111,12 +1120,14 @@ class MainActivity : ComponentActivity() {
                                         val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
                                         val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
                                         val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
+                                        val pricingSummaries by viewModel.ingredientPricingSummaries.collectAsStateWithLifecycle()
                                         InventoriesScreen(
                                             state = uiState,
                                             inventoryItems = inventoryItemsList,
                                             usages = usagesList,
                                             ordersList = ordersList,
                                             inventoryOrders = inventoryOrdersList,
+                                            pricingSummaries = pricingSummaries,
                                             onUpdateStock = { id, stock -> viewModel.updateStockLevel(id, stock) },
                                             onStartEditingStock = { viewModel.startEditingStock(it) },
                                             onCancelEditingStock = { viewModel.cancelEditingStock() },
@@ -1129,7 +1140,12 @@ class MainActivity : ComponentActivity() {
                                             onDeleteInventoryItem = { viewModel.deleteInventoryItem(it) },
                                             onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
                                             onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
-                                            onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) }
+                                            onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) },
+                                            onSyncPricingToSheets = { viewModel.syncIngredientPricingToSheets() },
+                                            onExportPricingCsv = {
+                                                val csvFile = viewModel.buildIngredientPricingCsvFile(context)
+                                                shareIngredientPricingCsv(csvFile)
+                                            }
                                         )
                                     }
                                 }
@@ -1801,6 +1817,11 @@ class MainActivity : ComponentActivity() {
                                         "Imported from ${sharedReceipt.sourceLabel.ifBlank { "Shared Receipt" }}"
                                     },
                                     sharedErrorText = sharedReceipt.parseError,
+                                    onRetryAiScan = if (uiState.activeRetryIntakeId != null) {
+                                        { viewModel.retryActiveSharedReceipt() }
+                                    } else {
+                                        null
+                                    },
                                     requiresAdminUnlock = isStaffMode,
                                     onRequestAdminUnlock = { showAdminUnlockDialog = true },
                                     onDismiss = { viewModel.dismissSharedReceiptDialog() },
@@ -1965,6 +1986,25 @@ class MainActivity : ComponentActivity() {
             lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") -> "image/jpeg"
             !fallbackType.isNullOrBlank() && fallbackType != "*/*" -> fallbackType
             else -> "application/pdf"
+        }
+    }
+
+    private fun shareIngredientPricingCsv(csvFile: java.io.File) {
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                csvFile
+            )
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/csv"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "FILTR Coffee Ingredient Pricing & Hike Sheet")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(sendIntent, "Open / Share Ingredient Pricing Excel CSV"))
+        } catch (e: Exception) {
+            viewModel.showSnackbar("Failed to export Excel CSV: ${e.message}")
         }
     }
 

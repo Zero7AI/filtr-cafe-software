@@ -47,7 +47,11 @@ import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
+import com.example.domain.inventory.IngredientPriceSummary
 import com.example.domain.inventory.ParsedRawMaterialReceipt
+import com.example.domain.inventory.PendingReceiptIntake
+import com.example.domain.inventory.PendingReceiptQueueStore
+import com.example.domain.inventory.RawMaterialPriceTracker
 import com.example.domain.kds.KdsBaristaColorPalette
 import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kds.KdsQueueUnitItem
@@ -255,7 +259,9 @@ data class BillingUiState(
     // Shared Raw Material Receipt Intake (WhatsApp / PDF / Photo)
     val isParsingSharedReceipt: Boolean = false,
     val sharedReceiptSourceLabel: String = "",
-    val parsedSharedReceipt: ParsedRawMaterialReceipt? = null
+    val parsedSharedReceipt: ParsedRawMaterialReceipt? = null,
+    val pendingReceiptQueue: List<PendingReceiptIntake> = emptyList(),
+    val activeRetryIntakeId: String? = null
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -388,6 +394,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val inventoryOrders: StateFlow<List<InventoryOrderWithItems>> = repository.allInventoryOrders
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val ingredientPricingSummaries: StateFlow<List<IngredientPriceSummary>> = combine(
+        inventoryItems,
+        inventoryOrders
+    ) { items, orders ->
+        RawMaterialPriceTracker.buildIngredientPricingSummaries(items, orders)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val inventoryUsages: StateFlow<List<InventoryUsageEntity>> = repository.allInventoryUsages
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -958,6 +971,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
     init {
+        refreshPendingReceiptQueue()
         // Monitor network connectivity in real-time
         val callback = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
@@ -968,6 +982,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         repository.syncPendingOrdersToSupabase()
                     } catch (e: Exception) {
                         Log.w("MainViewModel", "Supabase sync on network reconnect failed: ${e.message}")
+                    }
+                    if (_uiState.value.pendingReceiptQueue.isNotEmpty() && !_uiState.value.isParsingSharedReceipt) {
+                        val firstPending = _uiState.value.pendingReceiptQueue.firstOrNull()
+                        if (firstPending != null) {
+                            val att = PendingReceiptQueueStore.loadAttachmentBytes(getApplication(), firstPending)
+                            if (att.isNotEmpty() || firstPending.sharedText.isNotBlank()) {
+                                try {
+                                    val res = repository.parseSharedRawMaterialReceipt(
+                                        att,
+                                        firstPending.sharedText,
+                                        firstPending.sourceLabel
+                                    )
+                                    if (res.isSuccess) {
+                                        PendingReceiptQueueStore.remove(getApplication(), firstPending.id)
+                                        val refreshed = PendingReceiptQueueStore.loadAll(getApplication())
+                                        _uiState.update {
+                                            it.copy(
+                                                pendingReceiptQueue = refreshed,
+                                                snackbarMessage = "Queued receipt '${firstPending.sourceLabel}' ready — check Inventory Orders!"
+                                            )
+                                        }
+                                    }
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
                     }
                     val url = _uiState.value.googleSheetsWebhookUrl
                     if (url.isNotBlank()) {
@@ -3431,10 +3471,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 repository.addInventoryOrder(orderEntity, orderItems)
 
+                val url = _uiState.value.googleSheetsWebhookUrl
+                if (url.isNotBlank()) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        repository.syncInventoryPurchaseToSheets(url, orderEntity, orderItems)
+                    }
+                }
+
                 _uiState.update {
                     it.copy(
                         showAddInventoryOrderDialog = false,
-                        snackbarMessage = "Inventory order $orderId saved (${validItems.size} items, ₹${"%.0f".format(totalAmount)})"
+                        snackbarMessage = "Inventory order $orderId saved & prices updated (${validItems.size} items, ₹${"%.0f".format(totalAmount)})"
                     )
                 }
             } catch (e: Exception) {
@@ -4929,7 +4976,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun importSharedRawMaterialReceipt(
         attachments: List<Pair<ByteArray, String>>,
         sharedText: String,
-        sourceLabel: String
+        sourceLabel: String,
+        existingQueueId: String? = null
     ) {
         val label = sourceLabel.trim().ifBlank { "Shared Receipt" }
         _uiState.update {
@@ -4945,16 +4993,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 sourceLabel = label
             )
             result.onSuccess { parsed ->
+                if (!existingQueueId.isNullOrBlank()) {
+                    PendingReceiptQueueStore.remove(getApplication(), existingQueueId)
+                }
+                val refreshedQueue = PendingReceiptQueueStore.loadAll(getApplication())
                 _uiState.update {
                     it.copy(
                         isParsingSharedReceipt = false,
-                        parsedSharedReceipt = parsed
+                        parsedSharedReceipt = parsed,
+                        pendingReceiptQueue = refreshedQueue,
+                        activeRetryIntakeId = null
                     )
                 }
             }.onFailure { err ->
+                val errorMsg = err.message ?: "Could not auto-extract line items"
+                val enqueued = if (attachments.isNotEmpty() || sharedText.isNotBlank()) {
+                    PendingReceiptQueueStore.enqueueOrUpdate(
+                        context = getApplication(),
+                        attachments = attachments,
+                        sharedText = sharedText,
+                        sourceLabel = label,
+                        lastError = errorMsg,
+                        existingId = existingQueueId
+                    )
+                } else null
+                val refreshedQueue = PendingReceiptQueueStore.loadAll(getApplication())
                 _uiState.update {
                     it.copy(
                         isParsingSharedReceipt = false,
+                        pendingReceiptQueue = refreshedQueue,
+                        activeRetryIntakeId = enqueued?.id ?: existingQueueId,
                         parsedSharedReceipt = ParsedRawMaterialReceipt(
                             supplierName = "",
                             notes = buildString {
@@ -4967,7 +5035,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             },
                             items = emptyList(),
                             sourceLabel = label,
-                            parseError = err.message ?: "Could not auto-extract line items"
+                            parseError = errorMsg
                         )
                     )
                 }
@@ -4975,12 +5043,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun retryQueuedReceipt(intakeId: String) {
+        val queue = PendingReceiptQueueStore.loadAll(getApplication())
+        val intake = queue.firstOrNull { it.id == intakeId } ?: return
+        val attachments = PendingReceiptQueueStore.loadAttachmentBytes(getApplication(), intake)
+        importSharedRawMaterialReceipt(
+            attachments = attachments,
+            sharedText = intake.sharedText,
+            sourceLabel = intake.sourceLabel,
+            existingQueueId = intake.id
+        )
+    }
+
+    fun retryActiveSharedReceipt() {
+        val activeId = _uiState.value.activeRetryIntakeId ?: return
+        retryQueuedReceipt(activeId)
+    }
+
+    fun dismissQueuedReceipt(intakeId: String) {
+        PendingReceiptQueueStore.remove(getApplication(), intakeId)
+        val refreshed = PendingReceiptQueueStore.loadAll(getApplication())
+        _uiState.update { it.copy(pendingReceiptQueue = refreshed) }
+    }
+
+    fun syncIngredientPricingToSheets() {
+        if (!requireAdmin("Syncing pricing to Google Sheets")) return
+        val url = _uiState.value.googleSheetsWebhookUrl.trim()
+        if (url.isBlank()) {
+            _uiState.update { it.copy(snackbarMessage = "Configure Google Sheets Webhook URL in Settings first, or use Excel CSV Export.") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val summaries = ingredientPricingSummaries.value
+            val orders = inventoryOrders.value
+            val res = repository.syncIngredientPricingToSheets(url, summaries, orders)
+            val msg = res.getOrElse { "Sheets sync failed: ${it.message}" }
+            _uiState.update { it.copy(snackbarMessage = msg) }
+        }
+    }
+
+    fun buildIngredientPricingCsvFile(context: Context): File {
+        val summaries = ingredientPricingSummaries.value
+        val orders = inventoryOrders.value
+        val csvContent = RawMaterialPriceTracker.buildIngredientPricingCsv(summaries, orders)
+        val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+        val exportDir = File(context.cacheDir, "inventory_reports").apply { mkdirs() }
+        val outFile = File(exportDir, "FILTR_Ingredient_Pricing_$dateStr.csv")
+        outFile.writeText(csvContent, Charsets.UTF_8)
+        return outFile
+    }
+
+    fun refreshPendingReceiptQueue() {
+        val items = PendingReceiptQueueStore.loadAll(getApplication())
+        _uiState.update { it.copy(pendingReceiptQueue = items) }
+    }
+
     fun dismissSharedReceiptDialog() {
         _uiState.update {
             it.copy(
                 isParsingSharedReceipt = false,
                 sharedReceiptSourceLabel = "",
-                parsedSharedReceipt = null
+                parsedSharedReceipt = null,
+                activeRetryIntakeId = null
             )
         }
     }
@@ -4991,10 +5115,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         items: List<InventoryOrderItemInput>
     ) {
         if (!requireAdmin("Saving raw material receipt")) return
+        val retryId = _uiState.value.activeRetryIntakeId
+        if (!retryId.isNullOrBlank()) {
+            PendingReceiptQueueStore.remove(getApplication(), retryId)
+        }
+        val refreshedQueue = PendingReceiptQueueStore.loadAll(getApplication())
         _uiState.update {
             it.copy(
                 parsedSharedReceipt = null,
                 sharedReceiptSourceLabel = "",
+                activeRetryIntakeId = null,
+                pendingReceiptQueue = refreshedQueue,
                 currentTab = FiltrTab.INVENTORY_ORDER
             )
         }

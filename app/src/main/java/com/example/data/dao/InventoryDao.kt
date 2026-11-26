@@ -42,6 +42,9 @@ interface InventoryDao {
     @Query("UPDATE inventory_items SET currentStock = currentStock + :amount WHERE id = :itemId")
     suspend fun addStock(itemId: Int, amount: Double)
 
+    @Query("UPDATE inventory_items SET currentStock = currentStock + :amount, defaultPrice = :latestPrice WHERE id = :itemId")
+    suspend fun addStockAndPrice(itemId: Int, amount: Double, latestPrice: Double)
+
     @Query("UPDATE inventory_items SET currentStock = MAX(0, currentStock - :amount) WHERE id = :itemId")
     suspend fun deductStock(itemId: Int, amount: Double)
 

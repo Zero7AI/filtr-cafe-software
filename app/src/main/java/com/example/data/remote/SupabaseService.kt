@@ -1640,6 +1640,42 @@ class SupabaseService private constructor() {
         }
     }
 
+    // ==================== GEMINI REMOTE CONFIG ====================
+
+    data class GeminiRemoteConfig(
+        val apiKeys: List<String> = emptyList(),
+        val models: List<String> = emptyList()
+    )
+
+    suspend fun fetchGeminiConfig(): GeminiRemoteConfig? = withContext(Dispatchers.IO) {
+        try {
+            val raw = fetchSyncMetadata("gemini_config") ?: return@withContext null
+            if (!raw.startsWith("{")) return@withContext null
+            val json = JSONObject(raw)
+            val keys = mutableListOf<String>()
+            json.optNonNullString("api_key", "").trim().takeIf { it.isNotBlank() }?.let { keys.add(it) }
+            val extraKeys = json.optJSONArray("backup_keys")
+            if (extraKeys != null) {
+                for (i in 0 until extraKeys.length()) {
+                    val k = extraKeys.optString(i, "").trim()
+                    if (k.isNotBlank() && k !in keys) keys.add(k)
+                }
+            }
+            val models = mutableListOf<String>()
+            val modelsArr = json.optJSONArray("models")
+            if (modelsArr != null) {
+                for (i in 0 until modelsArr.length()) {
+                    val m = modelsArr.optString(i, "").trim()
+                    if (m.isNotBlank() && m !in models) models.add(m)
+                }
+            }
+            if (keys.isEmpty() && models.isEmpty()) null else GeminiRemoteConfig(keys, models)
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchGeminiConfig failed: ${e.message}")
+            null
+        }
+    }
+
     // ==================== DEVICE ACCESS REGISTRY & PASSCODE POLICY ====================
 
     data class AccessPolicyConfig(

@@ -31,7 +31,9 @@ import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.domain.attendance.AttendanceCalculator
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.StoreGeofenceConfig
+import com.example.domain.inventory.IngredientPriceSummary
 import com.example.domain.inventory.ParsedRawMaterialReceipt
+import com.example.domain.inventory.RawMaterialPriceTracker
 import com.example.domain.kds.KdsBaristaColorPalette
 import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kitchen.KitchenInventoryCalculator
@@ -1719,8 +1721,16 @@ class FiltrRepository(
                     val masterItem = inventoryDao?.getInventoryItemByName(item.itemName)
                     if (masterItem != null && item.quantity > 0) {
                         val (packsToAdd, _) = calculatePacksAndCost(item.quantity, item.unit, masterItem)
+                        val latestPackPrice = RawMaterialPriceTracker.resolvePackUnitPrice(item, masterItem)
                         if (packsToAdd > 0.0) {
-                            inventoryDao?.addStock(masterItem.id, packsToAdd)
+                            if (latestPackPrice > 0.0) {
+                                inventoryDao?.addStockAndPrice(masterItem.id, packsToAdd, latestPackPrice)
+                            } else {
+                                inventoryDao?.addStock(masterItem.id, packsToAdd)
+                            }
+                            affectedIds.add(masterItem.id)
+                        } else if (latestPackPrice > 0.0) {
+                            inventoryDao?.updateInventoryItem(masterItem.copy(defaultPrice = latestPackPrice))
                             affectedIds.add(masterItem.id)
                         }
                     }
@@ -1732,15 +1742,18 @@ class FiltrRepository(
                 dirtyInventoryItemIds.add(itemId)
                 try {
                     val updatedItem = inventoryDao?.getInventoryItemById(itemId)
-                    if (updatedItem != null && supabaseService.updateInventoryStock(itemId, updatedItem.currentStock).isSuccess) {
+                    if (updatedItem != null && supabaseService.saveInventoryItem(updatedItem).isSuccess) {
                         dirtyInventoryItemIds.remove(itemId)
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to sync stock update to Supabase: ${e.message}")
+                    Log.w(TAG, "Failed to sync stock & price update to Supabase: ${e.message}")
                 }
             }
             try {
-                supabaseService.saveInventoryOrder(order, items)
+                val res = supabaseService.saveInventoryOrder(order, items)
+                if (res.isSuccess) {
+                    inventoryDao?.insertInventoryOrder(order.copy(syncStatus = "SYNCED"))
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync inventory order to Supabase: ${e.message}")
             }
@@ -3491,6 +3504,35 @@ class FiltrRepository(
             sharedText = sharedText,
             availableInventoryItems = currentItems,
             sourceLabel = sourceLabel
+        )
+    }
+
+    suspend fun syncInventoryPurchaseToSheets(
+        webhookUrl: String,
+        order: InventoryOrderEntity,
+        items: List<InventoryOrderItemEntity>
+    ): Result<String> {
+        if (webhookUrl.isBlank()) return Result.failure(IllegalArgumentException("Webhook URL not configured"))
+        val masterItems = try { allInventoryItems.first() } catch (_: Exception) { emptyList() }
+        val allOrders = try { allInventoryOrders.first() } catch (_: Exception) { emptyList() }
+        val summaries = RawMaterialPriceTracker.buildIngredientPricingSummaries(masterItems, allOrders)
+        return sheetsSyncService.syncInventoryPurchaseToGoogleSheets(
+            webhookUrl = webhookUrl,
+            order = order,
+            items = items,
+            pricingSummaries = summaries
+        )
+    }
+
+    suspend fun syncIngredientPricingToSheets(
+        webhookUrl: String,
+        summaries: List<IngredientPriceSummary>,
+        recentOrders: List<InventoryOrderWithItems>
+    ): Result<String> {
+        return sheetsSyncService.syncIngredientPricingToGoogleSheets(
+            webhookUrl = webhookUrl,
+            pricingSummaries = summaries,
+            recentOrders = recentOrders
         )
     }
 }

@@ -1,10 +1,14 @@
 package com.example.data.remote
 
 import android.util.Log
+import com.example.data.entity.InventoryOrderEntity
+import com.example.data.entity.InventoryOrderItemEntity
+import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
+import com.example.domain.inventory.IngredientPriceSummary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -554,6 +558,127 @@ class GoogleSheetsSyncService {
         }
     }
 
+    private fun ingredientSummaryToJson(summary: IngredientPriceSummary): JSONObject {
+        return JSONObject().apply {
+            put("itemName", summary.itemName)
+            put("category", summary.category)
+            put("unit", summary.unit)
+            put("packSize", summary.packSize)
+            put("currentStock", summary.currentStock)
+            put("latestRate", summary.latestRate)
+            put("previousRate", summary.previousRate ?: 0.0)
+            put("hasPreviousRate", summary.previousRate != null)
+            put("priceDelta", summary.priceDelta)
+            put("priceChangePercent", summary.priceChangePercent)
+            put("trend", summary.trend.name)
+            put("alertLabel", summary.alertLabel)
+            put("lastSupplier", summary.lastSupplier.ifBlank { "-" })
+            put("lastPurchasedAt", if (summary.lastPurchasedTimestamp > 0L) formatSheetDate(summary.lastPurchasedTimestamp) else "")
+            put("purchaseCount", summary.totalPurchasesCount)
+        }
+    }
+
+    suspend fun syncInventoryPurchaseToGoogleSheets(
+        webhookUrl: String,
+        order: InventoryOrderEntity,
+        items: List<InventoryOrderItemEntity>,
+        pricingSummaries: List<IngredientPriceSummary>
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
+        }
+
+        executeWithRetry("syncInventoryPurchase(${order.orderId})") {
+            try {
+                val urlWithParams = if (cleanUrl.contains("?")) "$cleanUrl&action=syncInventoryPurchase" else "$cleanUrl?action=syncInventoryPurchase"
+                val itemsArray = JSONArray()
+                items.forEach { line ->
+                    itemsArray.put(JSONObject().apply {
+                        put("orderId", order.orderId)
+                        put("itemName", line.itemName)
+                        put("quantity", line.quantity)
+                        put("unit", line.unit)
+                        put("unitPrice", line.unitPrice)
+                        put("subtotal", line.subtotal)
+                    })
+                }
+                val summariesArray = JSONArray()
+                pricingSummaries.forEach { summariesArray.put(ingredientSummaryToJson(it)) }
+
+                val payload = JSONObject().apply {
+                    put("action", "syncInventoryPurchase")
+                    put("orderId", order.orderId)
+                    put("timestamp", formatSheetDate(order.timestamp))
+                    put("supplierName", order.supplierName.ifBlank { "Supplier" })
+                    put("totalAmount", order.totalAmount)
+                    put("notes", order.notes)
+                    put("items", itemsArray)
+                    put("pricingSummaries", summariesArray)
+                }
+
+                val requestBody = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+                val request = Request.Builder().url(urlWithParams).post(requestBody).build()
+                client.newCall(request).execute().use { response ->
+                    parseMutationResponse(response, "Synced raw material bill & pricing to Excel/Sheets")
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+
+    suspend fun syncIngredientPricingToGoogleSheets(
+        webhookUrl: String,
+        pricingSummaries: List<IngredientPriceSummary>,
+        recentOrders: List<InventoryOrderWithItems>
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
+        }
+
+        executeWithRetry("syncIngredientPricing(${pricingSummaries.size})") {
+            try {
+                val urlWithParams = if (cleanUrl.contains("?")) "$cleanUrl&action=syncIngredientPricing" else "$cleanUrl?action=syncIngredientPricing"
+                val summariesArray = JSONArray()
+                pricingSummaries.forEach { summariesArray.put(ingredientSummaryToJson(it)) }
+
+                val purchasesArray = JSONArray()
+                recentOrders.sortedByDescending { it.order.timestamp }.take(200).forEach { bill ->
+                    val ts = formatSheetDate(bill.order.timestamp)
+                    bill.items.forEach { line ->
+                        purchasesArray.put(JSONObject().apply {
+                            put("orderId", bill.order.orderId)
+                            put("timestamp", ts)
+                            put("supplierName", bill.order.supplierName.ifBlank { "Supplier" })
+                            put("itemName", line.itemName)
+                            put("quantity", line.quantity)
+                            put("unit", line.unit)
+                            put("unitPrice", line.unitPrice)
+                            put("subtotal", line.subtotal)
+                            put("notes", bill.order.notes)
+                        })
+                    }
+                }
+
+                val payload = JSONObject().apply {
+                    put("action", "syncIngredientPricing")
+                    put("pricingSummaries", summariesArray)
+                    put("purchases", purchasesArray)
+                }
+
+                val requestBody = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+                val request = Request.Builder().url(urlWithParams).post(requestBody).build()
+                client.newCall(request).execute().use { response ->
+                    parseMutationResponse(response, "Ingredient pricing balanced to Google Sheets (${pricingSummaries.size} items)")
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+
     companion object {
         const val GOOGLE_APPS_SCRIPT_TEMPLATE = """
 // ============================================================================
@@ -605,6 +730,11 @@ var HEADERS = {
               "Avg Order Value (₹)", "Calculated At"],
   FILTERED: ["Order ID", "Timestamp", "Customer Name", "Contact Number", "Total Amount",
              "Payment Status", "Payment Mode", "Kitchen Status", "Delivery Status"],
+  INGREDIENT_PRICING: ["Ingredient Name", "Category", "Unit", "Pack Size", "Current Stock",
+                       "Last Rate (₹)", "Previous Rate (₹)", "Price Diff (₹)", "Change (%)",
+                       "Price Alert", "Last Supplier", "Last Purchased", "Total Bills"],
+  INVENTORY_PURCHASES: ["Bill ID", "Date", "Supplier", "Ingredient Name", "Quantity",
+                        "Unit", "Unit Rate (₹)", "Subtotal (₹)", "Notes"],
   LOG: ["Timestamp", "Action", "Details", "Status", "Duration (ms)"]
 };
 
@@ -724,6 +854,26 @@ function doPost(e) {
         (data.startDate || "ALL") + " to " + (data.endDate || "ALL") + " | " + rangeOrders.length + " orders",
         "OK", Date.now() - startTime);
       return successResponse_("Range analytics calculated: " + rangeOrders.length + " orders");
+    }
+
+    // ---- RAW MATERIAL PURCHASE & INGREDIENT PRICING ----
+    if (action === "syncInventoryPurchase") {
+      withLock_(function() {
+        syncInventoryPurchase_(ss, data);
+      });
+      logSync_(ss, "syncInventoryPurchase", "bill=" + (data.orderId || ""), "OK", Date.now() - startTime);
+      return successResponse_("Inventory purchase & pricing synced");
+    }
+
+    if (action === "syncIngredientPricing") {
+      var summaries = data.pricingSummaries || [];
+      var purchases = data.purchases || [];
+      withLock_(function() {
+        syncIngredientPricingSheet_(ss, summaries);
+        syncInventoryPurchaseRows_(ss, purchases);
+      });
+      logSync_(ss, "syncIngredientPricing", summaries.length + " ingredients", "OK", Date.now() - startTime);
+      return successResponse_("Ingredient pricing updated: " + summaries.length + " items");
     }
 
     // ---- SYNC SINGLE ORDER (default fallback) ----
@@ -1531,6 +1681,104 @@ function menuViewSyncLog_() {
   } else {
     SpreadsheetApp.getUi().alert("No sync log found. Sync some orders first!");
   }
+}
+
+// ======================== INVENTORY PRICING & PURCHASES ========================
+
+function syncInventoryPurchase_(ss, data) {
+  if (!data) return;
+  var rows = [];
+  var items = data.items || [];
+  for (var i = 0; i < items.length; i++) {
+    var line = items[i];
+    rows.push({
+      orderId: data.orderId || line.orderId || "",
+      timestamp: data.timestamp || formatDate_(new Date()),
+      supplierName: data.supplierName || "Supplier",
+      itemName: line.itemName || "",
+      quantity: line.quantity || 0,
+      unit: line.unit || "",
+      unitPrice: line.unitPrice || 0,
+      subtotal: line.subtotal || 0,
+      notes: data.notes || ""
+    });
+  }
+  syncInventoryPurchaseRows_(ss, rows);
+  if (data.pricingSummaries && data.pricingSummaries.length > 0) {
+    syncIngredientPricingSheet_(ss, data.pricingSummaries);
+  }
+}
+
+function syncInventoryPurchaseRows_(ss, purchaseRows) {
+  if (!purchaseRows || purchaseRows.length === 0) return;
+  var sheet = ensureSheet_(ss, "Inventory_Purchases", HEADERS.INVENTORY_PURCHASES);
+  var existingKeys = {};
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    var existingVals = sheet.getRange(2, 1, lastRow - 1, 4).getDisplayValues();
+    for (var r = 0; r < existingVals.length; r++) {
+      var k = String(existingVals[r][0]).replace(/^'/, "").trim().toLowerCase() + "::" + String(existingVals[r][3]).trim().toLowerCase();
+      existingKeys[k] = r + 2;
+    }
+  }
+  for (var i = 0; i < purchaseRows.length; i++) {
+    var p = purchaseRows[i];
+    var rowData = [
+      "'" + String(p.orderId || ""),
+      p.timestamp || "",
+      p.supplierName || "Supplier",
+      p.itemName || "",
+      roundNum_(Number(p.quantity || 0)),
+      p.unit || "",
+      roundNum_(Number(p.unitPrice || 0)),
+      roundNum_(Number(p.subtotal || 0)),
+      p.notes || ""
+    ];
+    var key = String(p.orderId || "").replace(/^'/, "").trim().toLowerCase() + "::" + String(p.itemName || "").trim().toLowerCase();
+    if (existingKeys[key]) {
+      sheet.getRange(existingKeys[key], 1, 1, rowData.length).setValues([rowData]);
+    } else {
+      sheet.appendRow(rowData);
+    }
+  }
+}
+
+function syncIngredientPricingSheet_(ss, summaries) {
+  var sheet = ensureSheet_(ss, "Ingredient_Pricing", HEADERS.INGREDIENT_PRICING);
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, HEADERS.INGREDIENT_PRICING.length).clearContent();
+  }
+  if (!summaries || summaries.length === 0) return;
+
+  var rows = [];
+  var bgColors = [];
+  for (var i = 0; i < summaries.length; i++) {
+    var s = summaries[i];
+    rows.push([
+      s.itemName || "",
+      s.category || "General",
+      s.unit || "kg",
+      roundNum_(Number(s.packSize || 1)),
+      roundNum_(Number(s.currentStock || 0)),
+      roundNum_(Number(s.latestRate || 0)),
+      s.hasPreviousRate ? roundNum_(Number(s.previousRate || 0)) : "",
+      roundNum_(Number(s.priceDelta || 0)),
+      roundNum_(Number(s.priceChangePercent || 0)) + "%",
+      s.alertLabel || "",
+      s.lastSupplier || "-",
+      s.lastPurchasedAt || "",
+      Number(s.purchaseCount || 0)
+    ]);
+    var rowBg = "#FFFFFF";
+    if (s.trend === "INCREASED") rowBg = "#FEE2E2";
+    else if (s.trend === "DECREASED") rowBg = "#DCFCE7";
+    bgColors.push([rowBg]);
+  }
+  var range = sheet.getRange(2, 1, rows.length, HEADERS.INGREDIENT_PRICING.length);
+  range.setValues(rows);
+  // Highlight Price Alert column (col 10) for immediate price-hike visibility in Excel/Sheets
+  sheet.getRange(2, 10, rows.length, 1).setBackgrounds(bgColors);
 }
 """
     }

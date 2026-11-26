@@ -34,6 +34,8 @@ import com.example.data.entity.calculatePacksAndCost
 import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.InventoryUsageEntity
 import com.example.data.entity.OrderWithItems
+import com.example.domain.inventory.IngredientPriceSummary
+import com.example.domain.inventory.PriceTrend
 import com.example.ui.BillingUiState
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
@@ -70,7 +72,10 @@ fun InventoriesScreen(
     onDeleteInventoryItem: (InventoryItemEntity) -> Unit,
     onDismissInventoryMaster: () -> Unit,
     onDismissAddInventoryItem: () -> Unit,
-    onSearchQueryChanged: (String) -> Unit
+    onSearchQueryChanged: (String) -> Unit,
+    pricingSummaries: List<IngredientPriceSummary> = emptyList(),
+    onSyncPricingToSheets: (() -> Unit)? = null,
+    onExportPricingCsv: (() -> Unit)? = null
 ) {
     // Date filter state (mirrors Analytics Dashboard)
     var dateFilter by remember { mutableStateOf("TODAY") } // TODAY, YESTERDAY, LAST_7_DAYS, THIS_MONTH, ALL_TIME, CUSTOM
@@ -355,14 +360,37 @@ fun InventoriesScreen(
                 )
             }
 
-            Button(
-                onClick = onOpenInventoryMaster,
-                colors = ButtonDefaults.buttonColors(containerColor = SurfaceVariantColor, contentColor = Color.White),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Inv Master", fontWeight = FontWeight.Bold)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (onExportPricingCsv != null) {
+                    OutlinedButton(
+                        onClick = onExportPricingCsv,
+                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.6f)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF34D399)),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Excel", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+                if (onSyncPricingToSheets != null) {
+                    Button(
+                        onClick = onSyncPricingToSheets,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981), contentColor = Color.Black),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Sheets", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+                Button(
+                    onClick = onOpenInventoryMaster,
+                    colors = ButtonDefaults.buttonColors(containerColor = SurfaceVariantColor, contentColor = Color.White),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Inv Master", fontWeight = FontWeight.Bold)
+                }
             }
         }
 
@@ -962,11 +990,15 @@ fun InventoriesScreen(
                     val dailyBurnPacks = if (periodDays > 0) packsConsumed / periodDays else 0.0
                     val daysLeft = if (dailyBurnPacks > 0) (item.currentStock / dailyBurnPacks).toInt() else null
 
+                    val priceSummary = pricingSummaries.firstOrNull {
+                        it.itemId == item.id || it.itemName.equals(item.name, ignoreCase = true)
+                    }
                     InventoryItemCard(
                         item = item,
                         daysLeft = daysLeft,
                         dateRangeLabel = dateRangeLabel,
                         consumptionRecord = consumptionRecord,
+                        priceSummary = priceSummary,
                         isEditing = state.editingStockItemId == item.id,
                         onUpdateStock = { onUpdateStock(item.id, it) },
                         onStartEditingStock = { onStartEditingStock(item.id) },
@@ -1025,6 +1057,7 @@ fun InventoryItemCard(
     daysLeft: Int?,
     dateRangeLabel: String = "Today",
     consumptionRecord: ItemConsumptionRecord? = null,
+    priceSummary: IngredientPriceSummary? = null,
     isEditing: Boolean,
     onUpdateStock: (Double) -> Unit,
     onStartEditingStock: () -> Unit,
@@ -1103,6 +1136,29 @@ fun InventoryItemCard(
                         color = Color.White,
                         fontSize = 13.sp
                     )
+
+                    if (priceSummary != null && priceSummary.latestRate > 0.0) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        val isHike = priceSummary.trend == PriceTrend.INCREASED
+                        val isDrop = priceSummary.trend == PriceTrend.DECREASED
+                        val rateColor = when {
+                            isHike -> Color(0xFFFCA5A5)
+                            isDrop -> Color(0xFF34D399)
+                            else -> TextGray
+                        }
+                        val rateLabel = buildString {
+                            append("Last Rate: ₹${formatDouble(priceSummary.latestRate)}/${item.unit}")
+                            if (priceSummary.previousRate != null) {
+                                append(" (prev ₹${formatDouble(priceSummary.previousRate)} • ${priceSummary.alertLabel})")
+                            }
+                        }
+                        Text(
+                            text = rateLabel,
+                            color = rateColor,
+                            fontSize = 11.sp,
+                            fontWeight = if (isHike || isDrop) FontWeight.Bold else FontWeight.Medium
+                        )
+                    }
 
                     // Consumption Pill for the selected period
                     if (consumptionRecord != null && consumptionRecord.totalQuantityUsed > 0) {

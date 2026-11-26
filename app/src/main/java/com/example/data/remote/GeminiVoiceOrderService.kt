@@ -11,6 +11,7 @@ import com.example.voice.engine.MenuCatalog
 import com.example.voice.model.VoiceOrderState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
@@ -49,23 +50,112 @@ class GeminiVoiceOrderService {
     )
 
     companion object {
+        private const val GEMINI_BASE_URL =
+            "https://generativelanguage.googleapis.com/v1beta/models"
         private const val GEMINI_GENERATE_URL =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            "$GEMINI_BASE_URL/gemini-2.5-flash:generateContent"
+        private val FALLBACK_MODELS = listOf(
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite"
+        )
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         private val sharedClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
-                .writeTimeout(30, TimeUnit.SECONDS)
-                .callTimeout(35, TimeUnit.SECONDS)
+                .readTimeout(40, TimeUnit.SECONDS)
+                .writeTimeout(40, TimeUnit.SECONDS)
+                .callTimeout(45, TimeUnit.SECONDS)
                 .build()
         }
     }
 
-    private fun resolveApiKey(): String? {
-        val key = BuildConfig.GEMINI_API_KEY.trim()
-        return key.takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+    private fun resolveApiKeys(): List<String> {
+        val local = BuildConfig.GEMINI_API_KEY.trim()
+            .takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+        val remote = try {
+            // Best-effort read from cached config if initialized
+            null
+        } catch (_: Exception) {
+            null
+        }
+        return listOfNotNull(local, remote).distinct()
+    }
+
+    private suspend fun resolveApiKeysAndModels(): Pair<List<String>, List<String>> {
+        val local = resolveApiKeys()
+        val remoteConfig = try {
+            val sb = SupabaseService.getInstance()
+            if (sb.isInitialized) sb.fetchGeminiConfig() else null
+        } catch (_: Exception) {
+            null
+        }
+        val keys = (local + remoteConfig?.apiKeys.orEmpty())
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+            .distinct()
+        val models = (remoteConfig?.models.orEmpty() + FALLBACK_MODELS)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        return keys to models
+    }
+
+    private fun resolveApiKey(): String? = resolveApiKeys().firstOrNull()
+
+    private fun buildGeminiRequestForModel(apiKey: String, model: String, payload: JSONObject): Request {
+        val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+        return Request.Builder()
+            .url("$GEMINI_BASE_URL/$model:generateContent")
+            .addHeader("x-goog-api-key", apiKey)
+            .post(body)
+            .build()
+    }
+
+    /**
+     * Executes Gemini generation across fallback models and API keys with short backoff on
+     * transient 429 (rate limit), 500, or 503 (high demand) errors so receipt parsing never
+     * gets stuck on a single busy model.
+     */
+    private suspend fun executeWithModelFallback(
+        payload: JSONObject
+    ): Result<String> {
+        val (keys, models) = resolveApiKeysAndModels()
+        if (keys.isEmpty()) {
+            return Result.failure(IllegalStateException("Gemini API key is not configured"))
+        }
+
+        var lastFailure: String = "Gemini request failed"
+        for ((modelIdx, model) in models.withIndex()) {
+            for (apiKey in keys) {
+                try {
+                    val response = executeRequest(buildGeminiRequestForModel(apiKey, model, payload))
+                    if (response.isSuccessful) {
+                        val text = extractGeminiText(response.body)
+                        if (text.isNotBlank()) {
+                            return Result.success(text)
+                        }
+                        lastFailure = "Model $model returned empty content"
+                    } else {
+                        lastFailure = "Model $model returned HTTP ${response.code}"
+                        val isBusyOrTransient = response.code == 429 || response.code == 503 || response.code >= 500
+                        if (!isBusyOrTransient && response.code != 404) {
+                            // Try next key if auth/quota issue, else continue cleanly
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastFailure = "$model network error: ${e.message ?: "timeout"}"
+                }
+            }
+            if (modelIdx < models.lastIndex) {
+                delay(450L * (modelIdx + 1))
+            }
+        }
+        return Result.failure(Exception("All AI models busy/unavailable ($lastFailure)"))
     }
 
     private suspend fun executeRequest(request: Request): HttpResult =
@@ -200,15 +290,12 @@ class GeminiVoiceOrderService {
                 })
             }
 
-            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
-            if (!response.isSuccessful) {
+            val aiResult = executeWithModelFallback(requestJson)
+            if (aiResult.isFailure) {
                 return@withContext parseOrderLocally(cleanedTranscript, availableItems)
             }
 
-            val textResponse = extractGeminiText(response.body)
-            if (textResponse.isBlank()) {
-                return@withContext parseOrderLocally(cleanedTranscript, availableItems)
-            }
+            val textResponse = aiResult.getOrThrow()
 
             val parsedOrderJson = JSONObject(textResponse)
             val customerName = parsedOrderJson.optString("customerName", "Walk-in Customer").trim()
@@ -332,15 +419,12 @@ class GeminiVoiceOrderService {
                 })
             }
 
-            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
-            if (!response.isSuccessful) {
-                return@withContext Result.failure(Exception("Gemini API error (HTTP ${response.code})"))
+            val aiResult = executeWithModelFallback(requestJson)
+            if (aiResult.isFailure) {
+                return@withContext Result.failure(aiResult.exceptionOrNull() ?: Exception("Gemini API error"))
             }
 
-            val textResponse = extractGeminiText(response.body)
-            if (textResponse.isBlank()) {
-                return@withContext Result.failure(Exception("Gemini returned an empty response"))
-            }
+            val textResponse = aiResult.getOrThrow()
 
             val parsedOrderJson = JSONObject(textResponse)
             val rawTranscript = parsedOrderJson.optString("rawTranscript", "").trim()
@@ -458,12 +542,12 @@ class GeminiVoiceOrderService {
                 })
             }
 
-            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
-            if (!response.isSuccessful) {
-                return@withContext Result.failure(Exception("Gemini API error (HTTP ${response.code})"))
+            val aiResult = executeWithModelFallback(requestJson)
+            if (aiResult.isFailure) {
+                return@withContext Result.failure(aiResult.exceptionOrNull() ?: Exception("Gemini API error"))
             }
 
-            val textResponse = extractGeminiText(response.body)
+            val textResponse = aiResult.getOrThrow()
             if (textResponse.isNotBlank()) {
                 Result.success(textResponse.replace("\"", "").trim())
             } else {
@@ -487,17 +571,17 @@ class GeminiVoiceOrderService {
         sourceLabel: String = "Shared Receipt"
     ): Result<ParsedRawMaterialReceipt> = withContext(Dispatchers.IO) {
         val cleanText = sharedText.trim()
-        val apiKey = resolveApiKey()
-        if (apiKey == null) {
+        if (attachments.isEmpty() && cleanText.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("No receipt file or text provided"))
+        }
+
+        val (keys, _) = resolveApiKeysAndModels()
+        if (keys.isEmpty()) {
             return@withContext if (cleanText.isNotBlank()) {
                 RawMaterialReceiptParser.parsePlainTextReceipt(cleanText, availableInventoryItems, sourceLabel)
             } else {
                 Result.failure(IllegalStateException("Gemini API key is not configured for PDF/image extraction"))
             }
-        }
-
-        if (attachments.isEmpty() && cleanText.isBlank()) {
-            return@withContext Result.failure(IllegalArgumentException("No receipt file or text provided"))
         }
 
         try {
@@ -571,21 +655,16 @@ class GeminiVoiceOrderService {
                 })
             }
 
-            val response = executeRequest(buildGeminiRequest(apiKey, requestJson))
-            if (!response.isSuccessful) {
+            val aiResult = executeWithModelFallback(requestJson)
+            if (aiResult.isFailure) {
                 if (cleanText.isNotBlank()) {
                     val offline = RawMaterialReceiptParser.parsePlainTextReceipt(cleanText, availableInventoryItems, sourceLabel)
                     if (offline.isSuccess) return@withContext offline
                 }
-                return@withContext Result.failure(Exception("Gemini API error (HTTP ${response.code})"))
+                return@withContext Result.failure(aiResult.exceptionOrNull() ?: Exception("AI extraction failed"))
             }
 
-            val textResponse = extractGeminiText(response.body)
-            if (textResponse.isBlank()) {
-                return@withContext Result.failure(Exception("Gemini returned an empty response"))
-            }
-
-            RawMaterialReceiptParser.parseGeminiReceiptJson(textResponse, availableInventoryItems, sourceLabel)
+            RawMaterialReceiptParser.parseGeminiReceiptJson(aiResult.getOrThrow(), availableInventoryItems, sourceLabel)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

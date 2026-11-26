@@ -37,6 +37,8 @@ import com.example.data.entity.InventoryItemEntity
 import com.example.data.entity.InventoryOrderEntity
 import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryOrderWithItems
+import com.example.domain.inventory.IngredientPriceSummary
+import com.example.domain.inventory.PriceTrend
 import com.example.ui.BillingUiState
 import com.example.ui.InventoryOrderItemInput
 import kotlinx.coroutines.delay
@@ -69,7 +71,12 @@ fun InventoryOrderScreen(
     onDismissAddInventoryItem: () -> Unit,
     onSearchQueryChanged: (String) -> Unit,
     onUpdateInventoryItem: (InventoryItemEntity) -> Unit = {},
-    onImportReceiptClick: (() -> Unit)? = null
+    onImportReceiptClick: (() -> Unit)? = null,
+    pricingSummaries: List<IngredientPriceSummary> = emptyList(),
+    onRetryQueuedReceipt: (String) -> Unit = {},
+    onDismissQueuedReceipt: (String) -> Unit = {},
+    onSyncPricingToSheets: (() -> Unit)? = null,
+    onExportPricingCsv: (() -> Unit)? = null
 ) {
     // Date filter state
     var dateFilter by remember { mutableStateOf("THIS_MONTH") } // TODAY, YESTERDAY, LAST_7_DAYS, THIS_MONTH, ALL_TIME, CUSTOM
@@ -204,7 +211,8 @@ fun InventoryOrderScreen(
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBackground),
+            .background(DarkBackground)
+            .testTag("inventory_orders_list"),
         contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 80.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -567,6 +575,168 @@ fun InventoryOrderScreen(
             }
         }
 
+        // Excel / Google Sheets Price Balance & Export Strip + Price Hike Alerts
+        val priceIncreaseAlerts = pricingSummaries.filter { it.trend == PriceTrend.INCREASED }
+        if (onSyncPricingToSheets != null || onExportPricingCsv != null || priceIncreaseAlerts.isNotEmpty()) {
+            item(key = "excel_pricing_strip") {
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = SurfaceColor),
+                    border = BorderStroke(
+                        1.dp,
+                        if (priceIncreaseAlerts.isNotEmpty()) Color(0xFFEF4444).copy(alpha = 0.55f) else SurfaceVariantColor
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "EXCEL PRICING & HIKE TRACKER",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    letterSpacing = 0.5.sp
+                                )
+                                Text(
+                                    text = if (priceIncreaseAlerts.isNotEmpty()) {
+                                        "↑ ${priceIncreaseAlerts.size} ingredient price increase(s) detected"
+                                    } else {
+                                        "${pricingSummaries.size} ingredient rates tracked (Latest vs Previous)"
+                                    },
+                                    color = if (priceIncreaseAlerts.isNotEmpty()) Color(0xFFFCA5A5) else TextGray,
+                                    fontSize = 11.sp
+                                )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (onExportPricingCsv != null) {
+                                    OutlinedButton(
+                                        onClick = onExportPricingCsv,
+                                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.6f)),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF34D399)),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.height(32.dp)
+                                    ) {
+                                        Text("Excel CSV", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                                if (onSyncPricingToSheets != null) {
+                                    Button(
+                                        onClick = onSyncPricingToSheets,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = Color(0xFF10B981),
+                                            contentColor = Color.Black
+                                        ),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.height(32.dp)
+                                    ) {
+                                        Text("Sync Sheet", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                        if (priceIncreaseAlerts.isNotEmpty()) {
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                items(priceIncreaseAlerts.take(8), key = { "hike_${it.itemName}" }) { alert ->
+                                    Surface(
+                                        color = Color(0xFFEF4444).copy(alpha = 0.16f),
+                                        border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.45f)),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Text(
+                                            text = "${alert.itemName}: ₹${String.format(Locale.US, "%.0f", alert.previousRate ?: 0.0)} → ₹${String.format(Locale.US, "%.0f", alert.latestRate)} (+${String.format(Locale.US, "%.0f", alert.priceChangePercent)}%)",
+                                            color = Color(0xFFFCA5A5),
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Visible Queued Bills Retry Banner (never leaves shared receipts in limbo)
+        if (state.pendingReceiptQueue.isNotEmpty()) {
+            item(key = "pending_receipt_queue") {
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF451A03)),
+                    border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.6f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "⏳ ${state.pendingReceiptQueue.size} Queued Receipt(s) Waiting for AI Scan",
+                            color = AmberAccent,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        state.pendingReceiptQueue.forEach { intake ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(DarkBackground.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = intake.sourceLabel,
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    if (intake.lastError.isNotBlank()) {
+                                        Text(
+                                            text = "Attempts: ${intake.attemptCount} • ${intake.lastError}",
+                                            color = Color(0xFFFCA5A5),
+                                            fontSize = 10.sp,
+                                            maxLines = 2
+                                        )
+                                    }
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Button(
+                                        onClick = { onRetryQueuedReceipt(intake.id) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = Color.Black),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.height(30.dp)
+                                    ) {
+                                        Text("Retry AI", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                    TextButton(
+                                        onClick = { onDismissQueuedReceipt(intake.id) },
+                                        contentPadding = PaddingValues(horizontal = 6.dp),
+                                        modifier = Modifier.height(30.dp)
+                                    ) {
+                                        Text("Clear", color = TextGray, fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Orders List
         if (displayOrders.isEmpty()) {
             item(key = "empty_state") {
@@ -723,6 +893,20 @@ fun InventoryOrderCard(
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                            )
+                        }
+
+                        val isOrderSynced = order.syncStatus.equals("SYNCED", ignoreCase = true)
+                        Surface(
+                            color = if (isOrderSynced) Color(0xFF10B981).copy(alpha = 0.16f) else AmberAccent.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = if (isOrderSynced) "Synced ✓" else "Pending Sync",
+                                color = if (isOrderSynced) Color(0xFF34D399) else AmberAccent,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                             )
                         }
 
@@ -980,6 +1164,7 @@ fun AddInventoryOrderDialog(
     initialItems: List<InventoryOrderItemInput> = emptyList(),
     sharedBannerText: String? = null,
     sharedErrorText: String? = null,
+    onRetryAiScan: (() -> Unit)? = null,
     requiresAdminUnlock: Boolean = false,
     onRequestAdminUnlock: () -> Unit = {}
 ) {
@@ -1076,10 +1261,22 @@ fun AddInventoryOrderDialog(
                                 )
                                 if (!sharedErrorText.isNullOrBlank()) {
                                     Text(
-                                        text = "Could not auto-read everything ($sharedErrorText) — please verify or enter items below.",
+                                        text = "Could not auto-read everything ($sharedErrorText) — verify or retry AI scan below.",
                                         color = Color(0xFFFCA5A5),
                                         fontSize = 11.sp
                                     )
+                                    if (onRetryAiScan != null) {
+                                        OutlinedButton(
+                                            onClick = onRetryAiScan,
+                                            border = BorderStroke(1.dp, AmberAccent),
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberAccent),
+                                            shape = RoundedCornerShape(8.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.padding(top = 4.dp).height(32.dp)
+                                        ) {
+                                            Text("Retry AI Scan", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
                                 }
                             }
                         }

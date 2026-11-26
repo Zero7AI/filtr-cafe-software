@@ -7,13 +7,19 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToKey
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.database.FiltrDatabase
 import com.example.data.entity.AttendanceLogEntity
 import com.example.data.entity.InventoryItemEntity
+import com.example.data.entity.InventoryOrderEntity
+import com.example.data.entity.InventoryOrderItemEntity
+import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.KdsItemClaimEntity
 import com.example.data.entity.KitchenInventoryEntryEntity
 import com.example.data.entity.KitchenInventoryShiftEntity
@@ -26,6 +32,8 @@ import com.example.domain.attendance.DayAttendanceStatus
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
+import com.example.domain.inventory.PendingReceiptIntake
+import com.example.domain.inventory.RawMaterialPriceTracker
 import com.example.domain.kds.KdsQueueBuilder
 import com.example.domain.kitchen.KitchenInventorySeedCatalog
 import com.example.domain.kitchen.KitchenSection
@@ -36,6 +44,7 @@ import com.example.ui.KitchenInventoryDashboardSummary
 import com.example.ui.KitchenInventoryViewRoute
 import com.example.ui.screens.AddInventoryOrderDialog
 import com.example.ui.screens.AttendanceScreen
+import com.example.ui.screens.InventoryOrderScreen
 import com.example.ui.screens.KdsScreen
 import com.example.ui.screens.KitchenInventoryScreen
 import com.example.ui.screens.OrdersScreen
@@ -568,5 +577,69 @@ class DatabaseMigrationAndUiCrashTest {
         composeTestRule.onNodeWithText("Save Order").performClick()
         assertEquals("Blinkit Wholesale", savedSupplier)
         assertEquals(1, savedCount)
+    }
+
+    @Test
+    fun `inventory order screen renders excel price hike strip queued retry card and sync badge`() {
+        val now = System.currentTimeMillis()
+        val milk = InventoryItemEntity(id = 1, name = "Milk", category = "Dairy", unit = "L", standardQuantity = 1.0, defaultPrice = 72.0)
+        val b1 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-1", now - 60_000L, "Metro", 650.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(1, "INV-1", "Milk", 10.0, "L", 65.0, 650.0))
+        )
+        val b2 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-2", now, "Blinkit", 720.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(2, "INV-2", "Milk", 10.0, "L", 72.0, 720.0))
+        )
+        val summaries = RawMaterialPriceTracker.buildIngredientPricingSummaries(listOf(milk), listOf(b1, b2))
+        var retriedId = ""
+
+        composeTestRule.setContent {
+            FiltrTheme {
+                InventoryOrderScreen(
+                    state = BillingUiState(
+                        pendingReceiptQueue = listOf(
+                            PendingReceiptIntake(
+                                id = "q1",
+                                sourceLabel = "metro_bill.pdf",
+                                lastError = "Offline during share",
+                                attemptCount = 1
+                            )
+                        )
+                    ),
+                    inventoryOrders = listOf(b1, b2),
+                    inventoryItems = listOf(milk),
+                    pricingSummaries = summaries,
+                    onOpenAddOrder = {},
+                    onOpenInventoryMaster = {},
+                    onDeleteOrder = {},
+                    onConfirmDeleteOrder = {},
+                    onDismissDeleteOrder = {},
+                    onSaveOrder = { _, _, _ -> },
+                    onDismissAddOrder = {},
+                    onSaveInventoryItem = { _, _, _, _, _ -> },
+                    onEditInventoryItem = {},
+                    onDeleteInventoryItem = {},
+                    onDismissInventoryMaster = {},
+                    onDismissAddInventoryItem = {},
+                    onSearchQueryChanged = {},
+                    onRetryQueuedReceipt = { retriedId = it },
+                    onSyncPricingToSheets = {},
+                    onExportPricingCsv = {}
+                )
+            }
+        }
+
+        composeTestRule.onNodeWithText("EXCEL PRICING & HIKE TRACKER").assertExists()
+        composeTestRule.onNodeWithText("Excel CSV").assertExists()
+        composeTestRule.onNodeWithText("Sync Sheet").assertExists()
+        composeTestRule.onNodeWithTag("inventory_orders_list").performScrollToKey("pending_receipt_queue")
+        composeTestRule.onNodeWithText("metro_bill.pdf").assertExists()
+        composeTestRule.onNodeWithText("Retry AI").performClick()
+        assertEquals("q1", retriedId)
+        composeTestRule.onNodeWithTag("inventory_orders_list").performScrollToKey("INV-2")
+        composeTestRule.onAllNodesWithText("Synced ✓", substring = true).fetchSemanticsNodes().let {
+            assertTrue("Expected at least one Synced badge", it.isNotEmpty())
+        }
     }
 }
