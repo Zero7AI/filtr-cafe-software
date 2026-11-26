@@ -1618,6 +1618,7 @@ class MainActivity : ComponentActivity() {
                                     isLoading = uiState.isLoadingDevices,
                                     onRefresh = { viewModel.refreshRegisteredDevices() },
                                     onUpdateDeviceStatus = { key, status -> viewModel.updateRemoteDeviceStatus(key, status) },
+                                    onUpdateDeviceRole = { key, role -> viewModel.updateRemoteDeviceRole(key, role) },
                                     onSavePolicy = { adminCode, staffCode, reqApproval, forceReverify ->
                                         viewModel.saveAccessPolicy(adminCode, staffCode, reqApproval, forceReverify)
                                     },

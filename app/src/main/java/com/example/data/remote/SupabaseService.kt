@@ -34,6 +34,30 @@ class SupabaseService private constructor() {
         fun getInstance(): SupabaseService = INSTANCE ?: synchronized(this) {
             INSTANCE ?: SupabaseService().also { INSTANCE = it }
         }
+
+        fun resolveDeviceAccessStatus(remoteStatus: String?, localStatus: String): String {
+            return when {
+                remoteStatus == "REVOKED" -> "REVOKED"
+                remoteStatus == "PENDING" -> "PENDING"
+                remoteStatus == "ACTIVE" && (localStatus == "PENDING" || localStatus == "REVOKED") -> "ACTIVE"
+                else -> localStatus
+            }
+        }
+
+        fun resolveDeviceRole(
+            remoteRole: String?,
+            remoteRoleUpdatedAtMs: Long,
+            localRole: String,
+            localRoleUpdatedAtMs: Long
+        ): Pair<String, Long> {
+            val normalizedRemote = remoteRole?.uppercase()?.takeIf { it == "ADMIN" || it == "STAFF" }
+            val normalizedLocal = if (localRole.equals("ADMIN", ignoreCase = true)) "ADMIN" else "STAFF"
+            return if (normalizedRemote != null && remoteRoleUpdatedAtMs > localRoleUpdatedAtMs) {
+                normalizedRemote to remoteRoleUpdatedAtMs
+            } else {
+                normalizedLocal to maxOf(localRoleUpdatedAtMs, remoteRoleUpdatedAtMs)
+            }
+        }
     }
 
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -1697,7 +1721,8 @@ class SupabaseService private constructor() {
         val status: String, // "ACTIVE", "PENDING", "REVOKED"
         val passcodeEpoch: Int = 1,
         val firstSeenMs: Long = System.currentTimeMillis(),
-        val lastSeenMs: Long = System.currentTimeMillis()
+        val lastSeenMs: Long = System.currentTimeMillis(),
+        val roleUpdatedAtMs: Long = 0L
     )
 
     suspend fun fetchAccessPolicyConfig(): AccessPolicyConfig = withContext(Dispatchers.IO) {
@@ -1746,7 +1771,8 @@ class SupabaseService private constructor() {
                 status = json.optNonNullString("status", "ACTIVE"),
                 passcodeEpoch = json.optInt("passcode_epoch", 1),
                 firstSeenMs = json.optLong("first_seen_ms", System.currentTimeMillis()),
-                lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis())
+                lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis()),
+                roleUpdatedAtMs = json.optLong("role_updated_at_ms", 0L)
             )
         } catch (e: Exception) {
             null
@@ -1766,6 +1792,7 @@ class SupabaseService private constructor() {
             put("passcode_epoch", reg.passcodeEpoch)
             put("first_seen_ms", reg.firstSeenMs)
             put("last_seen_ms", reg.lastSeenMs)
+            put("role_updated_at_ms", reg.roleUpdatedAtMs)
         }.toString()
     }
 
@@ -1782,7 +1809,8 @@ class SupabaseService private constructor() {
         appVersionName: String,
         appVersionCode: Int,
         localStatus: String,
-        passcodeEpoch: Int
+        passcodeEpoch: Int,
+        localRoleUpdatedAtMs: Long = 0L
     ): DeviceRegistration? = withContext(Dispatchers.IO) {
         if (!_isInitialized) initialize()
         val key = "device_reg_$deviceId"
@@ -1791,18 +1819,19 @@ class SupabaseService private constructor() {
                 ?: fetchSyncMetadata("device_reg_${appRole.lowercase()}_$deviceId")
             val existing = if (!existingRaw.isNullOrBlank()) parseDeviceRegistration(key, existingRaw) else null
 
-            // Remote REVOKED and PENDING always take precedence; clients cannot self-promote PENDING -> ACTIVE
-            val resolvedStatus = when {
-                existing?.status == "REVOKED" -> "REVOKED"
-                existing?.status == "PENDING" -> "PENDING"
-                existing?.status == "ACTIVE" && localStatus == "PENDING" -> "ACTIVE"
-                else -> localStatus
-            }
+            // Remote REVOKED and PENDING always take precedence; remote ACTIVE promotes restored REVOKED or approved PENDING devices
+            val resolvedStatus = resolveDeviceAccessStatus(existing?.status, localStatus)
+            val (resolvedRole, resolvedRoleUpdatedAtMs) = resolveDeviceRole(
+                remoteRole = existing?.appRole,
+                remoteRoleUpdatedAtMs = existing?.roleUpdatedAtMs ?: 0L,
+                localRole = appRole,
+                localRoleUpdatedAtMs = localRoleUpdatedAtMs
+            )
 
             val updated = DeviceRegistration(
                 registryKey = key,
                 deviceId = deviceId,
-                appRole = appRole,
+                appRole = resolvedRole,
                 operatorName = operatorName.ifBlank { existing?.operatorName ?: "Unassigned Device" },
                 deviceModel = deviceModel,
                 androidVersion = androidVersion,
@@ -1811,7 +1840,8 @@ class SupabaseService private constructor() {
                 status = resolvedStatus,
                 passcodeEpoch = passcodeEpoch,
                 firstSeenMs = existing?.firstSeenMs ?: System.currentTimeMillis(),
-                lastSeenMs = System.currentTimeMillis()
+                lastSeenMs = System.currentTimeMillis(),
+                roleUpdatedAtMs = resolvedRoleUpdatedAtMs
             )
             val saveRes = saveSyncMetadata(key, deviceRegistrationToJson(updated))
             if (saveRes.isFailure) {
@@ -1862,6 +1892,22 @@ class SupabaseService private constructor() {
             val existingRaw = fetchSyncMetadata(registryKey) ?: return@withContext Result.failure(Exception("Device not found"))
             val existing = parseDeviceRegistration(registryKey, existingRaw) ?: return@withContext Result.failure(Exception("Invalid device record"))
             val updated = existing.copy(status = newStatus)
+            saveSyncMetadata(registryKey, deviceRegistrationToJson(updated))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun setDeviceRole(registryKey: String, newRole: String): Result<String> = withContext(Dispatchers.IO) {
+        if (!_isInitialized) initialize()
+        val normalized = newRole.uppercase()
+        if (normalized != "ADMIN" && normalized != "STAFF") {
+            return@withContext Result.failure(IllegalArgumentException("Invalid role: $newRole"))
+        }
+        try {
+            val existingRaw = fetchSyncMetadata(registryKey) ?: return@withContext Result.failure(Exception("Device not found"))
+            val existing = parseDeviceRegistration(registryKey, existingRaw) ?: return@withContext Result.failure(Exception("Invalid device record"))
+            val updated = existing.copy(appRole = normalized, roleUpdatedAtMs = System.currentTimeMillis())
             saveSyncMetadata(registryKey, deviceRegistrationToJson(updated))
         } catch (e: Exception) {
             Result.failure(e)

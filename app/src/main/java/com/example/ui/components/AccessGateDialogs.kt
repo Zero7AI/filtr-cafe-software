@@ -168,14 +168,14 @@ fun DeviceAccessGateDialog(
                 when {
                     isRevoked -> {
                         Text(
-                            text = "This device's access has been revoked by the Store Owner. Please contact the owner or re-verify with valid credentials.",
+                            text = "Full app access (Staff & Admin) has been revoked by the Store Owner. Ask the Owner to tap Restore under Devices & Access Control, then tap Check Status.",
                             fontSize = 13.sp,
                             color = Color(0xFFDC2626)
                         )
                     }
                     isPending -> {
                         Text(
-                            text = "Device registered as \"${operatorName.ifBlank { deviceModel }}\". Ask the Store Owner to approve this device under Active Devices.",
+                            text = "Device registered as \"${operatorName.ifBlank { deviceModel }}\". Ask the Store Owner to approve this device under Devices & Access Control.",
                             fontSize = 13.sp,
                             color = ShadcnBlack
                         )
@@ -399,10 +399,12 @@ fun ActiveDevicesDialog(
     isLoading: Boolean,
     onRefresh: () -> Unit,
     onUpdateDeviceStatus: (registryKey: String, newStatus: String) -> Unit,
+    onUpdateDeviceRole: (registryKey: String, newRole: String) -> Unit,
     onSavePolicy: (adminPasscode: String, staffPasscode: String, requireApproval: Boolean, forceReverifyAll: Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
     var showPolicyEditor by remember { mutableStateOf(false) }
+    var devicePendingRevoke by remember { mutableStateOf<SupabaseService.DeviceRegistration?>(null) }
     var adminCode by remember { mutableStateOf(accessPolicy.adminPasscode) }
     var staffCode by remember { mutableStateOf(accessPolicy.staffPasscode) }
     var requireApproval by remember { mutableStateOf(accessPolicy.requireOwnerApprovalForAdmin) }
@@ -535,6 +537,11 @@ fun ActiveDevicesDialog(
                         }
                     }
                 } else {
+                    Text(
+                        text = "Make Staff / Admin changes role only • Revoke locks out full app.",
+                        fontSize = 11.sp,
+                        color = ShadcnMutedText
+                    )
                     if (devices.isEmpty()) {
                         Box(
                             modifier = Modifier
@@ -553,11 +560,13 @@ fun ActiveDevicesDialog(
                         ) {
                             items(devices, key = { it.registryKey }) { dev ->
                                 val isCurrent = dev.deviceId == currentDeviceId
+                                val nextRole = if (dev.appRole.equals("ADMIN", ignoreCase = true)) "STAFF" else "ADMIN"
                                 DeviceRowCard(
                                     device = dev,
                                     isCurrentDevice = isCurrent,
-                                    onRevoke = { onUpdateDeviceStatus(dev.registryKey, "REVOKED") },
-                                    onApprove = { onUpdateDeviceStatus(dev.registryKey, "ACTIVE") }
+                                    onRevoke = { devicePendingRevoke = dev },
+                                    onApprove = { onUpdateDeviceStatus(dev.registryKey, "ACTIVE") },
+                                    onToggleRole = { onUpdateDeviceRole(dev.registryKey, nextRole) }
                                 )
                             }
                         }
@@ -573,6 +582,49 @@ fun ActiveDevicesDialog(
         containerColor = ShadcnWhite,
         shape = RoundedCornerShape(18.dp)
     )
+
+    devicePendingRevoke?.let { target ->
+        AlertDialog(
+            onDismissRequest = { devicePendingRevoke = null },
+            title = {
+                Text(
+                    text = "Revoke Full App Access?",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 17.sp,
+                    color = Color(0xFFDC2626)
+                )
+            },
+            text = {
+                Text(
+                    text = "This locks \"${target.operatorName}\" (${target.deviceModel}) out of BOTH Staff and Admin views until restored. To remove only Admin rights, cancel and tap \"Make Staff\" instead.",
+                    fontSize = 13.sp,
+                    color = ShadcnBlack
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onUpdateDeviceStatus(target.registryKey, "REVOKED")
+                        devicePendingRevoke = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626), contentColor = Color.White),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Revoke Access", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { devicePendingRevoke = null },
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Cancel", color = ShadcnBlack)
+                }
+            },
+            containerColor = ShadcnWhite,
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
 }
 
 @Composable
@@ -580,7 +632,8 @@ private fun DeviceRowCard(
     device: SupabaseService.DeviceRegistration,
     isCurrentDevice: Boolean,
     onRevoke: () -> Unit,
-    onApprove: () -> Unit
+    onApprove: () -> Unit,
+    onToggleRole: () -> Unit
 ) {
     val isAdmin = device.appRole.equals("ADMIN", ignoreCase = true)
     val lastSeenStr = remember(device.lastSeenMs) {
@@ -671,25 +724,44 @@ private fun DeviceRowCard(
                 }
 
                 if (!isCurrentDevice) {
-                    if (device.status == "ACTIVE") {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         OutlinedButton(
-                            onClick = onRevoke,
-                            border = BorderStroke(1.dp, Color(0xFFEF4444)),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            onClick = onToggleRole,
+                            border = BorderStroke(1.dp, ShadcnBorder),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                             modifier = Modifier.height(28.dp),
                             shape = RoundedCornerShape(8.dp)
                         ) {
-                            Text("Revoke Access", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFDC2626))
+                            Text(
+                                text = if (isAdmin) "Make Staff" else "Make Admin",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = ShadcnBlack
+                            )
                         }
-                    } else {
-                        Button(
-                            onClick = onApprove,
-                            colors = ButtonDefaults.buttonColors(containerColor = StatusGreen, contentColor = Color.White),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            modifier = Modifier.height(28.dp),
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Text(if (device.status == "PENDING") "Approve" else "Restore", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        if (device.status == "ACTIVE") {
+                            OutlinedButton(
+                                onClick = onRevoke,
+                                border = BorderStroke(1.dp, Color(0xFFEF4444)),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                modifier = Modifier.height(28.dp),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("Revoke", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFDC2626))
+                            }
+                        } else {
+                            Button(
+                                onClick = onApprove,
+                                colors = ButtonDefaults.buttonColors(containerColor = StatusGreen, contentColor = Color.White),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                modifier = Modifier.height(28.dp),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(if (device.status == "PENDING") "Approve" else "Restore", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }

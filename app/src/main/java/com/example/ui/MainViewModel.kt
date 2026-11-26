@@ -1184,9 +1184,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Check for app updates and verify device access on startup
+        // Check for app updates and verify device access on startup + every 60s
         viewModelScope.launch(Dispatchers.IO) {
             syncDeviceAccessHeartbeat()
+            while (true) {
+                delay(60_000L)
+                if (_uiState.value.isNetworkAvailable) {
+                    syncDeviceAccessHeartbeat()
+                }
+            }
         }
         viewModelScope.launch {
             delay(1000) // Fast initial check immediately upon launch
@@ -4025,6 +4031,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val localStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED"
             val localOperator = prefs.getString("device_operator_name", "") ?: ""
             val localEpoch = prefs.getInt("device_passcode_epoch", 1)
+            val localRoleUpdatedAtMs = prefs.getLong("device_role_updated_at_ms", 0L)
 
             val remoteReg = supabase.syncDeviceHeartbeat(
                 deviceId = currentDeviceId,
@@ -4035,35 +4042,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 appVersionName = BuildConfig.VERSION_NAME,
                 appVersionCode = BuildConfig.VERSION_CODE,
                 localStatus = localStatus,
-                passcodeEpoch = localEpoch
+                passcodeEpoch = localEpoch,
+                localRoleUpdatedAtMs = localRoleUpdatedAtMs
             )
 
-            var effectiveStatus = localStatus
-            if (remoteReg != null) {
-                effectiveStatus = when {
-                    remoteReg.status == "REVOKED" -> "REVOKED"
-                    remoteReg.status == "PENDING" -> "PENDING"
-                    remoteReg.status == "ACTIVE" && localStatus == "PENDING" -> "ACTIVE"
-                    else -> localStatus
+            val effectiveStatus = if (remoteReg != null) {
+                SupabaseService.resolveDeviceAccessStatus(remoteReg.status, localStatus)
+            } else {
+                localStatus
+            }.let { statusAfterRemote ->
+                if (statusAfterRemote == "ACTIVE" && localEpoch < policy.passcodeEpoch) {
+                    "UNVERIFIED"
+                } else {
+                    statusAfterRemote
                 }
             }
 
-            if (effectiveStatus == "ACTIVE" && localEpoch < policy.passcodeEpoch) {
-                effectiveStatus = "UNVERIFIED"
+            val (effectiveRole, effectiveRoleUpdatedAtMs) = if (remoteReg != null) {
+                SupabaseService.resolveDeviceRole(
+                    remoteRole = remoteReg.appRole,
+                    remoteRoleUpdatedAtMs = remoteReg.roleUpdatedAtMs,
+                    localRole = currentRole,
+                    localRoleUpdatedAtMs = localRoleUpdatedAtMs
+                )
+            } else {
+                currentRole to localRoleUpdatedAtMs
             }
 
-            if (effectiveStatus != localStatus) {
-                prefs.edit().putString("device_access_status", effectiveStatus).apply()
+            if (effectiveStatus != localStatus || effectiveRole != currentRole || effectiveRoleUpdatedAtMs != localRoleUpdatedAtMs) {
+                prefs.edit()
+                    .putString("device_access_status", effectiveStatus)
+                    .putString("authenticated_role", effectiveRole)
+                    .putLong("device_role_updated_at_ms", effectiveRoleUpdatedAtMs)
+                    .apply()
+            }
+
+            val roleNotice = when {
+                effectiveRole != currentRole && effectiveRole == "STAFF" ->
+                    "Role changed to Staff Mode by Store Owner"
+                effectiveRole != currentRole && effectiveRole == "ADMIN" ->
+                    "Role updated to Admin Mode by Store Owner"
+                else -> null
             }
 
             _uiState.update {
                 val updated = it.copy(
                     deviceAccessStatus = effectiveStatus,
-                    accessPolicyConfig = sanitizedPolicyForRole(policy, currentRole),
-                    currentRole = currentRole
+                    accessPolicyConfig = sanitizedPolicyForRole(policy, effectiveRole),
+                    currentRole = effectiveRole,
+                    snackbarMessage = roleNotice ?: it.snackbarMessage
                 )
-                if (effectiveStatus != "ACTIVE" || currentRole != "ADMIN") {
-                    updated.resetRestrictedStateForRole(currentRole)
+                if (effectiveStatus != "ACTIVE" || effectiveRole != "ADMIN") {
+                    updated.resetRestrictedStateForRole(effectiveRole)
                 } else {
                     updated
                 }
@@ -4101,6 +4131,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                val roleTs = System.currentTimeMillis()
                 val remoteReg = withContext(Dispatchers.IO) {
                     supabase.syncDeviceHeartbeat(
                         deviceId = currentDeviceId,
@@ -4111,7 +4142,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         appVersionName = BuildConfig.VERSION_NAME,
                         appVersionCode = BuildConfig.VERSION_CODE,
                         localStatus = targetStatus,
-                        passcodeEpoch = policy.passcodeEpoch
+                        passcodeEpoch = policy.passcodeEpoch,
+                        localRoleUpdatedAtMs = roleTs
                     )
                 }
 
@@ -4125,6 +4157,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     .putString("device_operator_name", operatorName.trim())
                     .putString("authenticated_role", authenticatedRole)
                     .putInt("device_passcode_epoch", policy.passcodeEpoch)
+                    .putLong("device_role_updated_at_ms", roleTs)
                     .apply()
 
                 _uiState.update {
@@ -4169,6 +4202,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 val targetStatus = if (policy.requireOwnerApprovalForAdmin) "PENDING" else "ACTIVE"
+                val roleTs = System.currentTimeMillis()
                 val remoteReg = withContext(Dispatchers.IO) {
                     supabase.syncDeviceHeartbeat(
                         deviceId = currentDeviceId,
@@ -4179,7 +4213,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         appVersionName = BuildConfig.VERSION_NAME,
                         appVersionCode = BuildConfig.VERSION_CODE,
                         localStatus = targetStatus,
-                        passcodeEpoch = policy.passcodeEpoch
+                        passcodeEpoch = policy.passcodeEpoch,
+                        localRoleUpdatedAtMs = roleTs
                     )
                 }
 
@@ -4193,6 +4228,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     prefs.edit()
                         .putString("device_access_status", "REVOKED")
                         .putString("authenticated_role", "STAFF")
+                        .putLong("device_role_updated_at_ms", roleTs)
                         .apply()
                     _uiState.update {
                         it.copy(
@@ -4208,6 +4244,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     .putString("authenticated_role", "ADMIN")
                     .putString("device_access_status", finalStatus)
                     .putInt("device_passcode_epoch", policy.passcodeEpoch)
+                    .putLong("device_role_updated_at_ms", roleTs)
                     .apply()
 
                 _uiState.update {
@@ -4232,7 +4269,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun lockToStaffRole() {
-        prefs.edit().putString("authenticated_role", "STAFF").apply()
+        val roleTs = System.currentTimeMillis()
+        prefs.edit()
+            .putString("authenticated_role", "STAFF")
+            .putLong("device_role_updated_at_ms", roleTs)
+            .apply()
         _uiState.update {
             it.copy(
                 currentRole = "STAFF",
@@ -4250,7 +4291,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     appVersionName = BuildConfig.VERSION_NAME,
                     appVersionCode = BuildConfig.VERSION_CODE,
                     localStatus = _uiState.value.deviceAccessStatus,
-                    passcodeEpoch = _uiState.value.accessPolicyConfig.passcodeEpoch
+                    passcodeEpoch = _uiState.value.accessPolicyConfig.passcodeEpoch,
+                    localRoleUpdatedAtMs = roleTs
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync staff lock heartbeat: ${e.message}")
@@ -4259,9 +4301,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun logOutDevice() {
+        val roleTs = System.currentTimeMillis()
         prefs.edit()
             .putString("device_access_status", "UNVERIFIED")
             .putString("authenticated_role", "STAFF")
+            .putLong("device_role_updated_at_ms", roleTs)
             .apply()
         _uiState.update {
             it.copy(
@@ -4271,6 +4315,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 manualInventoryDraftNotes = "",
                 snackbarMessage = "Device signed out"
             ).resetRestrictedStateForRole("STAFF")
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                SupabaseService.getInstance().syncDeviceHeartbeat(
+                    deviceId = currentDeviceId,
+                    appRole = "STAFF",
+                    operatorName = _uiState.value.operatorName,
+                    deviceModel = currentDeviceModel,
+                    androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+                    appVersionName = BuildConfig.VERSION_NAME,
+                    appVersionCode = BuildConfig.VERSION_CODE,
+                    localStatus = "UNVERIFIED",
+                    passcodeEpoch = _uiState.value.accessPolicyConfig.passcodeEpoch,
+                    localRoleUpdatedAtMs = roleTs
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync logout heartbeat: ${e.message}")
+            }
         }
     }
 
@@ -4330,6 +4392,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (res.isSuccess) {
                     _uiState.update { it.copy(snackbarMessage = "Device access updated to $newStatus") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Failed: ${res.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed: ${e.message}") }
+            }
+            refreshRegisteredDevices()
+        }
+    }
+
+    fun updateRemoteDeviceRole(registryKey: String, newRole: String) {
+        if (!requireAdmin("Updating device role")) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingDevices = true) }
+            try {
+                val res = withContext(Dispatchers.IO) {
+                    SupabaseService.getInstance().setDeviceRole(registryKey, newRole)
+                }
+                if (res.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Device role updated to $newRole") }
                 } else {
                     _uiState.update { it.copy(snackbarMessage = "Failed: ${res.exceptionOrNull()?.message}") }
                 }
