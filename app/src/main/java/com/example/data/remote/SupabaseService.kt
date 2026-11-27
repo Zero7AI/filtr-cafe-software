@@ -58,6 +58,47 @@ class SupabaseService private constructor() {
                 normalizedLocal to maxOf(localRoleUpdatedAtMs, remoteRoleUpdatedAtMs)
             }
         }
+
+        fun resolveDeviceMemberLink(
+            remoteMemberId: String?,
+            remoteMemberName: String?,
+            remoteUpdatedAtMs: Long,
+            localMemberId: String,
+            localMemberName: String,
+            localUpdatedAtMs: Long
+        ): Triple<String, String, Long> {
+            val rId = remoteMemberId?.trim().orEmpty()
+            val rName = remoteMemberName?.trim().orEmpty()
+            val lId = localMemberId.trim()
+            val lName = localMemberName.trim()
+            return if (rId.isNotBlank() && remoteUpdatedAtMs >= localUpdatedAtMs) {
+                Triple(rId, rName, remoteUpdatedAtMs)
+            } else if (lId.isNotBlank()) {
+                Triple(lId, lName, maxOf(localUpdatedAtMs, remoteUpdatedAtMs))
+            } else if (rId.isNotBlank()) {
+                Triple(rId, rName, remoteUpdatedAtMs)
+            } else {
+                Triple("", "", maxOf(localUpdatedAtMs, remoteUpdatedAtMs))
+            }
+        }
+
+        /**
+         * Enforces organization roster constraints on a device:
+         * - Inactive (offboarded) linked member => lock out device ("REVOKED") & drop to "STAFF".
+         * - Active linked member with orgRole == "STAFF" => lock device role to "STAFF" (prevents Staff-phone Admin elevation).
+         */
+        fun enforceMemberRosterPolicy(
+            currentRole: String,
+            currentStatus: String,
+            linkedMember: StaffRosterEntity?
+        ): Pair<String, String> {
+            if (linkedMember == null) return currentRole to currentStatus
+            if (!linkedMember.isActive) return "STAFF" to "REVOKED"
+            if (linkedMember.orgRole.equals("STAFF", ignoreCase = true)) {
+                return "STAFF" to currentStatus
+            }
+            return currentRole to currentStatus
+        }
     }
 
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -1722,8 +1763,35 @@ class SupabaseService private constructor() {
         val passcodeEpoch: Int = 1,
         val firstSeenMs: Long = System.currentTimeMillis(),
         val lastSeenMs: Long = System.currentTimeMillis(),
-        val roleUpdatedAtMs: Long = 0L
+        val roleUpdatedAtMs: Long = 0L,
+        val linkedMemberId: String = "",
+        val linkedMemberName: String = "",
+        val memberLinkUpdatedAtMs: Long = 0L
     )
+
+    suspend fun fetchGoogleSheetsWebhookUrl(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("google_sheets_webhook_url")?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    suspend fun saveGoogleSheetsWebhookUrl(url: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("google_sheets_webhook_url", url.trim())
+    }
+
+    suspend fun fetchGoogleSheetsSpreadsheetUrl(): String? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("google_sheets_url")?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    suspend fun saveGoogleSheetsSpreadsheetUrl(url: String): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("google_sheets_url", url.trim())
+    }
+
+    suspend fun fetchPriceAlertThresholdPct(): Double? = withContext(Dispatchers.IO) {
+        fetchSyncMetadata("inventory_price_alert_threshold_pct")?.trim()?.toDoubleOrNull()
+    }
+
+    suspend fun savePriceAlertThresholdPct(thresholdPct: Double): Result<String> = withContext(Dispatchers.IO) {
+        saveSyncMetadata("inventory_price_alert_threshold_pct", thresholdPct.toString())
+    }
 
     suspend fun fetchAccessPolicyConfig(): AccessPolicyConfig = withContext(Dispatchers.IO) {
         try {
@@ -1772,7 +1840,10 @@ class SupabaseService private constructor() {
                 passcodeEpoch = json.optInt("passcode_epoch", 1),
                 firstSeenMs = json.optLong("first_seen_ms", System.currentTimeMillis()),
                 lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis()),
-                roleUpdatedAtMs = json.optLong("role_updated_at_ms", 0L)
+                roleUpdatedAtMs = json.optLong("role_updated_at_ms", 0L),
+                linkedMemberId = json.optNonNullString("linked_member_id", ""),
+                linkedMemberName = json.optNonNullString("linked_member_name", ""),
+                memberLinkUpdatedAtMs = json.optLong("member_link_updated_at_ms", 0L)
             )
         } catch (e: Exception) {
             null
@@ -1793,6 +1864,9 @@ class SupabaseService private constructor() {
             put("first_seen_ms", reg.firstSeenMs)
             put("last_seen_ms", reg.lastSeenMs)
             put("role_updated_at_ms", reg.roleUpdatedAtMs)
+            put("linked_member_id", reg.linkedMemberId)
+            put("linked_member_name", reg.linkedMemberName)
+            put("member_link_updated_at_ms", reg.memberLinkUpdatedAtMs)
         }.toString()
     }
 
@@ -1810,7 +1884,10 @@ class SupabaseService private constructor() {
         appVersionCode: Int,
         localStatus: String,
         passcodeEpoch: Int,
-        localRoleUpdatedAtMs: Long = 0L
+        localRoleUpdatedAtMs: Long = 0L,
+        localLinkedMemberId: String = "",
+        localLinkedMemberName: String = "",
+        localMemberLinkUpdatedAtMs: Long = 0L
     ): DeviceRegistration? = withContext(Dispatchers.IO) {
         if (!_isInitialized) initialize()
         val key = "device_reg_$deviceId"
@@ -1827,6 +1904,14 @@ class SupabaseService private constructor() {
                 localRole = appRole,
                 localRoleUpdatedAtMs = localRoleUpdatedAtMs
             )
+            val (resolvedMemberId, resolvedMemberName, resolvedMemberLinkTs) = resolveDeviceMemberLink(
+                remoteMemberId = existing?.linkedMemberId,
+                remoteMemberName = existing?.linkedMemberName,
+                remoteUpdatedAtMs = existing?.memberLinkUpdatedAtMs ?: 0L,
+                localMemberId = localLinkedMemberId,
+                localMemberName = localLinkedMemberName,
+                localUpdatedAtMs = localMemberLinkUpdatedAtMs
+            )
 
             val updated = DeviceRegistration(
                 registryKey = key,
@@ -1841,7 +1926,10 @@ class SupabaseService private constructor() {
                 passcodeEpoch = passcodeEpoch,
                 firstSeenMs = existing?.firstSeenMs ?: System.currentTimeMillis(),
                 lastSeenMs = System.currentTimeMillis(),
-                roleUpdatedAtMs = resolvedRoleUpdatedAtMs
+                roleUpdatedAtMs = resolvedRoleUpdatedAtMs,
+                linkedMemberId = resolvedMemberId,
+                linkedMemberName = resolvedMemberName,
+                memberLinkUpdatedAtMs = resolvedMemberLinkTs
             )
             val saveRes = saveSyncMetadata(key, deviceRegistrationToJson(updated))
             if (saveRes.isFailure) {
@@ -1912,5 +2000,51 @@ class SupabaseService private constructor() {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    suspend fun setDeviceMemberLink(
+        registryKey: String,
+        memberId: String,
+        memberName: String,
+        memberOrgRole: String? = null
+    ): Result<String> = withContext(Dispatchers.IO) {
+        if (!_isInitialized) initialize()
+        try {
+            val existingRaw = fetchSyncMetadata(registryKey) ?: return@withContext Result.failure(Exception("Device not found"))
+            val existing = parseDeviceRegistration(registryKey, existingRaw) ?: return@withContext Result.failure(Exception("Invalid device record"))
+            val now = System.currentTimeMillis()
+            val normalizedRole = memberOrgRole?.uppercase()?.takeIf { it == "ADMIN" || it == "STAFF" }
+            val updated = existing.copy(
+                linkedMemberId = memberId.trim(),
+                linkedMemberName = memberName.trim(),
+                memberLinkUpdatedAtMs = now,
+                appRole = normalizedRole ?: existing.appRole,
+                roleUpdatedAtMs = if (normalizedRole != null) now else existing.roleUpdatedAtMs
+            )
+            saveSyncMetadata(registryKey, deviceRegistrationToJson(updated))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun cascadeMemberPolicyToLinkedDevices(member: StaffRosterEntity): Int = withContext(Dispatchers.IO) {
+        if (!_isInitialized) initialize()
+        val devices = fetchAllRegisteredDevices()
+        var updatedCount = 0
+        val now = System.currentTimeMillis()
+        val normalizedRole = if (member.orgRole.equals("ADMIN", ignoreCase = true)) "ADMIN" else "STAFF"
+        for (dev in devices) {
+            if (dev.linkedMemberId == member.id) {
+                val updated = if (!member.isActive) {
+                    dev.copy(status = "REVOKED", appRole = "STAFF", roleUpdatedAtMs = now)
+                } else {
+                    dev.copy(appRole = normalizedRole, linkedMemberName = member.name, roleUpdatedAtMs = now)
+                }
+                if (saveSyncMetadata(dev.registryKey, deviceRegistrationToJson(updated)).isSuccess) {
+                    updatedCount++
+                }
+            }
+        }
+        updatedCount
     }
 }

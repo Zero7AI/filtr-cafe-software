@@ -162,6 +162,13 @@ fun AttendanceScreen(
         isActive: Boolean,
         colorHex: String
     ) -> Unit)? = null,
+    onAdminSaveManualAttendance: ((
+        dateKey: String,
+        staffName: String,
+        checkInTimestamp: Long,
+        checkOutTimestamp: Long,
+        notes: String
+    ) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var isManagerView by remember { mutableStateOf(false) }
@@ -172,6 +179,7 @@ fun AttendanceScreen(
     var selectedManagerDateKey by remember(selectedMonthKey, selectedManagerStaffName) {
         mutableStateOf<String?>(null)
     }
+    var editingAttendanceTarget by remember { mutableStateOf<Pair<String, AttendanceCalendarDay?>?>(null) }
 
     Column(
         modifier = modifier
@@ -262,11 +270,31 @@ fun AttendanceScreen(
                                 isActive
                             )
                         }
-                    }
+                    },
+                    onOpenManualAttendanceEdit = if (onAdminSaveManualAttendance != null) {
+                        { staffName, day -> editingAttendanceTarget = staffName to day }
+                    } else null
                 )
             }
 
             Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+
+    editingAttendanceTarget?.let { (targetStaffName, targetDay) ->
+        if (onAdminSaveManualAttendance != null) {
+            val defaultDate = targetDay?.dateKey
+                ?: SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            AdminManualAttendanceDialog(
+                staffName = targetStaffName,
+                initialDateKey = defaultDate,
+                existingLog = targetDay?.log,
+                onDismiss = { editingAttendanceTarget = null },
+                onSave = { dateKey, checkInMs, checkOutMs, notes ->
+                    onAdminSaveManualAttendance(dateKey, targetStaffName, checkInMs, checkOutMs, notes)
+                    editingAttendanceTarget = null
+                }
+            )
         }
     }
 }
@@ -1087,7 +1115,8 @@ private fun MonthlyCalendarAndDetailSection(
     summary: MonthlyAttendanceSummary,
     selectedDateKey: String?,
     onSelectMonth: (String) -> Unit,
-    onSelectDateKey: (String) -> Unit
+    onSelectDateKey: (String) -> Unit,
+    onEditSelectedDay: ((AttendanceCalendarDay) -> Unit)? = null
 ) {
     Surface(
         color = Color.White,
@@ -1237,7 +1266,12 @@ private fun MonthlyCalendarAndDetailSection(
             val selectedDay = summary.days.firstOrNull { it.dateKey == selectedDateKey }
             if (selectedDay != null) {
                 HorizontalDivider(color = AttendanceBorder)
-                AttendanceDayDetailCard(day = selectedDay)
+                AttendanceDayDetailCard(
+                    day = selectedDay,
+                    onEditClick = if (onEditSelectedDay != null) {
+                        { onEditSelectedDay(selectedDay) }
+                    } else null
+                )
             } else {
                 Text(
                     text = "Tap any day above to view check-in, check-out, and hours worked.",
@@ -1376,7 +1410,10 @@ private fun CalendarDayCell(
 }
 
 @Composable
-private fun AttendanceDayDetailCard(day: AttendanceCalendarDay) {
+private fun AttendanceDayDetailCard(
+    day: AttendanceCalendarDay,
+    onEditClick: (() -> Unit)? = null
+) {
     val visuals = resolveDayStatusVisuals(day.status)
 
     Surface(
@@ -1402,17 +1439,29 @@ private fun AttendanceDayDetailCard(day: AttendanceCalendarDay) {
                     fontWeight = FontWeight.Bold,
                     color = AttendanceInk
                 )
-                Surface(
-                    color = visuals.bgColor,
-                    shape = RoundedCornerShape(999.dp)
-                ) {
-                    Text(
-                        text = visuals.label,
-                        color = visuals.color,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        color = visuals.bgColor,
+                        shape = RoundedCornerShape(999.dp)
+                    ) {
+                        Text(
+                            text = visuals.label,
+                            color = visuals.color,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+                    if (onEditClick != null) {
+                        OutlinedButton(
+                            onClick = onEditClick,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.height(28.dp)
+                        ) {
+                            Text("Edit Date", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AttendanceInk)
+                        }
+                    }
                 }
             }
 
@@ -1538,7 +1587,8 @@ private fun ManagerAttendanceView(
         joinedDateKey: String,
         isActive: Boolean,
         colorHex: String
-    ) -> Unit
+    ) -> Unit,
+    onOpenManualAttendanceEdit: ((staffName: String, day: AttendanceCalendarDay?) -> Unit)? = null
 ) {
     ManagerSubTabBar(
         selectedTab = selectedTab,
@@ -1553,7 +1603,15 @@ private fun ManagerAttendanceView(
                     onSelectManagerStaff(staffName)
                     onSelectTab(ManagerAttendanceTab.CALENDAR)
                 },
-                onNavigateToRoster = { onSelectTab(ManagerAttendanceTab.ROSTER_GPS) }
+                onNavigateToRoster = { onSelectTab(ManagerAttendanceTab.ROSTER_GPS) },
+                onEditTodayClick = if (onOpenManualAttendanceEdit != null) {
+                    { staffName ->
+                        val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                        val todayDay = teamRollCall.firstOrNull { it.member.name == staffName }
+                            ?.monthlySummary?.days?.firstOrNull { it.dateKey == todayKey }
+                        onOpenManualAttendanceEdit(staffName, todayDay)
+                    }
+                } else null
             )
         }
 
@@ -1571,7 +1629,13 @@ private fun ManagerAttendanceView(
                 summary = managerSummary,
                 selectedDateKey = selectedDateKey,
                 onSelectMonth = onSelectMonth,
-                onSelectDateKey = onSelectDateKey
+                onSelectDateKey = onSelectDateKey,
+                onEditSelectedDay = if (onOpenManualAttendanceEdit != null) {
+                    { day ->
+                        val staff = selectedManagerStaffName.ifBlank { managerSummary.staffName }
+                        onOpenManualAttendanceEdit(staff, day)
+                    }
+                } else null
             )
 
             DailyLogsCard(
@@ -1651,7 +1715,8 @@ private fun ManagerSubTabBar(
 private fun ManagerRollCallSection(
     teamRollCall: List<TeamRollCallRow>,
     onSelectStaffForCalendar: (String) -> Unit,
-    onNavigateToRoster: () -> Unit
+    onNavigateToRoster: () -> Unit,
+    onEditTodayClick: ((String) -> Unit)? = null
 ) {
     if (teamRollCall.isEmpty()) {
         Surface(
@@ -1752,7 +1817,10 @@ private fun ManagerRollCallSection(
     teamRollCall.forEach { row ->
         RollCallEmployeeCard(
             row = row,
-            onClick = { onSelectStaffForCalendar(row.member.name) }
+            onClick = { onSelectStaffForCalendar(row.member.name) },
+            onEditToday = if (onEditTodayClick != null) {
+                { onEditTodayClick(row.member.name) }
+            } else null
         )
     }
 }
@@ -1780,7 +1848,8 @@ private fun RollCallCountPill(
 @Composable
 private fun RollCallEmployeeCard(
     row: TeamRollCallRow,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onEditToday: (() -> Unit)? = null
 ) {
     val visuals = resolveDayStatusVisuals(row.todayStatus)
     val todayLog = row.todayLog
@@ -1845,18 +1914,30 @@ private fun RollCallEmployeeCard(
 
                 Spacer(modifier = Modifier.width(8.dp))
 
-                Surface(
-                    color = visuals.bgColor,
-                    shape = RoundedCornerShape(999.dp),
-                    border = BorderStroke(1.dp, visuals.borderColor.copy(alpha = 0.5f))
-                ) {
-                    Text(
-                        text = visuals.label,
-                        color = visuals.color,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        color = visuals.bgColor,
+                        shape = RoundedCornerShape(999.dp),
+                        border = BorderStroke(1.dp, visuals.borderColor.copy(alpha = 0.5f))
+                    ) {
+                        Text(
+                            text = visuals.label,
+                            color = visuals.color,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+                    if (onEditToday != null) {
+                        OutlinedButton(
+                            onClick = onEditToday,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.height(26.dp)
+                        ) {
+                            Text("Mark", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AttendanceInk)
+                        }
+                    }
                 }
             }
 
@@ -2854,5 +2935,152 @@ private fun shiftMonthKey(monthKey: String, deltaMonths: Int): String {
         "%04d-%02d",
         calendar.get(Calendar.YEAR),
         calendar.get(Calendar.MONTH) + 1
+    )
+}
+
+@Composable
+private fun AdminManualAttendanceDialog(
+    staffName: String,
+    initialDateKey: String,
+    existingLog: AttendanceLogEntity?,
+    onDismiss: () -> Unit,
+    onSave: (dateKey: String, checkInMs: Long, checkOutMs: Long, notes: String) -> Unit
+) {
+    var dateKey by remember(initialDateKey) { mutableStateOf(initialDateKey) }
+    var mode by remember(existingLog) {
+        mutableStateOf(
+            when {
+                existingLog != null && existingLog.checkInTimestamp > 0L && existingLog.checkOutTimestamp > 0L -> "PRESENT"
+                existingLog != null && existingLog.checkInTimestamp > 0L -> "ON_DUTY"
+                else -> "PRESENT"
+            }
+        )
+    }
+    val hmFormat = remember { SimpleDateFormat("HH:mm", Locale.US) }
+    var checkInHm by remember(existingLog) {
+        mutableStateOf(
+            if (existingLog != null && existingLog.checkInTimestamp > 0L) hmFormat.format(Date(existingLog.checkInTimestamp)) else "09:00"
+        )
+    }
+    var checkOutHm by remember(existingLog) {
+        mutableStateOf(
+            if (existingLog != null && existingLog.checkOutTimestamp > 0L) hmFormat.format(Date(existingLog.checkOutTimestamp)) else "18:00"
+        )
+    }
+    var notes by remember(existingLog) { mutableStateOf(existingLog?.notes.orEmpty()) }
+    val validDate = dateKey.trim().matches(Regex("\\d{4}-\\d{2}-\\d{2}"))
+
+    fun combineDateAndHm(dKey: String, hm: String): Long {
+        return try {
+            val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+            sdf.parse("${dKey.trim()} ${hm.trim()}")?.time ?: System.currentTimeMillis()
+        } catch (_: Exception) {
+            System.currentTimeMillis()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color.White,
+        title = {
+            Text("Admin Override — $staffName", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = AttendanceInk)
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = dateKey,
+                    onValueChange = { dateKey = it },
+                    label = { Text("Date (yyyy-MM-dd)") },
+                    isError = !validDate,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf(
+                        "PRESENT" to "Present",
+                        "ON_DUTY" to "On Duty",
+                        "ABSENT" to "Mark Absent"
+                    ).forEach { (key, label) ->
+                        val selected = mode == key
+                        Surface(
+                            color = if (selected) AttendanceInk else AttendanceNeutralBg,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { mode = key }
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (selected) Color.White else AttendanceInk,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                        }
+                    }
+                }
+                if (mode != "ABSENT") {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedTextField(
+                            value = checkInHm,
+                            onValueChange = { checkInHm = it },
+                            label = { Text("In (HH:mm)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (mode == "PRESENT") {
+                            OutlinedTextField(
+                                value = checkOutHm,
+                                onValueChange = { checkOutHm = it },
+                                label = { Text("Out (HH:mm)") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = notes,
+                    onValueChange = { notes = it },
+                    label = { Text("Reason / Admin Note") },
+                    placeholder = { Text("e.g. Forgot check-in") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    when (mode) {
+                        "ABSENT" -> onSave(dateKey.trim(), 0L, 0L, notes.trim())
+                        "ON_DUTY" -> onSave(dateKey.trim(), combineDateAndHm(dateKey, checkInHm), 0L, notes.trim())
+                        else -> onSave(
+                            dateKey.trim(),
+                            combineDateAndHm(dateKey, checkInHm),
+                            combineDateAndHm(dateKey, checkOutHm),
+                            notes.trim()
+                        )
+                    }
+                },
+                enabled = validDate,
+                colors = ButtonDefaults.buttonColors(containerColor = AttendanceInk, contentColor = Color.White),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text("Save Entry", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = AttendanceMuted)
+            }
+        },
+        shape = RoundedCornerShape(16.dp)
     )
 }

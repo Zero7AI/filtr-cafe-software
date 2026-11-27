@@ -1,5 +1,6 @@
 package com.example.data.remote
 
+import com.example.data.entity.StaffRosterEntity
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -65,5 +66,28 @@ class DeviceAccessStatusTest {
         val (roleBad, tsBad) = SupabaseService.resolveDeviceRole("UNKNOWN", 999L, "other", 500L)
         assertEquals("STAFF", roleBad)
         assertEquals(999L, tsBad)
+    }
+
+    @Test
+    fun `resolveDeviceMemberLink prefers newer remote assignment and enforces roster constraints`() {
+        val (mId, mName, mTs) = SupabaseService.resolveDeviceMemberLink(
+            remoteMemberId = "kanha",
+            remoteMemberName = "Kanha",
+            remoteUpdatedAtMs = 5_000L,
+            localMemberId = "",
+            localMemberName = "",
+            localUpdatedAtMs = 0L
+        )
+        assertEquals("kanha", mId)
+        assertEquals("Kanha", mName)
+        assertEquals(5_000L, mTs)
+
+        val inactiveStaff = StaffRosterEntity(id = "kanha", name = "Kanha", isActive = false, orgRole = "STAFF")
+        assertEquals("STAFF" to "REVOKED", SupabaseService.enforceMemberRosterPolicy("ADMIN", "ACTIVE", inactiveStaff))
+
+        val activeStaff = StaffRosterEntity(id = "kanha", name = "Kanha", isActive = true, orgRole = "STAFF")
+        assertEquals("STAFF" to "ACTIVE", SupabaseService.enforceMemberRosterPolicy("ADMIN", "ACTIVE", activeStaff))
+
+        assertEquals("ADMIN" to "ACTIVE", SupabaseService.enforceMemberRosterPolicy("ADMIN", "ACTIVE", null))
     }
 }

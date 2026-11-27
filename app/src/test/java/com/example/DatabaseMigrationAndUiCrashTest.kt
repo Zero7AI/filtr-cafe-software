@@ -70,9 +70,9 @@ class DatabaseMigrationAndUiCrashTest {
     val composeTestRule = createComposeRule()
 
     @Test
-    fun `room migration 13 to 17 preserves existing data and opens all new tables cleanly`() = runTest {
+    fun `room migration 13 to 18 preserves existing data and opens all new tables cleanly`() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val dbName = "migration_verify_13_to_17.db"
+        val dbName = "migration_verify_13_to_18.db"
         context.deleteDatabase(dbName)
 
         // Create authentic v13 SQLite database with pre-existing cafe data
@@ -102,13 +102,14 @@ class DatabaseMigrationAndUiCrashTest {
         }
         helper.writableDatabase.close()
 
-        // Strictly validate Room migration 13 -> 17 WITHOUT fallbackToDestructiveMigration
+        // Strictly validate Room migration 13 -> 18 WITHOUT fallbackToDestructiveMigration
         val migratedDb = Room.databaseBuilder(context, FiltrDatabase::class.java, dbName)
             .addMigrations(
                 FiltrDatabase.MIGRATION_13_14,
                 FiltrDatabase.MIGRATION_14_15,
                 FiltrDatabase.MIGRATION_15_16,
-                FiltrDatabase.MIGRATION_16_17
+                FiltrDatabase.MIGRATION_16_17,
+                FiltrDatabase.MIGRATION_17_18
             )
             .allowMainThreadQueries()
             .build()
@@ -641,5 +642,67 @@ class DatabaseMigrationAndUiCrashTest {
         composeTestRule.onAllNodesWithText("Synced ✓", substring = true).fetchSemanticsNodes().let {
             assertTrue("Expected at least one Synced badge", it.isNotEmpty())
         }
+    }
+
+    @Test
+    fun `inventories screen renders admin alert hub threshold chips and price hike badge`() {
+        val now = System.currentTimeMillis()
+        val milk = InventoryItemEntity(
+            id = 1,
+            name = "Full Cream Milk",
+            category = "Dairy",
+            unit = "L",
+            standardQuantity = 1.0,
+            defaultPrice = 75.0,
+            currentStock = 0.5
+        )
+        val b1 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-10", now - 86_400_000L, "Metro", 650.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(1, "INV-10", "Full Cream Milk", 10.0, "L", 65.0, 650.0))
+        )
+        val b2 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-11", now, "Blinkit", 750.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(2, "INV-11", "Full Cream Milk", 10.0, "L", 75.0, 750.0))
+        )
+        val alerts = RawMaterialPriceTracker.evaluateInventoryAlerts(
+            inventoryItems = listOf(milk),
+            inventoryOrders = listOf(b1, b2),
+            usages = emptyList(),
+            priceAlertThresholdPct = 5.0
+        )
+        var thresholdUpdated = 0.0
+
+        composeTestRule.setContent {
+            FiltrTheme {
+                com.example.ui.screens.InventoriesScreen(
+                    state = BillingUiState(),
+                    inventoryItems = listOf(milk),
+                    usages = emptyList(),
+                    ordersList = emptyList(),
+                    inventoryOrders = listOf(b1, b2),
+                    inventoryAlerts = alerts,
+                    priceAlertThresholdPct = 5.0,
+                    onUpdatePriceAlertThreshold = { thresholdUpdated = it },
+                    onUpdateStock = { _, _ -> },
+                    onStartEditingStock = {},
+                    onCancelEditingStock = {},
+                    onOpenAddStockDialog = {},
+                    onDismissAddStockDialog = {},
+                    onAddStockPacks = { _, _ -> },
+                    onOpenInventoryMaster = {},
+                    onSaveInventoryItem = { _, _, _, _, _ -> },
+                    onEditInventoryItem = {},
+                    onDeleteInventoryItem = {},
+                    onDismissInventoryMaster = {},
+                    onDismissAddInventoryItem = {},
+                    onSearchQueryChanged = {}
+                )
+            }
+        }
+
+        composeTestRule.onNodeWithText("ADMIN INVENTORY ALERTS").assertExists()
+        composeTestRule.onNodeWithText("Full Cream Milk").assertExists()
+        composeTestRule.onNodeWithText("±10%").performClick()
+        assertEquals(10.0, thresholdUpdated, 0.01)
     }
 }

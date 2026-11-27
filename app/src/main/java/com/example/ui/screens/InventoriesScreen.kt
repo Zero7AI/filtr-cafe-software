@@ -35,7 +35,11 @@ import com.example.data.entity.InventoryOrderWithItems
 import com.example.data.entity.InventoryUsageEntity
 import com.example.data.entity.OrderWithItems
 import com.example.domain.inventory.IngredientPriceSummary
+import com.example.domain.inventory.InventoryAlertRow
+import com.example.domain.inventory.PriceAlertLevel
 import com.example.domain.inventory.PriceTrend
+import com.example.domain.inventory.RawMaterialPriceTracker
+import com.example.domain.inventory.StockAlertLevel
 import com.example.ui.BillingUiState
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
@@ -74,6 +78,10 @@ fun InventoriesScreen(
     onDismissAddInventoryItem: () -> Unit,
     onSearchQueryChanged: (String) -> Unit,
     pricingSummaries: List<IngredientPriceSummary> = emptyList(),
+    inventoryAlerts: List<InventoryAlertRow> = emptyList(),
+    priceAlertThresholdPct: Double = 5.0,
+    onUpdatePriceAlertThreshold: (Double) -> Unit = {},
+    onOpenPurchaseOrders: () -> Unit = {},
     onSyncPricingToSheets: (() -> Unit)? = null,
     onExportPricingCsv: (() -> Unit)? = null
 ) {
@@ -466,103 +474,229 @@ fun InventoriesScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp),
             modifier = Modifier.fillMaxSize()
         ) {
-            // LOW STOCK / REORDER ALERT SECTION (<= 7 Orders Left)
-            item {
+            // ADMIN INVENTORY ALERT & REORDER HUB (Present Stock + Price Shift Thresholds)
+            item(key = "admin_inventory_alerts_hub") {
+                val evaluatedAlerts = remember(inventoryAlerts, inventoryItems, inventoryOrders, usages, priceAlertThresholdPct) {
+                    inventoryAlerts.ifEmpty {
+                        RawMaterialPriceTracker.evaluateInventoryAlerts(
+                            inventoryItems = inventoryItems,
+                            inventoryOrders = inventoryOrders,
+                            usages = usages,
+                            priceAlertThresholdPct = priceAlertThresholdPct
+                        )
+                    }
+                }
+                var alertMode by remember { mutableStateOf("ALL") } // ALL, REORDER, HIKES
+                val reorderAlerts = remember(evaluatedAlerts) {
+                    evaluatedAlerts.filter { it.stockAlertLevel != StockAlertLevel.HEALTHY }
+                }
+                val hikeAlerts = remember(evaluatedAlerts) {
+                    evaluatedAlerts.filter { it.priceAlertLevel == PriceAlertLevel.HIGH_HIKE || it.priceAlertLevel == PriceAlertLevel.MINOR_UP }
+                }
+                val shownAlerts = remember(evaluatedAlerts, reorderAlerts, hikeAlerts, alertMode) {
+                    when (alertMode) {
+                        "REORDER" -> reorderAlerts
+                        "HIKES" -> hikeAlerts
+                        else -> evaluatedAlerts.filter {
+                            it.stockAlertLevel != StockAlertLevel.HEALTHY ||
+                                it.priceAlertLevel == PriceAlertLevel.HIGH_HIKE ||
+                                it.priceAlertLevel == PriceAlertLevel.MINOR_UP
+                        }
+                    }
+                }
+                val urgentCount = reorderAlerts.size
+                val hikeCount = hikeAlerts.count { it.priceAlertLevel == PriceAlertLevel.HIGH_HIKE }
+
                 Card(
                     shape = RoundedCornerShape(16.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = if (lowStockAlerts.isNotEmpty()) Color(0xFF7F1D1D).copy(alpha = 0.25f) else SurfaceColor
+                        containerColor = if (urgentCount > 0 || hikeCount > 0) Color(0xFF27171B) else SurfaceColor
                     ),
                     border = BorderStroke(
                         1.dp,
-                        if (lowStockAlerts.isNotEmpty()) Color(0xFFEF4444).copy(alpha = 0.6f) else SurfaceVariantColor
+                        if (urgentCount > 0 || hikeCount > 0) Color(0xFFEF4444).copy(alpha = 0.55f) else SurfaceVariantColor
                     ),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                                 Icon(
-                                    imageVector = if (lowStockAlerts.isNotEmpty()) Icons.Default.Warning else Icons.Default.CheckCircle,
+                                    imageVector = if (urgentCount > 0 || hikeCount > 0) Icons.Default.Warning else Icons.Default.CheckCircle,
                                     contentDescription = null,
-                                    tint = if (lowStockAlerts.isNotEmpty()) Color(0xFFEF4444) else Color(0xFF10B981),
-                                    modifier = Modifier.size(20.dp)
+                                    tint = if (urgentCount > 0 || hikeCount > 0) Color(0xFFEF4444) else Color(0xFF10B981),
+                                    modifier = Modifier.size(18.dp)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = if (lowStockAlerts.isNotEmpty()) "CRITICAL REORDER ALERTS (≤ 7 Orders Left)" else "STOCK HEALTH STATUS",
-                                    color = if (lowStockAlerts.isNotEmpty()) Color(0xFFEF4444) else Color(0xFF10B981),
+                                    text = "ADMIN INVENTORY ALERTS",
+                                    color = if (urgentCount > 0 || hikeCount > 0) Color(0xFFFCA5A5) else Color(0xFF10B981),
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Black,
-                                    letterSpacing = 0.5.sp
+                                    letterSpacing = 0.6.sp
                                 )
                             }
                             Surface(
-                                color = if (lowStockAlerts.isNotEmpty()) Color(0xFFEF4444).copy(alpha = 0.2f) else Color(0xFF10B981).copy(alpha = 0.15f),
+                                color = if (urgentCount > 0) Color(0xFFEF4444).copy(alpha = 0.22f) else Color(0xFF10B981).copy(alpha = 0.16f),
                                 shape = RoundedCornerShape(6.dp)
                             ) {
                                 Text(
-                                    text = if (lowStockAlerts.isNotEmpty()) "${lowStockAlerts.size} Urgent Items" else "All Healthy (>7 Orders)",
-                                    color = if (lowStockAlerts.isNotEmpty()) Color(0xFFEF4444) else Color(0xFF10B981),
-                                    fontSize = 11.sp,
+                                    text = "$urgentCount Reorder • $hikeCount High Hike",
+                                    color = if (urgentCount > 0 || hikeCount > 0) Color(0xFFFCA5A5) else Color(0xFF34D399),
+                                    fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                 )
                             }
                         }
 
-                        if (lowStockAlerts.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                lowStockAlerts.forEach { (item, ordersLeft) ->
+                        // Threshold selector
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Price Hike Alert:", fontSize = 11.sp, color = TextGray)
+                            listOf(3.0, 5.0, 10.0, 15.0).forEach { pct ->
+                                val selected = kotlin.math.abs(priceAlertThresholdPct - pct) < 0.2
+                                Surface(
+                                    color = if (selected) AmberAccent else SurfaceVariantColor,
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.clickable { onUpdatePriceAlertThreshold(pct) }
+                                ) {
+                                    Text(
+                                        text = "±${pct.toInt()}%",
+                                        color = if (selected) Color.Black else Color.White,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        // Mode tabs
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(
+                                "ALL" to "Alerts (${shownAlerts.size})",
+                                "REORDER" to "Reorder ($urgentCount)",
+                                "HIKES" to "Price Hikes (${hikeAlerts.size})"
+                            ).forEach { (key, label) ->
+                                val selected = alertMode == key
+                                Surface(
+                                    color = if (selected) Color.White else SurfaceVariantColor,
+                                    shape = RoundedCornerShape(14.dp),
+                                    modifier = Modifier.clickable { alertMode = key }
+                                ) {
+                                    Text(
+                                        text = label,
+                                        color = if (selected) Color.Black else TextGray,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        if (shownAlerts.isEmpty()) {
+                            Text(
+                                text = "All stock levels healthy and no price hikes above ±${priceAlertThresholdPct.toInt()}%.",
+                                color = Color(0xFF34D399),
+                                fontSize = 11.sp
+                            )
+                        } else {
+                            // Column header row
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color.Black.copy(alpha = 0.25f), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text("ITEM", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1.3f))
+                                Text("PRESENT", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(0.9f))
+                                Text("ALERT", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1.2f))
+                                Text("ORDER QTY", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                            }
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                shownAlerts.take(10).forEach { row ->
+                                    val alertBadgeBg = when {
+                                        row.stockAlertLevel == StockAlertLevel.OUT_OF_STOCK ||
+                                            row.stockAlertLevel == StockAlertLevel.CRITICAL_REORDER ||
+                                            row.priceAlertLevel == PriceAlertLevel.HIGH_HIKE -> Color(0xFFEF4444).copy(alpha = 0.22f)
+                                        row.stockAlertLevel == StockAlertLevel.LOW_STOCK ||
+                                            row.priceAlertLevel == PriceAlertLevel.MINOR_UP -> AmberAccent.copy(alpha = 0.2f)
+                                        else -> Color(0xFF10B981).copy(alpha = 0.16f)
+                                    }
+                                    val alertBadgeFg = when {
+                                        row.stockAlertLevel == StockAlertLevel.OUT_OF_STOCK ||
+                                            row.stockAlertLevel == StockAlertLevel.CRITICAL_REORDER ||
+                                            row.priceAlertLevel == PriceAlertLevel.HIGH_HIKE -> Color(0xFFFCA5A5)
+                                        row.stockAlertLevel == StockAlertLevel.LOW_STOCK ||
+                                            row.priceAlertLevel == PriceAlertLevel.MINOR_UP -> AmberAccent
+                                        else -> Color(0xFF34D399)
+                                    }
+                                    val primaryAlertText = when {
+                                        row.stockAlertLevel != StockAlertLevel.HEALTHY && row.priceAlertLevel == PriceAlertLevel.HIGH_HIKE ->
+                                            "${row.stockAlertLabel} • ${row.priceAlertLabel}"
+                                        row.stockAlertLevel != StockAlertLevel.HEALTHY -> row.stockAlertLabel
+                                        else -> row.priceAlertLabel
+                                    }
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .background(SurfaceColor.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-                                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                            .background(SurfaceColor.copy(alpha = 0.72f), RoundedCornerShape(8.dp))
+                                            .padding(horizontal = 8.dp, vertical = 6.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Column(modifier = Modifier.weight(1f)) {
+                                        Column(modifier = Modifier.weight(1.3f)) {
+                                            Text(row.itemName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                            if (row.latestRate > 0.0) {
+                                                Text("₹${formatDouble(row.latestRate)}/${row.unit}", color = TextGray, fontSize = 10.sp)
+                                            }
+                                        }
+                                        Text(
+                                            text = "${formatDouble(row.currentStock)} ${row.unit}",
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.weight(0.9f)
+                                        )
+                                        Surface(
+                                            color = alertBadgeBg,
+                                            shape = RoundedCornerShape(4.dp),
+                                            modifier = Modifier
+                                                .weight(1.2f)
+                                                .padding(end = 4.dp)
+                                        ) {
                                             Text(
-                                                text = item.name,
-                                                color = Color.White,
+                                                text = primaryAlertText,
+                                                color = alertBadgeFg,
+                                                fontSize = 10.sp,
                                                 fontWeight = FontWeight.Bold,
-                                                fontSize = 14.sp
-                                            )
-                                            Text(
-                                                text = "Stock: ${formatDouble(item.currentStock)} ${item.unit} (${item.category})",
-                                                color = TextGray,
-                                                fontSize = 11.sp
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp)
                                             )
                                         }
-
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Surface(
-                                                color = Color(0xFFEF4444).copy(alpha = 0.25f),
-                                                shape = RoundedCornerShape(6.dp)
-                                            ) {
+                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                text = row.suggestedOrderLabel,
+                                                color = if (row.suggestedOrderPacks > 0) AmberAccent else TextGray,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            if (row.suggestedOrderPacks > 0) {
                                                 Text(
-                                                    text = "Only ~$ordersLeft orders left",
-                                                    color = Color(0xFFFCA5A5),
-                                                    fontSize = 11.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                                    text = "+ Order",
+                                                    color = AmberAccent,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Black,
+                                                    modifier = Modifier
+                                                        .clickable { onOpenPurchaseOrders() }
+                                                        .padding(top = 2.dp)
                                                 )
-                                            }
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Button(
-                                                onClick = { onOpenAddStockDialog(item) },
-                                                colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = Color.Black),
-                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                                                shape = RoundedCornerShape(6.dp),
-                                                modifier = Modifier.height(28.dp)
-                                            ) {
-                                                Text("+ Stock", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                             }
                                         }
                                     }
@@ -993,12 +1127,19 @@ fun InventoriesScreen(
                     val priceSummary = pricingSummaries.firstOrNull {
                         it.itemId == item.id || it.itemName.equals(item.name, ignoreCase = true)
                     }
+                    val alertRow = RawMaterialPriceTracker.evaluateInventoryAlerts(
+                        inventoryItems = listOf(item),
+                        inventoryOrders = inventoryOrders,
+                        usages = usages,
+                        priceAlertThresholdPct = priceAlertThresholdPct
+                    ).firstOrNull()
                     InventoryItemCard(
                         item = item,
                         daysLeft = daysLeft,
                         dateRangeLabel = dateRangeLabel,
                         consumptionRecord = consumptionRecord,
                         priceSummary = priceSummary,
+                        alertRow = alertRow,
                         isEditing = state.editingStockItemId == item.id,
                         onUpdateStock = { onUpdateStock(item.id, it) },
                         onStartEditingStock = { onStartEditingStock(item.id) },
@@ -1058,6 +1199,7 @@ fun InventoryItemCard(
     dateRangeLabel: String = "Today",
     consumptionRecord: ItemConsumptionRecord? = null,
     priceSummary: IngredientPriceSummary? = null,
+    alertRow: InventoryAlertRow? = null,
     isEditing: Boolean,
     onUpdateStock: (Double) -> Unit,
     onStartEditingStock: () -> Unit,
@@ -1082,16 +1224,45 @@ fun InventoryItemCard(
                     fontSize = 16.sp
                 )
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (item.currentStock < 1.0) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (alertRow != null && alertRow.stockAlertLevel != StockAlertLevel.HEALTHY) {
+                        val isCrit = alertRow.stockAlertLevel == StockAlertLevel.OUT_OF_STOCK ||
+                            alertRow.stockAlertLevel == StockAlertLevel.CRITICAL_REORDER
+                        Surface(
+                            color = (if (isCrit) Color(0xFFEF4444) else AmberAccent).copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = alertRow.stockAlertLabel,
+                                color = if (isCrit) Color(0xFFFCA5A5) else AmberAccent,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    } else if (item.currentStock < 1.0) {
                         Surface(
                             color = Color(0xFFEF4444).copy(alpha = 0.2f),
-                            shape = RoundedCornerShape(4.dp),
-                            modifier = Modifier.padding(end = 8.dp)
+                            shape = RoundedCornerShape(4.dp)
                         ) {
                             Text(
                                 text = "LOW STOCK",
                                 color = Color(0xFFEF4444),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    if (alertRow != null && alertRow.priceAlertLevel == PriceAlertLevel.HIGH_HIKE) {
+                        Surface(
+                            color = Color(0xFFEF4444).copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = alertRow.priceAlertLabel,
+                                color = Color(0xFFFCA5A5),
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)

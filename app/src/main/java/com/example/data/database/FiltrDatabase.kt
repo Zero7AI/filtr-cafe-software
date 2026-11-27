@@ -53,7 +53,7 @@ import java.util.Locale
         KitchenInventoryEntryEntity::class, AttendanceLogEntity::class,
         StaffRosterEntity::class, KdsItemClaimEntity::class
     ],
-    version = 17,
+    version = 18,
     exportSchema = false
 )
 abstract class FiltrDatabase : RoomDatabase() {
@@ -330,6 +330,12 @@ abstract class FiltrDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_17_18 = object : androidx.room.migration.Migration(17, 18) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `staff_roster` ADD COLUMN `orgRole` TEXT NOT NULL DEFAULT 'STAFF'")
+            }
+        }
+
         internal fun getInstanceOrNull(): FiltrDatabase? = INSTANCE
 
         fun getDatabase(context: Context, scope: CoroutineScope): FiltrDatabase {
@@ -348,7 +354,8 @@ abstract class FiltrDatabase : RoomDatabase() {
                     MIGRATION_13_14,
                     MIGRATION_14_15,
                     MIGRATION_15_16,
-                    MIGRATION_16_17
+                    MIGRATION_16_17,
+                    MIGRATION_17_18
                 )
                 .fallbackToDestructiveMigration(true) // Last resort for ancient versions
                 .addCallback(FiltrDatabaseCallback(scope))

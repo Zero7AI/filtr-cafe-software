@@ -16,5 +16,7 @@ data class StaffRosterEntity(
     val isActive: Boolean = true,
     val updatedAt: Long = 0L,
     @ColumnInfo(defaultValue = "")
-    val colorHex: String = ""
+    val colorHex: String = "",
+    @ColumnInfo(defaultValue = "STAFF")
+    val orgRole: String = "STAFF"
 )

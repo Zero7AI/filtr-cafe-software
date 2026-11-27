@@ -468,7 +468,9 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
 
-                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 10.dp))
+
+                                    Text("LIVE OPERATIONS", color = Color(0xFFF59E0B), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 4.dp))
 
                                     NavigationDrawerItem(
                                         label = { Text("New Order Billing", fontWeight = FontWeight.Bold) },
@@ -486,7 +488,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -505,7 +507,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -524,7 +526,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -543,7 +545,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -562,7 +564,49 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(vertical = 8.dp))
+
+                                    Text("INVENTORY & COSTING", color = Color(0xFF38BDF8), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 4.dp))
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Inventories & Alerts", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Warehouse, contentDescription = null, tint = Color(0xFF38BDF8)) },
+                                        selected = uiState.currentTab == FiltrTab.INVENTORIES,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.INVENTORIES)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Purchase Bills & Pricing", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.INVENTORY_ORDER,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.INVENTORY_ORDER)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -581,139 +625,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Staff Attendance", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.LocationOn, contentDescription = null, tint = Color(0xFF34D399)) },
-                                        selected = uiState.currentTab == FiltrTab.ATTENDANCE,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.ATTENDANCE)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFF34D399).copy(alpha = 0.2f),
-                                            selectedIconColor = Color(0xFF34D399),
-                                            selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Item Master (Menu)", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.MenuBook, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.MENU,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.MENU)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
-                                            selectedIconColor = Color.White,
-                                            selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Analytics Dashboard", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Analytics, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.DASHBOARD,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.DASHBOARD)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
-                                            selectedIconColor = Color.White,
-                                            selectedTextColor = Color.White,
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Accounts / UPI", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.QrCode, contentDescription = null) },
-                                        selected = false,
-                                        onClick = {
-                                            viewModel.openAccountsUpiDialog()
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Customers", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.People, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.CUSTOMERS,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.CUSTOMERS)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    HorizontalDivider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(vertical = 8.dp))
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Inventory Order", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.INVENTORY_ORDER,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.INVENTORY_ORDER)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Inventories", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Warehouse, contentDescription = null) },
-                                        selected = uiState.currentTab == FiltrTab.INVENTORIES,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.INVENTORIES)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -732,7 +644,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -751,7 +663,7 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
                                     NavigationDrawerItem(
@@ -770,25 +682,25 @@ class MainActivity : ComponentActivity() {
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 4.dp)
+                                        modifier = Modifier.padding(vertical = 2.dp)
                                     )
 
-                                    Spacer(modifier = Modifier.height(12.dp))
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(vertical = 8.dp))
 
-                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f), modifier = Modifier.padding(vertical = 12.dp))
+                                    Text("TEAM & SECURITY", color = Color(0xFF34D399), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 4.dp))
 
                                     NavigationDrawerItem(
-                                        label = { Text("🎨 Bill & Receipt Design", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, tint = Color(0xFFF59E0B)) },
-                                        selected = uiState.currentTab == FiltrTab.RECEIPT_DESIGN,
+                                        label = { Text("Staff Attendance", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.LocationOn, contentDescription = null, tint = Color(0xFF34D399)) },
+                                        selected = uiState.currentTab == FiltrTab.ATTENDANCE,
                                         onClick = {
-                                            viewModel.selectTab(FiltrTab.RECEIPT_DESIGN)
+                                            viewModel.selectTab(FiltrTab.ATTENDANCE)
                                             scope.launch { drawerState.close() }
                                         },
                                         colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
+                                            selectedContainerColor = Color(0xFF34D399).copy(alpha = 0.2f),
+                                            selectedIconColor = Color(0xFF34D399),
+                                            selectedTextColor = Color.White,
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
@@ -807,6 +719,102 @@ class MainActivity : ComponentActivity() {
                                         colors = NavigationDrawerItemDefaults.colors(
                                             unselectedIconColor = Color.White.copy(alpha = 0.7f),
                                             unselectedTextColor = Color.White.copy(alpha = 0.9f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(vertical = 8.dp))
+
+                                    Text("CATALOG & SETTINGS", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 4.dp))
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Item Master (Menu)", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.MenuBook, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.MENU,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.MENU)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
+                                            selectedIconColor = Color.White,
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Analytics Dashboard", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.Analytics, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.DASHBOARD,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.DASHBOARD)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color.White.copy(alpha = 0.2f),
+                                            selectedIconColor = Color.White,
+                                            selectedTextColor = Color.White,
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Customers", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.People, contentDescription = null) },
+                                        selected = uiState.currentTab == FiltrTab.CUSTOMERS,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.CUSTOMERS)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("Accounts / UPI", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.Default.QrCode, contentDescription = null) },
+                                        selected = false,
+                                        onClick = {
+                                            viewModel.openAccountsUpiDialog()
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+
+                                    NavigationDrawerItem(
+                                        label = { Text("🎨 Bill & Receipt Design", fontWeight = FontWeight.Bold) },
+                                        icon = { Icon(imageVector = Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, tint = Color(0xFFF59E0B)) },
+                                        selected = uiState.currentTab == FiltrTab.RECEIPT_DESIGN,
+                                        onClick = {
+                                            viewModel.selectTab(FiltrTab.RECEIPT_DESIGN)
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        colors = NavigationDrawerItemDefaults.colors(
+                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                            selectedIconColor = Color(0xFFF59E0B),
+                                            selectedTextColor = Color(0xFFF59E0B),
+                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
+                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
                                         ),
                                         shape = RoundedCornerShape(12.dp),
                                         modifier = Modifier.padding(vertical = 2.dp)
@@ -1121,6 +1129,7 @@ class MainActivity : ComponentActivity() {
                                         val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
                                         val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
                                         val pricingSummaries by viewModel.ingredientPricingSummaries.collectAsStateWithLifecycle()
+                                        val inventoryAlerts by viewModel.inventoryAlerts.collectAsStateWithLifecycle()
                                         InventoriesScreen(
                                             state = uiState,
                                             inventoryItems = inventoryItemsList,
@@ -1128,6 +1137,10 @@ class MainActivity : ComponentActivity() {
                                             ordersList = ordersList,
                                             inventoryOrders = inventoryOrdersList,
                                             pricingSummaries = pricingSummaries,
+                                            inventoryAlerts = inventoryAlerts,
+                                            priceAlertThresholdPct = uiState.priceAlertThresholdPct,
+                                            onUpdatePriceAlertThreshold = { viewModel.updatePriceAlertThreshold(it) },
+                                            onOpenPurchaseOrders = { viewModel.selectTab(FiltrTab.INVENTORY_ORDER) },
                                             onUpdateStock = { id, stock -> viewModel.updateStockLevel(id, stock) },
                                             onStartEditingStock = { viewModel.startEditingStock(it) },
                                             onCancelEditingStock = { viewModel.cancelEditingStock() },
@@ -1397,6 +1410,9 @@ class MainActivity : ComponentActivity() {
                                         },
                                         onSaveStaffRosterMemberWithColor = { id, name, role, shift, offDay, joinDate, active, colorHex ->
                                             viewModel.saveStaffRosterMember(id, name, role, shift, offDay, joinDate, active, colorHex)
+                                        },
+                                        onAdminSaveManualAttendance = { dateKey, staffName, checkInMs, checkOutMs, notes ->
+                                            viewModel.saveAdminManualAttendance(dateKey, staffName, checkInMs, checkOutMs, notes)
                                         }
                                     )
                                 }
@@ -1611,6 +1627,7 @@ class MainActivity : ComponentActivity() {
                             }
 
                             if (uiState.showActiveDevicesDialog && !isStaffMode) {
+                                val staffRosterList by viewModel.staffRoster.collectAsStateWithLifecycle()
                                 ActiveDevicesDialog(
                                     devices = uiState.registeredDevices,
                                     currentDeviceId = viewModel.currentDeviceId,
@@ -1622,7 +1639,10 @@ class MainActivity : ComponentActivity() {
                                     onSavePolicy = { adminCode, staffCode, reqApproval, forceReverify ->
                                         viewModel.saveAccessPolicy(adminCode, staffCode, reqApproval, forceReverify)
                                     },
-                                    onDismiss = { viewModel.dismissActiveDevicesDialog() }
+                                    onDismiss = { viewModel.dismissActiveDevicesDialog() },
+                                    staffRoster = staffRosterList,
+                                    onLinkDeviceToMember = { key, member -> viewModel.linkDeviceToMember(key, member) },
+                                    onCreateAndLinkMember = { key, name -> viewModel.createAndLinkRosterMemberForDevice(key, name) }
                                 )
                             }
 

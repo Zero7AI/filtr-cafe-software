@@ -2,6 +2,7 @@ package com.example.ui.components
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -58,6 +59,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import com.example.data.entity.StaffRosterEntity
+import com.example.domain.attendance.AttendanceCalculator
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -401,10 +404,14 @@ fun ActiveDevicesDialog(
     onUpdateDeviceStatus: (registryKey: String, newStatus: String) -> Unit,
     onUpdateDeviceRole: (registryKey: String, newRole: String) -> Unit,
     onSavePolicy: (adminPasscode: String, staffPasscode: String, requireApproval: Boolean, forceReverifyAll: Boolean) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    staffRoster: List<StaffRosterEntity> = emptyList(),
+    onLinkDeviceToMember: (registryKey: String, member: StaffRosterEntity) -> Unit = { _, _ -> },
+    onCreateAndLinkMember: (registryKey: String, name: String) -> Unit = { _, _ -> }
 ) {
-    var showPolicyEditor by remember { mutableStateOf(false) }
+    var activeSection by remember { mutableStateOf("BY_TEAM") } // BY_TEAM, ALL_DEVICES, PASSCODES
     var devicePendingRevoke by remember { mutableStateOf<SupabaseService.DeviceRegistration?>(null) }
+    var devicePendingMemberLink by remember { mutableStateOf<SupabaseService.DeviceRegistration?>(null) }
     var adminCode by remember { mutableStateOf(accessPolicy.adminPasscode) }
     var staffCode by remember { mutableStateOf(accessPolicy.staffPasscode) }
     var requireApproval by remember { mutableStateOf(accessPolicy.requireOwnerApprovalForAdmin) }
@@ -412,8 +419,8 @@ fun ActiveDevicesDialog(
     var showAdminCode by remember { mutableStateOf(false) }
     var showStaffCode by remember { mutableStateOf(false) }
 
-    LaunchedEffect(accessPolicy, showPolicyEditor) {
-        if (!showPolicyEditor) {
+    LaunchedEffect(accessPolicy, activeSection) {
+        if (activeSection != "PASSCODES") {
             adminCode = accessPolicy.adminPasscode
             staffCode = accessPolicy.staffPasscode
             requireApproval = accessPolicy.requireOwnerApprovalForAdmin
@@ -449,23 +456,33 @@ fun ActiveDevicesDialog(
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text(
-                        text = if (showPolicyEditor) "Passcode & Approval Policy" else "All tracked Admin & Staff mobiles",
-                        fontSize = 12.sp,
-                        color = ShadcnMutedText
-                    )
-                    TextButton(
-                        onClick = { showPolicyEditor = !showPolicyEditor },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                    ) {
-                        Text(if (showPolicyEditor) "View Devices" else "Passcodes", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    listOf(
+                        "BY_TEAM" to "By Team",
+                        "ALL_DEVICES" to "All (${devices.size})",
+                        "PASSCODES" to "Passcodes"
+                    ).forEach { (key, label) ->
+                        val selected = activeSection == key
+                        Surface(
+                            color = if (selected) ShadcnBlack else Color(0xFFF4F4F5),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { activeSection = key }
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (selected) ShadcnWhite else ShadcnBlack,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(vertical = 7.dp, horizontal = 6.dp)
+                            )
+                        }
                     }
                 }
 
-                if (showPolicyEditor) {
+                if (activeSection == "PASSCODES") {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -526,7 +543,7 @@ fun ActiveDevicesDialog(
                         Button(
                             onClick = {
                                 onSavePolicy(adminCode.trim(), staffCode.trim(), requireApproval, forceReverify)
-                                showPolicyEditor = false
+                                activeSection = "ALL_DEVICES"
                             },
                             enabled = adminCode.isNotBlank() && staffCode.isNotBlank(),
                             colors = ButtonDefaults.buttonColors(containerColor = ShadcnBlack, contentColor = ShadcnWhite),
@@ -536,9 +553,158 @@ fun ActiveDevicesDialog(
                             Text("Save Access Policy", fontWeight = FontWeight.Bold)
                         }
                     }
+                } else if (activeSection == "BY_TEAM") {
+                    val staffOnlyRoster = remember(staffRoster) {
+                        staffRoster.filter { it.isActive && !it.orgRole.equals("ADMIN", ignoreCase = true) }
+                    }
+                    val adminDevices = remember(devices) {
+                        devices.filter { it.appRole.equals("ADMIN", ignoreCase = true) }
+                    }
+                    val staffDevices = remember(devices) {
+                        devices.filter { !it.appRole.equals("ADMIN", ignoreCase = true) }
+                    }
+                    Text(
+                        text = "Staff Roster phones auto-track attendance & stay locked to Staff Mode.",
+                        fontSize = 11.sp,
+                        color = ShadcnMutedText
+                    )
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 360.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        item(key = "hdr_admins") {
+                            Text(
+                                text = "ADMIN LOGINS (${adminDevices.size} devices)",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Black,
+                                color = ShadcnBlack
+                            )
+                        }
+                        adminDevices.groupBy {
+                            it.linkedMemberName.ifBlank { it.operatorName.ifBlank { "Admin" } }
+                                .lowercase()
+                        }.forEach { (key, devs) ->
+                            item(key = "adm_$key") {
+                                val displayName = devs.first().linkedMemberName.ifBlank { devs.first().operatorName }
+                                Card(
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFAFAFA)),
+                                    border = BorderStroke(1.dp, ShadcnBorder),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text("$displayName (${devs.size} login${if (devs.size > 1) "s" else ""})", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = ShadcnBlack)
+                                            Surface(color = ShadcnBlack, shape = RoundedCornerShape(6.dp)) {
+                                                Text("ADMIN", color = ShadcnWhite, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                                            }
+                                        }
+                                        devs.forEach { d ->
+                                            Text(
+                                                text = "• ${d.deviceModel}${if (d.deviceId == currentDeviceId) " (This Phone)" else ""} • ${d.status}",
+                                                fontSize = 11.sp,
+                                                color = ShadcnMutedText
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        item(key = "hdr_staff") {
+                            Text(
+                                text = "STAFF ROSTER & DEVICES (${staffOnlyRoster.size} roster • ${staffDevices.size} phones)",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Black,
+                                color = Color(0xFF0369A1),
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
+                        }
+                        items(staffOnlyRoster, key = { "roster_${it.id}" }) { member ->
+                            val memberKey = AttendanceCalculator.normalizeStaffKey(member.name)
+                            val linkedDevs = devices.filter { d ->
+                                d.linkedMemberId == member.id ||
+                                    (d.linkedMemberId.isBlank() && AttendanceCalculator.normalizeStaffKey(d.operatorName) == memberKey)
+                            }
+                            Card(
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF0F9FF)),
+                                border = BorderStroke(1.dp, Color(0xFFBAE6FD)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("${member.name} • ${member.roleTitle}", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = ShadcnBlack)
+                                        Text("${linkedDevs.size} device${if (linkedDevs.size != 1) "s" else ""}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF0369A1))
+                                    }
+                                    if (linkedDevs.isEmpty()) {
+                                        Text("No device linked yet", fontSize = 11.sp, color = ShadcnMutedText)
+                                    } else {
+                                        linkedDevs.forEach { d ->
+                                            Text(
+                                                text = "• ${d.deviceModel} (${d.appRole}) • ${d.status}",
+                                                fontSize = 11.sp,
+                                                color = ShadcnBlack
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        val unassignedStaffDevs = staffDevices.filter { d ->
+                            val norm = AttendanceCalculator.normalizeStaffKey(d.operatorName)
+                            d.linkedMemberId.isBlank() && staffOnlyRoster.none {
+                                AttendanceCalculator.normalizeStaffKey(it.name) == norm
+                            }
+                        }
+                        if (unassignedStaffDevs.isNotEmpty()) {
+                            item(key = "hdr_unlinked_staff") {
+                                Text(
+                                    text = "UNLINKED STAFF MOBILES (${unassignedStaffDevs.size})",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Black,
+                                    color = StatusAmber,
+                                    modifier = Modifier.padding(top = 6.dp)
+                                )
+                            }
+                            items(unassignedStaffDevs, key = { "unlinked_${it.registryKey}" }) { dev ->
+                                Card(
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBEB)),
+                                    border = BorderStroke(1.dp, StatusAmber.copy(alpha = 0.5f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(dev.operatorName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = ShadcnBlack)
+                                            Text(dev.deviceModel, fontSize = 11.sp, color = ShadcnMutedText)
+                                        }
+                                        TextButton(onClick = { onCreateAndLinkMember(dev.registryKey, dev.operatorName) }) {
+                                            Text("Add to Roster", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     Text(
-                        text = "Make Staff / Admin changes role only • Revoke locks out full app.",
+                        text = "Make Staff / Admin changes role only • Assign links to Staff Roster • Revoke locks out full app.",
                         fontSize = 11.sp,
                         color = ShadcnMutedText
                     )
@@ -566,7 +732,8 @@ fun ActiveDevicesDialog(
                                     isCurrentDevice = isCurrent,
                                     onRevoke = { devicePendingRevoke = dev },
                                     onApprove = { onUpdateDeviceStatus(dev.registryKey, "ACTIVE") },
-                                    onToggleRole = { onUpdateDeviceRole(dev.registryKey, nextRole) }
+                                    onToggleRole = { onUpdateDeviceRole(dev.registryKey, nextRole) },
+                                    onAssignMember = { devicePendingMemberLink = dev }
                                 )
                             }
                         }
@@ -582,6 +749,66 @@ fun ActiveDevicesDialog(
         containerColor = ShadcnWhite,
         shape = RoundedCornerShape(18.dp)
     )
+
+    devicePendingMemberLink?.let { target ->
+        val staffChoices = remember(staffRoster) {
+            staffRoster.filter { it.isActive && !it.orgRole.equals("ADMIN", ignoreCase = true) }
+        }
+        AlertDialog(
+            onDismissRequest = { devicePendingMemberLink = null },
+            title = {
+                Text(
+                    text = "Assign Staff Member — ${target.operatorName}",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = ShadcnBlack
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "${target.deviceModel} will sync attendance and stay locked to Staff Mode when linked to a Staff Roster member.",
+                        fontSize = 12.sp,
+                        color = ShadcnMutedText
+                    )
+                    staffChoices.forEach { member ->
+                        OutlinedButton(
+                            onClick = {
+                                onLinkDeviceToMember(target.registryKey, member)
+                                devicePendingMemberLink = null
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("${member.name} (${member.roleTitle})", color = ShadcnBlack, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    Button(
+                        onClick = {
+                            onCreateAndLinkMember(target.registryKey, target.operatorName)
+                            devicePendingMemberLink = null
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = ShadcnBlack, contentColor = ShadcnWhite),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("+ Add \"${target.operatorName}\" to Staff Roster & Link", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { devicePendingMemberLink = null }) {
+                    Text("Cancel", color = ShadcnMutedText)
+                }
+            },
+            containerColor = ShadcnWhite,
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
 
     devicePendingRevoke?.let { target ->
         AlertDialog(
@@ -633,7 +860,8 @@ private fun DeviceRowCard(
     isCurrentDevice: Boolean,
     onRevoke: () -> Unit,
     onApprove: () -> Unit,
-    onToggleRole: () -> Unit
+    onToggleRole: () -> Unit,
+    onAssignMember: () -> Unit
 ) {
     val isAdmin = device.appRole.equals("ADMIN", ignoreCase = true)
     val lastSeenStr = remember(device.lastSeenMs) {
@@ -693,6 +921,14 @@ private fun DeviceRowCard(
                 fontSize = 11.sp,
                 color = ShadcnMutedText
             )
+            if (device.linkedMemberName.isNotBlank()) {
+                Text(
+                    text = "Linked Member: ${device.linkedMemberName}",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF0369A1)
+                )
+            }
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = ShadcnBorder)
 
@@ -725,19 +961,33 @@ private fun DeviceRowCard(
 
                 if (!isCurrentDevice) {
                     Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         OutlinedButton(
+                            onClick = onAssignMember,
+                            border = BorderStroke(1.dp, Color(0xFF0369A1).copy(alpha = 0.45f)),
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                            modifier = Modifier.height(28.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (device.linkedMemberId.isNotBlank()) "Reassign" else "Assign",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF0369A1)
+                            )
+                        }
+                        OutlinedButton(
                             onClick = onToggleRole,
                             border = BorderStroke(1.dp, ShadcnBorder),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            contentPadding = PaddingValues(horizontal = 7.dp, vertical = 2.dp),
                             modifier = Modifier.height(28.dp),
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
                                 text = if (isAdmin) "Make Staff" else "Make Admin",
-                                fontSize = 11.sp,
+                                fontSize = 10.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 color = ShadcnBlack
                             )

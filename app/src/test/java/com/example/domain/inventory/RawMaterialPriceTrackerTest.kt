@@ -129,10 +129,60 @@ class RawMaterialPriceTrackerTest {
 
         val csv = RawMaterialPriceTracker.buildIngredientPricingCsv(summaries, listOf(bill1, bill2))
         assertTrue(csv.startsWith("\uFEFF"))
+        assertTrue(csv.contains("DATE-WISE PRICE HISTORY & REORDER MATRIX"))
         assertTrue(csv.contains("Full Cream Milk"))
         assertTrue(csv.contains("Blinkit Wholesale"))
         assertTrue(csv.contains("72.00"))
         assertTrue(csv.contains("65.00"))
         assertTrue(csv.contains("INV-20261126-002"))
+    }
+
+    @Test
+    fun `evaluateInventoryAlerts flags low stock suggested order and builds date column matrix`() {
+        val lowMilk = milk.copy(currentStock = 0.0, defaultPrice = 75.0)
+        val day1Ms = 1_763_600_000_000L // fixed Nov date 1
+        val day2Ms = 1_764_118_400_000L // fixed Nov date 2 (different day)
+        val b1 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-A1", day1Ms, "Metro", 650.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(1, "INV-A1", "Full Cream Milk", 10.0, "L", 65.0, 650.0))
+        )
+        val b2 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-A2", day2Ms, "Blinkit", 750.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(2, "INV-A2", "Full Cream Milk", 10.0, "L", 75.0, 750.0))
+        )
+
+        val alerts = RawMaterialPriceTracker.evaluateInventoryAlerts(
+            inventoryItems = listOf(lowMilk),
+            inventoryOrders = listOf(b1, b2),
+            usages = emptyList(),
+            priceAlertThresholdPct = 5.0
+        )
+        assertEquals(1, alerts.size)
+        val alert = alerts.first()
+        assertEquals(StockAlertLevel.OUT_OF_STOCK, alert.stockAlertLevel)
+        assertEquals(5, alert.suggestedOrderPacks)
+        assertEquals(PriceAlertLevel.HIGH_HIKE, alert.priceAlertLevel)
+        assertTrue(alert.priceAlertLabel.contains("HIGH HIKE"))
+
+        // With higher threshold (20%), ~15.4% hike downgrades to MINOR_UP
+        val relaxedAlerts = RawMaterialPriceTracker.evaluateInventoryAlerts(
+            inventoryItems = listOf(lowMilk),
+            inventoryOrders = listOf(b1, b2),
+            usages = emptyList(),
+            priceAlertThresholdPct = 20.0
+        )
+        assertEquals(PriceAlertLevel.MINOR_UP, relaxedAlerts.first().priceAlertLevel)
+
+        val matrix = RawMaterialPriceTracker.buildIngredientPriceMatrix(
+            inventoryItems = listOf(lowMilk),
+            inventoryOrders = listOf(b1, b2),
+            usages = emptyList(),
+            priceAlertThresholdPct = 5.0
+        )
+        assertEquals(2, matrix.dates.size)
+        assertEquals(1, matrix.rows.size)
+        val row = matrix.rows.first()
+        assertEquals(65.0, row.ratesByDate[matrix.dates[0]]!!, 0.01)
+        assertEquals(75.0, row.ratesByDate[matrix.dates[1]]!!, 0.01)
     }
 }

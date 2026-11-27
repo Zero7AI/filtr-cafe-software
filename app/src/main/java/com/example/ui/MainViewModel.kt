@@ -43,6 +43,8 @@ import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.data.entity.StaffRosterEntity
 import com.example.domain.attendance.AttendanceCalculator
 import com.example.domain.attendance.DayAttendanceStatus
+import com.example.domain.inventory.IngredientPriceMatrix
+import com.example.domain.inventory.InventoryAlertRow
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
@@ -157,6 +159,8 @@ data class BillingUiState(
     val orderNotes: String = "",
     val cartItems: Map<MenuItemEntity, Int> = emptyMap(),
     val googleSheetsWebhookUrl: String = "",
+    val googleSheetsUrl: String = "",
+    val priceAlertThresholdPct: Double = 5.0,
     val isPlacingOrder: Boolean = false,
     val isListeningVoice: Boolean = false,
     val isParsingVoice: Boolean = false,
@@ -250,6 +254,8 @@ data class BillingUiState(
     val deviceAccessStatus: String = "ACTIVE", // "ACTIVE", "UNVERIFIED", "PENDING", "REVOKED"
     val operatorName: String = "",
     val currentRole: String = "STAFF", // "ADMIN" or "STAFF"
+    val linkedMemberId: String = "",
+    val linkedMemberName: String = "",
     val accessGateError: String = "",
     val isVerifyingAccess: Boolean = false,
     val showActiveDevicesDialog: Boolean = false,
@@ -356,6 +362,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(
         BillingUiState(
             googleSheetsWebhookUrl = prefs.getString("sheets_webhook_url", "") ?: "",
+            googleSheetsUrl = prefs.getString("google_sheets_url", "") ?: "",
+            priceAlertThresholdPct = (prefs.getString("price_alert_threshold_pct", "5.0") ?: "5.0").toDoubleOrNull() ?: 5.0,
             receiptStoryTitle = prefs.getString("receipt_story_title", "Testing of Hazelnut Iced Coffee") ?: "Testing of Hazelnut Iced Coffee",
             receiptStoryDate = prefs.getString("receipt_story_date", "") ?: "",
             receiptStoryCaption = prefs.getString("receipt_story_caption", "Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.") ?: "Late nights, endless trials, and pure passion. We spent months perfecting this exact brew ratio for you.",
@@ -375,6 +383,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             deviceAccessStatus = prefs.getString("device_access_status", "UNVERIFIED") ?: "UNVERIFIED",
             operatorName = prefs.getString("device_operator_name", "") ?: "",
             currentRole = initialRole,
+            linkedMemberId = prefs.getString("linked_member_id", "") ?: "",
+            linkedMemberName = prefs.getString("linked_member_name", "") ?: "",
             accessPolicyConfig = sanitizedPolicyForRole(SupabaseService.AccessPolicyConfig(), initialRole)
         )
     )
@@ -404,6 +414,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val inventoryUsages: StateFlow<List<InventoryUsageEntity>> = repository.allInventoryUsages
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val inventoryAlerts: StateFlow<List<InventoryAlertRow>> = combine(
+        inventoryItems,
+        inventoryOrders,
+        inventoryUsages,
+        _uiState.map { it.priceAlertThresholdPct }.distinctUntilChanged()
+    ) { items, orders, usages, threshold ->
+        RawMaterialPriceTracker.evaluateInventoryAlerts(
+            inventoryItems = items,
+            inventoryOrders = orders,
+            usages = usages,
+            priceAlertThresholdPct = threshold
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val ingredientPriceMatrix: StateFlow<IngredientPriceMatrix> = combine(
+        inventoryItems,
+        inventoryOrders,
+        inventoryUsages,
+        _uiState.map { it.priceAlertThresholdPct }.distinctUntilChanged()
+    ) { items, orders, usages, threshold ->
+        RawMaterialPriceTracker.buildIngredientPriceMatrix(
+            inventoryItems = items,
+            inventoryOrders = orders,
+            usages = usages,
+            priceAlertThresholdPct = threshold
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), IngredientPriceMatrix(emptyList(), emptyList()))
 
     val customers: StateFlow<List<CustomerEntity>> = repository.allCustomers
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -712,18 +750,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         staffRoster,
         onDutyStaffKeysToday
     ) { (operatorName, registeredDevices), attendanceLogs, roster, onDutyKeys ->
+        val staffOnlyRoster = roster.filter { !it.orgRole.equals("ADMIN", ignoreCase = true) }
         val fromDevices = registeredDevices
             .filter { it.appRole == "STAFF" }
-            .map { it.operatorName.trim() }
+            .map { it.linkedMemberName.ifBlank { it.operatorName }.trim() }
         val fromLogs = attendanceLogs.map { it.staffName.trim() }
 
-        AttendanceCalculator.resolveSelectableStaffNames(
-            roster = roster,
+        val resolved = AttendanceCalculator.resolveSelectableStaffNames(
+            roster = staffOnlyRoster,
             onDutyNormalizedKeys = onDutyKeys,
             fallbackDeviceNames = fromDevices,
             fallbackLogNames = fromLogs,
             loggedInOperatorName = operatorName
         )
+        // Also merge verified STAFF device operators not yet added to Staff Roster
+        val extraStaff = fromDevices
+            .filter { AttendanceCalculator.isRealStaffName(it) }
+            .filter { devName -> resolved.none { it.equals(devName, ignoreCase = true) } }
+        (resolved + extraStaff).distinctBy { AttendanceCalculator.normalizeStaffKey(it) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _selectedCheckInStaffName = MutableStateFlow("")
@@ -928,7 +972,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) { roster, monthKey, allLogs, activeDateKey ->
         val todayMonthKey = if (activeDateKey.length >= 7) activeDateKey.substring(0, 7) else monthKey
         roster
-            .filter { it.isActive }
+            .filter { it.isActive && !it.orgRole.equals("ADMIN", ignoreCase = true) }
             .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
             .map { member ->
                 val targetStaffKey = AttendanceCalculator.normalizeStaffKey(member.name)
@@ -2720,11 +2764,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 googleSheetsWebhookUrl = trimmedUrl,
                 showSettingsDialog = false,
-                snackbarMessage = "Google Sheets Webhook URL saved! Syncing pending orders..."
+                snackbarMessage = "Google Sheets Webhook URL saved & synced across devices! Syncing pending orders..."
             )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            SupabaseService.getInstance().saveGoogleSheetsWebhookUrl(trimmedUrl)
         }
         if (trimmedUrl.isNotBlank()) {
             syncPendingOrdersToSheets()
+        }
+    }
+
+    fun updatePriceAlertThreshold(thresholdPct: Double) {
+        if (!requireAdmin("Updating price alert threshold")) return
+        val safe = thresholdPct.coerceIn(0.5, 50.0)
+        prefs.edit().putString("price_alert_threshold_pct", safe.toString()).apply()
+        _uiState.update {
+            it.copy(
+                priceAlertThresholdPct = safe,
+                snackbarMessage = "Price hike alert threshold set to ±${safe.toInt()}%"
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            SupabaseService.getInstance().savePriceAlertThresholdPct(safe)
         }
     }
 
@@ -3480,7 +3542,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val url = _uiState.value.googleSheetsWebhookUrl
                 if (url.isNotBlank()) {
                     viewModelScope.launch(Dispatchers.IO) {
-                        repository.syncInventoryPurchaseToSheets(url, orderEntity, orderItems)
+                        repository.syncInventoryPurchaseToSheets(
+                            webhookUrl = url,
+                            order = orderEntity,
+                            items = orderItems,
+                            priceAlertThresholdPct = _uiState.value.priceAlertThresholdPct
+                        )
                     }
                 }
 
@@ -4032,6 +4099,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val localOperator = prefs.getString("device_operator_name", "") ?: ""
             val localEpoch = prefs.getInt("device_passcode_epoch", 1)
             val localRoleUpdatedAtMs = prefs.getLong("device_role_updated_at_ms", 0L)
+            val localMemberId = prefs.getString("linked_member_id", "") ?: ""
+            val localMemberName = prefs.getString("linked_member_name", "") ?: ""
+            val localMemberLinkTs = prefs.getLong("device_member_link_updated_at_ms", 0L)
+
+            val remoteWebhook = supabase.fetchGoogleSheetsWebhookUrl()
+            val remoteSheetUrl = supabase.fetchGoogleSheetsSpreadsheetUrl()
+            val remoteThresholdPct = supabase.fetchPriceAlertThresholdPct()
 
             val remoteReg = supabase.syncDeviceHeartbeat(
                 deviceId = currentDeviceId,
@@ -4043,22 +4117,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 appVersionCode = BuildConfig.VERSION_CODE,
                 localStatus = localStatus,
                 passcodeEpoch = localEpoch,
-                localRoleUpdatedAtMs = localRoleUpdatedAtMs
+                localRoleUpdatedAtMs = localRoleUpdatedAtMs,
+                localLinkedMemberId = localMemberId,
+                localLinkedMemberName = localMemberName,
+                localMemberLinkUpdatedAtMs = localMemberLinkTs
             )
 
-            val effectiveStatus = if (remoteReg != null) {
+            val statusAfterRemote = if (remoteReg != null) {
                 SupabaseService.resolveDeviceAccessStatus(remoteReg.status, localStatus)
             } else {
                 localStatus
-            }.let { statusAfterRemote ->
-                if (statusAfterRemote == "ACTIVE" && localEpoch < policy.passcodeEpoch) {
-                    "UNVERIFIED"
-                } else {
-                    statusAfterRemote
-                }
+            }.let { status ->
+                if (status == "ACTIVE" && localEpoch < policy.passcodeEpoch) "UNVERIFIED" else status
             }
 
-            val (effectiveRole, effectiveRoleUpdatedAtMs) = if (remoteReg != null) {
+            val (resolvedRole, resolvedRoleUpdatedAtMs) = if (remoteReg != null) {
                 SupabaseService.resolveDeviceRole(
                     remoteRole = remoteReg.appRole,
                     remoteRoleUpdatedAtMs = remoteReg.roleUpdatedAtMs,
@@ -4069,11 +4142,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 currentRole to localRoleUpdatedAtMs
             }
 
-            if (effectiveStatus != localStatus || effectiveRole != currentRole || effectiveRoleUpdatedAtMs != localRoleUpdatedAtMs) {
+            val (resolvedMemberId, resolvedMemberName, resolvedMemberLinkTs) = if (remoteReg != null) {
+                SupabaseService.resolveDeviceMemberLink(
+                    remoteMemberId = remoteReg.linkedMemberId,
+                    remoteMemberName = remoteReg.linkedMemberName,
+                    remoteUpdatedAtMs = remoteReg.memberLinkUpdatedAtMs,
+                    localMemberId = localMemberId,
+                    localMemberName = localMemberName,
+                    localUpdatedAtMs = localMemberLinkTs
+                )
+            } else {
+                Triple(localMemberId, localMemberName, localMemberLinkTs)
+            }
+
+            val rosterSnapshot = staffRoster.value
+            val linkedMember = resolvedMemberId.takeIf { it.isNotBlank() }?.let { mid ->
+                rosterSnapshot.firstOrNull { it.id == mid }
+            }
+            val (effectiveRole, effectiveStatus) = SupabaseService.enforceMemberRosterPolicy(
+                currentRole = resolvedRole,
+                currentStatus = statusAfterRemote,
+                linkedMember = linkedMember
+            )
+
+            if (!remoteWebhook.isNullOrBlank() && remoteWebhook != _uiState.value.googleSheetsWebhookUrl) {
+                prefs.edit().putString("sheets_webhook_url", remoteWebhook).apply()
+            }
+            if (!remoteSheetUrl.isNullOrBlank() && remoteSheetUrl != _uiState.value.googleSheetsUrl) {
+                prefs.edit().putString("google_sheets_url", remoteSheetUrl).apply()
+            }
+            if (remoteThresholdPct != null && kotlin.math.abs(remoteThresholdPct - _uiState.value.priceAlertThresholdPct) > 0.01) {
+                prefs.edit().putString("price_alert_threshold_pct", remoteThresholdPct.toString()).apply()
+            }
+
+            if (effectiveStatus != localStatus || effectiveRole != currentRole ||
+                resolvedRoleUpdatedAtMs != localRoleUpdatedAtMs ||
+                resolvedMemberId != localMemberId || resolvedMemberName != localMemberName ||
+                resolvedMemberLinkTs != localMemberLinkTs
+            ) {
                 prefs.edit()
                     .putString("device_access_status", effectiveStatus)
                     .putString("authenticated_role", effectiveRole)
-                    .putLong("device_role_updated_at_ms", effectiveRoleUpdatedAtMs)
+                    .putLong("device_role_updated_at_ms", resolvedRoleUpdatedAtMs)
+                    .putString("linked_member_id", resolvedMemberId)
+                    .putString("linked_member_name", resolvedMemberName)
+                    .putLong("device_member_link_updated_at_ms", resolvedMemberLinkTs)
                     .apply()
             }
 
@@ -4090,6 +4203,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     deviceAccessStatus = effectiveStatus,
                     accessPolicyConfig = sanitizedPolicyForRole(policy, effectiveRole),
                     currentRole = effectiveRole,
+                    linkedMemberId = resolvedMemberId,
+                    linkedMemberName = resolvedMemberName,
+                    googleSheetsWebhookUrl = remoteWebhook ?: it.googleSheetsWebhookUrl,
+                    googleSheetsUrl = remoteSheetUrl ?: it.googleSheetsUrl,
+                    priceAlertThresholdPct = remoteThresholdPct ?: it.priceAlertThresholdPct,
                     snackbarMessage = roleNotice ?: it.snackbarMessage
                 )
                 if (effectiveStatus != "ACTIVE" || effectiveRole != "ADMIN") {
@@ -4131,19 +4249,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                val cleanOperator = operatorName.trim()
+                val matchedStaffMember = if (authenticatedRole == "STAFF") {
+                    val normKey = AttendanceCalculator.normalizeStaffKey(cleanOperator)
+                    staffRoster.value.firstOrNull {
+                        it.isActive && !it.orgRole.equals("ADMIN", ignoreCase = true) &&
+                            (it.id == normKey || AttendanceCalculator.normalizeStaffKey(it.name) == normKey)
+                    }
+                } else {
+                    null
+                }
+                val linkMemberId = matchedStaffMember?.id ?: _uiState.value.linkedMemberId
+                val linkMemberName = matchedStaffMember?.name ?: _uiState.value.linkedMemberName
                 val roleTs = System.currentTimeMillis()
                 val remoteReg = withContext(Dispatchers.IO) {
                     supabase.syncDeviceHeartbeat(
                         deviceId = currentDeviceId,
                         appRole = authenticatedRole,
-                        operatorName = operatorName.trim(),
+                        operatorName = cleanOperator,
                         deviceModel = currentDeviceModel,
                         androidVersion = "Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
                         appVersionName = BuildConfig.VERSION_NAME,
                         appVersionCode = BuildConfig.VERSION_CODE,
                         localStatus = targetStatus,
                         passcodeEpoch = policy.passcodeEpoch,
-                        localRoleUpdatedAtMs = roleTs
+                        localRoleUpdatedAtMs = roleTs,
+                        localLinkedMemberId = linkMemberId,
+                        localLinkedMemberName = linkMemberName,
+                        localMemberLinkUpdatedAtMs = if (matchedStaffMember != null) roleTs else 0L
                     )
                 }
 
@@ -4152,24 +4285,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "PENDING" -> "PENDING"
                     else -> targetStatus
                 }
+                val resolvedLinkedId = remoteReg?.linkedMemberId?.takeIf { it.isNotBlank() } ?: linkMemberId
+                val resolvedLinkedName = remoteReg?.linkedMemberName?.takeIf { it.isNotBlank() } ?: linkMemberName
                 prefs.edit()
                     .putString("device_access_status", finalStatus)
-                    .putString("device_operator_name", operatorName.trim())
+                    .putString("device_operator_name", cleanOperator)
                     .putString("authenticated_role", authenticatedRole)
                     .putInt("device_passcode_epoch", policy.passcodeEpoch)
                     .putLong("device_role_updated_at_ms", roleTs)
+                    .putString("linked_member_id", resolvedLinkedId)
+                    .putString("linked_member_name", resolvedLinkedName)
                     .apply()
 
                 _uiState.update {
                     val base = it.copy(
                         isVerifyingAccess = false,
                         deviceAccessStatus = finalStatus,
-                        operatorName = operatorName.trim(),
+                        operatorName = cleanOperator,
                         currentRole = authenticatedRole,
+                        linkedMemberId = resolvedLinkedId,
+                        linkedMemberName = resolvedLinkedName,
                         accessGateError = "",
                         accessPolicyConfig = sanitizedPolicyForRole(policy, authenticatedRole)
                     )
                     base.resetRestrictedStateForRole(authenticatedRole)
+                }
+
+                // Auto-record attendance check-in when a Staff mobile logs in
+                if (authenticatedRole == "STAFF" && finalStatus == "ACTIVE") {
+                    val attendanceName = resolvedLinkedName.ifBlank { cleanOperator }
+                    if (AttendanceCalculator.isRealStaffName(attendanceName)) {
+                        withContext(Dispatchers.IO) {
+                            refreshDateKeyIfNeeded()
+                            val dateKey = _activeDateKey.value
+                            repository.recordStaffAutoLoginAttendance(
+                                dateKey = dateKey,
+                                monthKey = dateKey.take(7),
+                                staffName = attendanceName,
+                                deviceId = currentDeviceId
+                            )
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 _uiState.update {
@@ -4198,6 +4354,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (!cleanCode.equals(policy.adminPasscode.trim(), ignoreCase = false)) {
                     onResult(false, "Incorrect Admin Passcode")
+                    return@launch
+                }
+
+                val linkedId = _uiState.value.linkedMemberId.ifBlank { prefs.getString("linked_member_id", "").orEmpty() }
+                val linkedStaff = linkedId.takeIf { it.isNotBlank() }?.let { id ->
+                    staffRoster.value.firstOrNull { it.id == id && !it.orgRole.equals("ADMIN", ignoreCase = true) }
+                }
+                if (linkedStaff != null) {
+                    onResult(false, "This mobile is assigned to Staff (${linkedStaff.name}). Ask the Store Owner for Admin access.")
                     return@launch
                 }
 
@@ -4301,6 +4466,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun logOutDevice() {
+        val prevRole = _uiState.value.currentRole
+        val prevStaffName = _uiState.value.linkedMemberName.ifBlank { _uiState.value.operatorName }.trim()
         val roleTs = System.currentTimeMillis()
         prefs.edit()
             .putString("device_access_status", "UNVERIFIED")
@@ -4318,6 +4485,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                if (prevRole == "STAFF" && AttendanceCalculator.isRealStaffName(prevStaffName)) {
+                    refreshDateKeyIfNeeded()
+                    repository.recordStaffAutoLogoutAttendance(
+                        dateKey = _activeDateKey.value,
+                        staffName = prevStaffName
+                    )
+                }
                 SupabaseService.getInstance().syncDeviceHeartbeat(
                     deviceId = currentDeviceId,
                     appRole = "STAFF",
@@ -4415,6 +4589,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     _uiState.update { it.copy(snackbarMessage = "Failed: ${res.exceptionOrNull()?.message}") }
                 }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed: ${e.message}") }
+            }
+            refreshRegisteredDevices()
+        }
+    }
+
+    fun linkDeviceToMember(registryKey: String, member: StaffRosterEntity) {
+        if (!requireAdmin("Linking device to team member")) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingDevices = true) }
+            try {
+                val targetRole = if (member.orgRole.equals("ADMIN", ignoreCase = true)) "ADMIN" else "STAFF"
+                val res = withContext(Dispatchers.IO) {
+                    SupabaseService.getInstance().setDeviceMemberLink(
+                        registryKey = registryKey,
+                        memberId = member.id,
+                        memberName = member.name,
+                        memberOrgRole = targetRole
+                    )
+                }
+                if (res.isSuccess) {
+                    _uiState.update { it.copy(snackbarMessage = "Device linked to ${member.name} ($targetRole)") }
+                } else {
+                    _uiState.update { it.copy(snackbarMessage = "Failed to link device: ${res.exceptionOrNull()?.message}") }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "Failed to link device: ${e.message}") }
+            }
+            refreshRegisteredDevices()
+        }
+    }
+
+    fun createAndLinkRosterMemberForDevice(registryKey: String, name: String) {
+        if (!requireAdmin("Adding staff member & linking device")) return
+        val cleanName = name.trim()
+        if (cleanName.isBlank()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingDevices = true) }
+            try {
+                val memberId = AttendanceCalculator.normalizeStaffKey(cleanName)
+                val member = StaffRosterEntity(
+                    id = memberId,
+                    name = cleanName,
+                    roleTitle = "Barista",
+                    shiftLabel = "Full Day",
+                    joinedDateKey = _activeDateKey.value,
+                    isActive = true,
+                    updatedAt = System.currentTimeMillis(),
+                    colorHex = KdsBaristaColorPalette.resolveColorHex(cleanName),
+                    orgRole = "STAFF"
+                )
+                withContext(Dispatchers.IO) {
+                    repository.saveStaffRosterMember(member)
+                    SupabaseService.getInstance().setDeviceMemberLink(
+                        registryKey = registryKey,
+                        memberId = member.id,
+                        memberName = member.name,
+                        memberOrgRole = "STAFF"
+                    )
+                }
+                _uiState.update { it.copy(snackbarMessage = "Added ${member.name} to Staff Roster & linked device") }
             } catch (e: Exception) {
                 _uiState.update { it.copy(snackbarMessage = "Failed: ${e.message}") }
             }
@@ -4892,6 +5128,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _selectedCheckInStaffName.value = staffName.trim()
     }
 
+    fun saveAdminManualAttendance(
+        dateKey: String,
+        staffName: String,
+        checkInTimestamp: Long,
+        checkOutTimestamp: Long,
+        notes: String
+    ) {
+        if (!requireAdmin("Editing staff attendance")) return
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.saveAdminManualAttendance(
+                dateKey = dateKey,
+                staffName = staffName,
+                checkInTimestamp = checkInTimestamp,
+                checkOutTimestamp = checkOutTimestamp,
+                notes = notes
+            ).onSuccess {
+                _uiState.update {
+                    it.copy(snackbarMessage = "Updated $staffName attendance for $dateKey")
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(snackbarMessage = err.message ?: "Failed to update attendance")
+                }
+            }
+        }
+    }
+
     fun saveStaffRosterMember(
         existingId: String?,
         name: String,
@@ -4947,6 +5210,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 colorHex = resolvedColor
             )
             val result = repository.saveStaffRosterMember(entity)
+            if (result.isSuccess) {
+                SupabaseService.getInstance().cascadeMemberPolicyToLinkedDevices(entity)
+            }
             result.onSuccess {
                 val verb = if (cleanExistingId != null) "updated" else "added"
                 _uiState.update {
@@ -5158,7 +5424,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val summaries = ingredientPricingSummaries.value
             val orders = inventoryOrders.value
-            val res = repository.syncIngredientPricingToSheets(url, summaries, orders)
+            val matrix = ingredientPriceMatrix.value
+            val res = repository.syncIngredientPricingToSheets(url, summaries, orders, matrix)
             val msg = res.getOrElse { "Sheets sync failed: ${it.message}" }
             _uiState.update { it.copy(snackbarMessage = msg) }
         }
@@ -5167,7 +5434,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun buildIngredientPricingCsvFile(context: Context): File {
         val summaries = ingredientPricingSummaries.value
         val orders = inventoryOrders.value
-        val csvContent = RawMaterialPriceTracker.buildIngredientPricingCsv(summaries, orders)
+        val csvContent = RawMaterialPriceTracker.buildIngredientPricingCsv(
+            summaries = summaries,
+            inventoryOrders = orders,
+            inventoryItems = inventoryItems.value,
+            usages = inventoryUsages.value,
+            priceAlertThresholdPct = _uiState.value.priceAlertThresholdPct
+        )
         val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
         val exportDir = File(context.cacheDir, "inventory_reports").apply { mkdirs() }
         val outFile = File(exportDir, "FILTR_Ingredient_Pricing_$dateStr.csv")

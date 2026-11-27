@@ -31,6 +31,7 @@ import com.example.data.entity.KitchenInventoryShiftEntity
 import com.example.domain.attendance.AttendanceCalculator
 import com.example.domain.attendance.GeofenceCheckResult
 import com.example.domain.attendance.StoreGeofenceConfig
+import com.example.domain.inventory.IngredientPriceMatrix
 import com.example.domain.inventory.IngredientPriceSummary
 import com.example.domain.inventory.ParsedRawMaterialReceipt
 import com.example.domain.inventory.RawMaterialPriceTracker
@@ -2943,6 +2944,143 @@ class FiltrRepository(
         }
     }
 
+    suspend fun recordStaffAutoLoginAttendance(
+        dateKey: String,
+        monthKey: String,
+        staffName: String,
+        deviceId: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): Result<AttendanceLogEntity?> {
+        val dao = attendanceDao ?: return Result.failure(IllegalStateException("AttendanceDao unavailable"))
+        return try {
+            val cleanStaff = staffName.trim().ifBlank { return Result.success(null) }
+            val logId = AttendanceCalculator.buildLogId(dateKey, cleanStaff)
+            val existing = dao.getLogById(logId)
+            if (existing != null && existing.checkInTimestamp > 0L) {
+                return Result.success(existing)
+            }
+            val entry = AttendanceLogEntity(
+                id = logId,
+                dateKey = dateKey,
+                monthKey = monthKey,
+                staffName = cleanStaff,
+                deviceId = deviceId.trim(),
+                checkInTimestamp = nowMs,
+                checkInLat = 0.0,
+                checkInLng = 0.0,
+                checkInDistanceMeters = 0.0,
+                checkOutTimestamp = 0L,
+                checkOutLat = 0.0,
+                checkOutLng = 0.0,
+                checkOutDistanceMeters = 0.0,
+                workedMinutes = 0,
+                notes = "Auto check-in on Staff login",
+                updatedAt = nowMs
+            )
+            dao.upsertLog(entry)
+            launchManagedSync {
+                attendanceSyncMutex.withLock {
+                    syncAttendanceMonthToCloud(monthKey)
+                }
+            }
+            Result.success(entry)
+        } catch (e: Exception) {
+            Log.w(TAG, "recordStaffAutoLoginAttendance failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun recordStaffAutoLogoutAttendance(
+        dateKey: String,
+        staffName: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): Result<AttendanceLogEntity?> {
+        val dao = attendanceDao ?: return Result.failure(IllegalStateException("AttendanceDao unavailable"))
+        return try {
+            val cleanStaff = staffName.trim().ifBlank { return Result.success(null) }
+            val logId = AttendanceCalculator.buildLogId(dateKey, cleanStaff)
+            val existing = dao.getLogById(logId) ?: return Result.success(null)
+            if (existing.checkInTimestamp <= 0L || existing.checkOutTimestamp > 0L) {
+                return Result.success(existing)
+            }
+            val workedMinutes = AttendanceCalculator.calculateWorkedMinutes(existing.checkInTimestamp, nowMs)
+            val updated = existing.copy(
+                checkOutTimestamp = nowMs,
+                workedMinutes = workedMinutes,
+                notes = listOf(existing.notes, "Auto check-out on Staff logout")
+                    .filter { it.isNotBlank() }.joinToString(" • "),
+                updatedAt = nowMs
+            )
+            dao.upsertLog(updated)
+            launchManagedSync {
+                attendanceSyncMutex.withLock {
+                    syncAttendanceMonthToCloud(existing.monthKey)
+                }
+            }
+            Result.success(updated)
+        } catch (e: Exception) {
+            Log.w(TAG, "recordStaffAutoLogoutAttendance failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun saveAdminManualAttendance(
+        dateKey: String,
+        staffName: String,
+        checkInTimestamp: Long,
+        checkOutTimestamp: Long,
+        notes: String = "",
+        nowMs: Long = System.currentTimeMillis()
+    ): Result<AttendanceLogEntity> {
+        val dao = attendanceDao ?: return Result.failure(IllegalStateException("AttendanceDao unavailable"))
+        return try {
+            val cleanStaff = staffName.trim().ifBlank {
+                return Result.failure(IllegalArgumentException("Staff name cannot be blank"))
+            }
+            val cleanDate = dateKey.trim()
+            val monthKey = cleanDate.take(7)
+            val logId = AttendanceCalculator.buildLogId(cleanDate, cleanStaff)
+            val existing = dao.getLogById(logId)
+            val safeOut = if (checkInTimestamp > 0L && checkOutTimestamp > checkInTimestamp) checkOutTimestamp else 0L
+            val worked = if (checkInTimestamp > 0L && safeOut > checkInTimestamp) {
+                AttendanceCalculator.calculateWorkedMinutes(checkInTimestamp, safeOut)
+            } else {
+                0
+            }
+            val resolvedNote = notes.trim().ifBlank {
+                if (checkInTimestamp > 0L) "Admin manual entry" else "Marked Absent by Admin"
+            }
+            val updated = AttendanceLogEntity(
+                id = logId,
+                dateKey = cleanDate,
+                monthKey = monthKey,
+                staffName = cleanStaff,
+                deviceId = existing?.deviceId ?: "admin_override",
+                checkInTimestamp = checkInTimestamp,
+                checkInLat = existing?.checkInLat ?: 0.0,
+                checkInLng = existing?.checkInLng ?: 0.0,
+                checkInDistanceMeters = existing?.checkInDistanceMeters ?: 0.0,
+                checkOutTimestamp = safeOut,
+                checkOutLat = existing?.checkOutLat ?: 0.0,
+                checkOutLng = existing?.checkOutLng ?: 0.0,
+                checkOutDistanceMeters = existing?.checkOutDistanceMeters ?: 0.0,
+                workedMinutes = worked,
+                notes = resolvedNote,
+                updatedAt = nowMs
+            )
+            dao.upsertLog(updated)
+            launchManagedSync {
+                attendanceSyncMutex.withLock {
+                    syncAttendanceMonthToCloud(monthKey)
+                }
+            }
+            Result.success(updated)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveAdminManualAttendance error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
     suspend fun saveAttendanceStoreConfig(config: StoreGeofenceConfig): Result<Unit> {
         return try {
             val payload = JSONObject().apply {
@@ -3123,6 +3261,7 @@ class FiltrRepository(
             put("isActive", member.isActive)
             put("updatedAt", member.updatedAt)
             put("colorHex", member.colorHex)
+            put("orgRole", member.orgRole.ifBlank { "STAFF" })
         }
     }
 
@@ -3130,6 +3269,7 @@ class FiltrRepository(
         val id = o.optNonNullString("id", "").trim()
         val name = o.optNonNullString("name", "").trim()
         if (id.isBlank() || name.isBlank()) return null
+        val rawRole = o.optNonNullString("orgRole", "STAFF").trim().uppercase()
         return StaffRosterEntity(
             id = id,
             name = name,
@@ -3139,7 +3279,8 @@ class FiltrRepository(
             joinedDateKey = o.optNonNullString("joinedDateKey", ""),
             isActive = o.optBoolean("isActive", true),
             updatedAt = o.optLong("updatedAt", 0L),
-            colorHex = o.optNonNullString("colorHex", "")
+            colorHex = o.optNonNullString("colorHex", ""),
+            orgRole = if (rawRole == "ADMIN") "ADMIN" else "STAFF"
         )
     }
 
@@ -3510,29 +3651,40 @@ class FiltrRepository(
     suspend fun syncInventoryPurchaseToSheets(
         webhookUrl: String,
         order: InventoryOrderEntity,
-        items: List<InventoryOrderItemEntity>
+        items: List<InventoryOrderItemEntity>,
+        priceAlertThresholdPct: Double = 5.0
     ): Result<String> {
         if (webhookUrl.isBlank()) return Result.failure(IllegalArgumentException("Webhook URL not configured"))
         val masterItems = try { allInventoryItems.first() } catch (_: Exception) { emptyList() }
         val allOrders = try { allInventoryOrders.first() } catch (_: Exception) { emptyList() }
+        val usages = try { allInventoryUsages.first() } catch (_: Exception) { emptyList() }
         val summaries = RawMaterialPriceTracker.buildIngredientPricingSummaries(masterItems, allOrders)
+        val matrix = RawMaterialPriceTracker.buildIngredientPriceMatrix(
+            inventoryItems = masterItems,
+            inventoryOrders = allOrders,
+            usages = usages,
+            priceAlertThresholdPct = priceAlertThresholdPct
+        )
         return sheetsSyncService.syncInventoryPurchaseToGoogleSheets(
             webhookUrl = webhookUrl,
             order = order,
             items = items,
-            pricingSummaries = summaries
+            pricingSummaries = summaries,
+            priceMatrix = matrix
         )
     }
 
     suspend fun syncIngredientPricingToSheets(
         webhookUrl: String,
         summaries: List<IngredientPriceSummary>,
-        recentOrders: List<InventoryOrderWithItems>
+        recentOrders: List<InventoryOrderWithItems>,
+        priceMatrix: IngredientPriceMatrix? = null
     ): Result<String> {
         return sheetsSyncService.syncIngredientPricingToGoogleSheets(
             webhookUrl = webhookUrl,
             pricingSummaries = summaries,
-            recentOrders = recentOrders
+            recentOrders = recentOrders,
+            priceMatrix = priceMatrix
         )
     }
 }

@@ -8,6 +8,7 @@ import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
+import com.example.domain.inventory.IngredientPriceMatrix
 import com.example.domain.inventory.IngredientPriceSummary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -578,11 +579,41 @@ class GoogleSheetsSyncService {
         }
     }
 
+    private fun priceMatrixToJson(matrix: IngredientPriceMatrix): JSONObject {
+        val datesArr = JSONArray()
+        matrix.dates.forEach { datesArr.put(it) }
+        val rowsArr = JSONArray()
+        matrix.rows.forEach { r ->
+            val ratesObj = JSONObject()
+            r.ratesByDate.forEach { (dateKey, rate) -> ratesObj.put(dateKey, rate) }
+            rowsArr.put(JSONObject().apply {
+                put("itemName", r.itemName)
+                put("category", r.category)
+                put("unit", r.unit)
+                put("currentStock", r.currentStock)
+                put("stockAlertLevel", r.stockAlertLevel.name)
+                put("stockAlertLabel", r.stockAlertLabel)
+                put("suggestedOrderLabel", r.suggestedOrderLabel)
+                put("latestRate", r.latestRate)
+                put("priceChangePercent", r.priceChangePercent)
+                put("priceAlertLevel", r.priceAlertLevel.name)
+                put("priceAlertLabel", r.priceAlertLabel)
+                put("trend", r.trend.name)
+                put("ratesByDate", ratesObj)
+            })
+        }
+        return JSONObject().apply {
+            put("dates", datesArr)
+            put("rows", rowsArr)
+        }
+    }
+
     suspend fun syncInventoryPurchaseToGoogleSheets(
         webhookUrl: String,
         order: InventoryOrderEntity,
         items: List<InventoryOrderItemEntity>,
-        pricingSummaries: List<IngredientPriceSummary>
+        pricingSummaries: List<IngredientPriceSummary>,
+        priceMatrix: IngredientPriceMatrix? = null
     ): Result<String> = withContext(Dispatchers.IO) {
         val cleanUrl = webhookUrl.trim()
         if (cleanUrl.isBlank()) {
@@ -615,6 +646,9 @@ class GoogleSheetsSyncService {
                     put("notes", order.notes)
                     put("items", itemsArray)
                     put("pricingSummaries", summariesArray)
+                    if (priceMatrix != null) {
+                        put("priceMatrix", priceMatrixToJson(priceMatrix))
+                    }
                 }
 
                 val requestBody = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -631,7 +665,8 @@ class GoogleSheetsSyncService {
     suspend fun syncIngredientPricingToGoogleSheets(
         webhookUrl: String,
         pricingSummaries: List<IngredientPriceSummary>,
-        recentOrders: List<InventoryOrderWithItems>
+        recentOrders: List<InventoryOrderWithItems>,
+        priceMatrix: IngredientPriceMatrix? = null
     ): Result<String> = withContext(Dispatchers.IO) {
         val cleanUrl = webhookUrl.trim()
         if (cleanUrl.isBlank()) {
@@ -666,6 +701,9 @@ class GoogleSheetsSyncService {
                     put("action", "syncIngredientPricing")
                     put("pricingSummaries", summariesArray)
                     put("purchases", purchasesArray)
+                    if (priceMatrix != null) {
+                        put("priceMatrix", priceMatrixToJson(priceMatrix))
+                    }
                 }
 
                 val requestBody = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -868,9 +906,13 @@ function doPost(e) {
     if (action === "syncIngredientPricing") {
       var summaries = data.pricingSummaries || [];
       var purchases = data.purchases || [];
+      var priceMatrix = data.priceMatrix || null;
       withLock_(function() {
         syncIngredientPricingSheet_(ss, summaries);
         syncInventoryPurchaseRows_(ss, purchases);
+        if (priceMatrix) {
+          syncPriceHistoryMatrixSheet_(ss, priceMatrix);
+        }
       });
       logSync_(ss, "syncIngredientPricing", summaries.length + " ingredients", "OK", Date.now() - startTime);
       return successResponse_("Ingredient pricing updated: " + summaries.length + " items");
@@ -1707,6 +1749,9 @@ function syncInventoryPurchase_(ss, data) {
   if (data.pricingSummaries && data.pricingSummaries.length > 0) {
     syncIngredientPricingSheet_(ss, data.pricingSummaries);
   }
+  if (data.priceMatrix) {
+    syncPriceHistoryMatrixSheet_(ss, data.priceMatrix);
+  }
 }
 
 function syncInventoryPurchaseRows_(ss, purchaseRows) {
@@ -1779,6 +1824,58 @@ function syncIngredientPricingSheet_(ss, summaries) {
   range.setValues(rows);
   // Highlight Price Alert column (col 10) for immediate price-hike visibility in Excel/Sheets
   sheet.getRange(2, 10, rows.length, 1).setBackgrounds(bgColors);
+}
+
+function syncPriceHistoryMatrixSheet_(ss, matrix) {
+  if (!matrix || !matrix.rows) return;
+  var dates = matrix.dates || [];
+  var baseHeaders = ["Ingredient Name", "Category", "Unit", "Present Stock", "Stock Alert", "Suggested Order", "Latest Rate (INR)", "Price Alert"];
+  var allHeaders = baseHeaders.concat(dates);
+  var sheet = ensureSheet_(ss, "Price_History_Matrix", allHeaders);
+  var lastRow = sheet.getLastRow();
+  var lastCol = Math.max(sheet.getLastColumn(), allHeaders.length);
+  if (lastRow > 1 && lastCol > 0) {
+    sheet.getRange(2, 1, lastRow - 1, lastCol).clearContent().setBackground(null);
+  }
+  if (matrix.rows.length === 0) return;
+
+  var values = [];
+  var stockColors = [];
+  var priceColors = [];
+  for (var i = 0; i < matrix.rows.length; i++) {
+    var r = matrix.rows[i];
+    var ratesByDate = r.ratesByDate || {};
+    var rowVals = [
+      r.itemName || "",
+      r.category || "General",
+      r.unit || "kg",
+      roundNum_(Number(r.currentStock || 0)),
+      r.stockAlertLabel || "OK",
+      r.suggestedOrderLabel || "—",
+      roundNum_(Number(r.latestRate || 0)),
+      r.priceAlertLabel || "OK"
+    ];
+    for (var d = 0; d < dates.length; d++) {
+      var dk = dates[d];
+      rowVals.push(ratesByDate[dk] !== undefined && ratesByDate[dk] !== null ? roundNum_(Number(ratesByDate[dk])) : "");
+    }
+    values.push(rowVals);
+
+    var sBg = "#DCFCE7";
+    if (r.stockAlertLevel === "OUT_OF_STOCK" || r.stockAlertLevel === "CRITICAL_REORDER") sBg = "#FEE2E2";
+    else if (r.stockAlertLevel === "LOW_STOCK") sBg = "#FEF3C7";
+    stockColors.push([sBg]);
+
+    var pBg = "#FFFFFF";
+    if (r.priceAlertLevel === "HIGH_HIKE") pBg = "#FEE2E2";
+    else if (r.priceAlertLevel === "MINOR_UP") pBg = "#FEF3C7";
+    else if (r.priceAlertLevel === "PRICE_DROP") pBg = "#DCFCE7";
+    priceColors.push([pBg]);
+  }
+  sheet.getRange(2, 1, values.length, allHeaders.length).setValues(values);
+  sheet.getRange(2, 5, values.length, 1).setBackgrounds(stockColors);
+  sheet.getRange(2, 8, values.length, 1).setBackgrounds(priceColors);
+  sheet.setFrozenColumns(1);
 }
 """
     }
