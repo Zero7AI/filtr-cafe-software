@@ -1,26 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/admin-auth';
-import { evaluateInventoryAlerts } from '@/lib/domain/inventory';
+import {
+  buildSkuPriceHistoryMatrix,
+  calculatePacksAndCost,
+  computeIngredientUsage,
+} from '@/lib/domain/inventory';
 import {
   DateRangePreset,
   getIstDateKey,
+  getIstMonthKey,
   getIstRangeBoundsMs,
   IST_OFFSET_MS,
 } from '@/lib/domain/ist';
 import {
+  buildShiftId,
+  computeReorderRecommendation,
+  KITCHEN_SEED_CATALOG,
+} from '@/lib/domain/kitchen';
+import { computePnlReport } from '@/lib/domain/pnl';
+import {
+  AttendanceLog,
+  FixedCostRecord,
   InventoryItem,
   InventoryOrder,
   InventoryOrderItem,
   InventoryOrderWithItems,
   InventoryUsage,
+  KitchenInventoryEntry,
+  KitchenInventoryItem,
   KitchenInventoryShift,
   StaffRosterMember,
-  AttendanceLog,
 } from '@/lib/domain/types';
 import {
   fetchOrdersInRangeServer,
   getSupabaseAdmin,
-  getSyncMetadata,
   getSyncMetadataJson,
 } from '@/lib/supabase-server';
 
@@ -46,11 +59,19 @@ export async function GET(request: NextRequest) {
       ? rangeParam
       : 'TODAY';
 
+    const monthKey = sp.get('monthKey') || getIstMonthKey();
+    const startDate = sp.get('start') || undefined;
+    const endDate = sp.get('end') || undefined;
+
     const { startMs, endMs, dateKeys } = getIstRangeBoundsMs(range, {
-      monthKey: sp.get('monthKey') || undefined,
-      startDate: sp.get('start') || undefined,
-      endDate: sp.get('end') || undefined,
+      monthKey,
+      startDate,
+      endDate,
     });
+
+    const spanMs = Math.max(1, endMs - startMs + 1);
+    const prevEndMs = startMs - 1;
+    const prevStartMs = prevEndMs - spanMs + 1;
 
     const todayKey = getIstDateKey();
     const todayMonthKey = todayKey.slice(0, 7);
@@ -58,39 +79,47 @@ export async function GET(request: NextRequest) {
 
     const [
       orders,
+      prevOrders,
       menuRes,
       invItemsRes,
       invOrdersRes,
       invUsageRes,
+      fixedCostsMap,
+      waPendingRes,
       roster,
       monthLogs,
-      thresholdRaw,
+      kitchenCatalogCloud,
       openingShift,
       closingShift,
     ] = await Promise.all([
       fetchOrdersInRangeServer(startMs, endMs),
+      fetchOrdersInRangeServer(prevStartMs, prevEndMs),
       supabase.from('menu_items').select('id, name, category'),
       supabase.from('inventory_items').select('*'),
       supabase
         .from('inventory_orders')
         .select('*, inventory_order_items(*)')
-        .order('timestamp', { ascending: false })
-        .limit(300),
+        .order('timestamp', { ascending: true })
+        .limit(1000),
       supabase.from('inventory_usage').select('*'),
+      getSyncMetadataJson<Record<string, FixedCostRecord>>('fixed_costs_config', {}),
+      supabase
+        .from('whatsapp_messages')
+        .select('id', { count: 'exact', head: true })
+        .in('status', ['retry_pending', 'config_error']),
       getSyncMetadataJson<StaffRosterMember[]>('attendance_staff_roster', []),
       getSyncMetadataJson<AttendanceLog[]>(`attendance_month_${todayMonthKey}`, []),
-      getSyncMetadata('inventory_price_alert_threshold_pct'),
+      getSyncMetadataJson<KitchenInventoryItem[]>('kitchen_inv_catalog', []),
       getSyncMetadataJson<KitchenInventoryShift | null>(
-        `kitchen_inv_shift_${todayKey}_OPENING`,
+        `kitchen_inv_shift_${buildShiftId(todayKey, 'OPENING')}`,
         null
       ),
       getSyncMetadataJson<KitchenInventoryShift | null>(
-        `kitchen_inv_shift_${todayKey}_CLOSING`,
+        `kitchen_inv_shift_${buildShiftId(todayKey, 'CLOSING')}`,
         null
       ),
     ]);
 
-    // Map menu item category lookup
     const categoryByMenuId = new Map<number, string>();
     const categoryByMenuName = new Map<string, string>();
     for (const m of menuRes.data || []) {
@@ -147,7 +176,6 @@ export async function GET(request: NextRequest) {
         activeKdsCount++;
       }
 
-      // Time bucket
       const istDate = new Date(o.timestamp + IST_OFFSET_MS);
       if (singleDay) {
         const h = String(istDate.getUTCHours()).padStart(2, '0');
@@ -188,6 +216,19 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    const prevGrossRevenue = prevOrders.reduce(
+      (s, o) => s + (o.order.total_amount || 0),
+      0
+    );
+    const revenueDeltaPct =
+      prevGrossRevenue > 0
+        ? Math.round(((grossRevenue - prevGrossRevenue) / prevGrossRevenue) * 1000) / 10
+        : null;
+    const ordersDeltaPct =
+      prevOrders.length > 0
+        ? Math.round(((orders.length - prevOrders.length) / prevOrders.length) * 1000) / 10
+        : null;
+
     const totalOrders = orders.length;
     const unpaidRevenue = Math.max(0, grossRevenue - paidRevenue);
     const avgOrderValue = totalOrders > 0 ? grossRevenue / totalOrders : 0;
@@ -201,8 +242,10 @@ export async function GET(request: NextRequest) {
       .map(([category, st]) => ({ category, ...st }))
       .sort((a, b) => b.revenue - a.revenue);
 
-    // Inventory alerts summary
+    // v2.5.4 Purchase Tracking Matrix + Exact Ingredient Usage + P&L Snapshot
     const invItems = (invItemsRes.data || []) as InventoryItem[];
+    const invById = new Map(invItems.map((i) => [i.id, i]));
+    const invUsage = (invUsageRes.data || []) as InventoryUsage[];
     const invOrders: InventoryOrderWithItems[] = (invOrdersRes.data || []).map(
       (row: Record<string, unknown>) => ({
         order: {
@@ -218,26 +261,61 @@ export async function GET(request: NextRequest) {
           : [],
       })
     );
-    const invUsage = (invUsageRes.data || []) as InventoryUsage[];
-    const thresholdPct = Number(thresholdRaw || 5) || 5;
-    const alertRows = evaluateInventoryAlerts(
-      invItems,
-      invOrders,
-      invUsage,
-      thresholdPct
-    );
 
-    const outOfStockCount = alertRows.filter(
-      (r) => r.stockAlertLevel === 'OUT_OF_STOCK'
-    ).length;
-    const lowStockCount = alertRows.filter(
-      (r) =>
-        r.stockAlertLevel === 'CRITICAL_REORDER' ||
-        r.stockAlertLevel === 'LOW_STOCK'
-    ).length;
-    const priceHikeCount = alertRows.filter(
-      (r) => r.priceAlertLevel === 'HIGH_HIKE'
-    ).length;
+    const skuMatrix = buildSkuPriceHistoryMatrix(invItems, invOrders);
+    const topPriceHikes = skuMatrix.rows
+      .filter((r) => r.isPriceHike || r.hasUnitAnomaly)
+      .slice(0, 8)
+      .map((r) => ({
+        skuName: r.skuName,
+        unitWeightLabel: r.unitWeightLabel,
+        latestPrice: r.latestPrice,
+        firstPrice: r.firstPrice,
+        priceChangeVsFirstPct: r.priceChangeVsFirstPct,
+        isPriceHike: r.isPriceHike,
+        hasUnitAnomaly: r.hasUnitAnomaly,
+        billsCount: r.bills.length,
+      }));
+
+    const usageReport = computeIngredientUsage(orders, invItems, invUsage);
+    const topUsage = usageReport.items.slice(0, 8).map((u) => {
+      const master = invById.get(u.inventoryItemId);
+      const estimatedCost = master
+        ? Math.round(calculatePacksAndCost(u.totalQuantity, u.unit, master).cost * 100) / 100
+        : 0;
+      return {
+        ...u,
+        category: master?.category || 'General',
+        estimatedCost,
+      };
+    });
+
+    const pnlReport = computePnlReport({
+      range,
+      monthKey,
+      startDate,
+      endDate,
+      orders,
+      inventoryItems: invItems,
+      usages: invUsage,
+      fixedCostsMap,
+    });
+
+    // Kitchen Shift & Reorder Pulse
+    const kitchenCatalog =
+      Array.isArray(kitchenCatalogCloud) && kitchenCatalogCloud.length > 0
+        ? kitchenCatalogCloud
+        : KITCHEN_SEED_CATALOG;
+    const latestByItem = new Map<string, KitchenInventoryEntry>();
+    for (const e of openingShift?.entries || []) latestByItem.set(e.itemId, e);
+    for (const e of closingShift?.entries || []) latestByItem.set(e.itemId, e);
+    const kitchenReorders = kitchenCatalog
+      .filter((i) => i.isActive)
+      .map((item) => {
+        const entry = latestByItem.get(item.id);
+        return entry ? computeReorderRecommendation(item, entry.totalUsableQty) : null;
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
 
     // Staff attendance summary for today
     const activeRoster = roster.filter((r) => r.isActive);
@@ -264,22 +342,31 @@ export async function GET(request: NextRequest) {
         unpaidCount,
         avgOrderValue,
         activeKdsCount,
+        revenueDeltaPct,
+        ordersDeltaPct,
       },
+      pnlSnapshot: {
+        netSales: pnlReport.netSales,
+        recipeCogs: pnlReport.recipeCogs,
+        grossProfit: pnlReport.grossProfit,
+        grossMarginPct: pnlReport.grossMarginPct,
+        proratedOverhead: pnlReport.proratedOverhead.total,
+        netOperatingProfit: pnlReport.netOperatingProfit,
+        netMarginPct: pnlReport.netMarginPct,
+        breakEvenDailySales: pnlReport.breakEvenDailySales,
+        currentDailySalesRunRate: pnlReport.currentDailySalesRunRate,
+      },
+      purchasePulse: {
+        trackedSkus: skuMatrix.rows.length,
+        priceHikeCount: skuMatrix.rows.filter((r) => r.isPriceHike).length,
+        unitAnomalyCount: skuMatrix.rows.filter((r) => r.hasUnitAnomaly).length,
+        pendingWhatsappCount: waPendingRes.count || 0,
+        topPriceHikes,
+      },
+      topUsage,
       revenueSeries: Array.from(bucketRevenue.values()),
       topItems,
       categories,
-      alerts: {
-        outOfStockCount,
-        lowStockCount,
-        priceHikeCount,
-        topAlerts: alertRows
-          .filter(
-            (r) =>
-              r.stockAlertLevel !== 'HEALTHY' ||
-              r.priceAlertLevel === 'HIGH_HIKE'
-          )
-          .slice(0, 6),
-      },
       team: {
         activeRosterCount: activeRoster.length,
         onDutyCount: onDutyStaff.length,
@@ -291,8 +378,10 @@ export async function GET(request: NextRequest) {
         openingBy: openingShift?.staffName || '',
         closingStatus: closingShift?.status || 'NOT_STARTED',
         closingBy: closingShift?.staffName || '',
+        reorderCount: kitchenReorders.length,
+        topReorders: kitchenReorders.slice(0, 5),
       },
-      recentOrders: orders.slice(0, 12),
+      recentOrders: orders.slice(0, 15),
     });
   } catch (err) {
     return NextResponse.json(

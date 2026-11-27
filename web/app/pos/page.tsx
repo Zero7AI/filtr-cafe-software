@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { MenuItem, OrderWithItems } from '@/lib/types';
@@ -198,7 +198,7 @@ export default function Home() {
 
   return (
     <div
-      className={`min-h-screen flex flex-col transition-colors duration-150 ${
+      className={`min-h-screen flex flex-col select-none transition-colors duration-150 ${
         isDark
           ? 'bg-zinc-950 text-white selection:bg-amber-500 selection:text-zinc-950'
           : 'bg-[#FAFAFA] text-[#09090B] selection:bg-amber-500 selection:text-white'
@@ -249,3 +249,4 @@ export default function Home() {
     </div>
   );
 }
+

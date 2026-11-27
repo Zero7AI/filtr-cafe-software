@@ -3,122 +3,31 @@ import { requireAdmin } from '@/lib/admin-auth';
 import {
   buildBillLedger,
   buildSkuPriceHistoryMatrix,
-  formatBillCell,
   matchCatalogItem,
   resolvePackUnitPrice,
 } from '@/lib/domain/inventory';
 import { getIstCompactDate } from '@/lib/domain/ist';
 import {
   InventoryItem,
-  InventoryOrder,
   InventoryOrderItem,
-  InventoryOrderWithItems,
 } from '@/lib/domain/types';
 import {
+  fetchAllInventoryStateServer,
+  parseUploadedReceiptAndSave,
+  pushSkuPriceHistoryToWebhook,
+  reprocessPendingWhatsappMessages,
+} from '@/lib/domain/whatsapp-ai';
+import {
   getSupabaseAdmin,
-  getSupabaseServerUrl,
   getSyncMetadata,
 } from '@/lib/supabase-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 const DEFAULT_SHEET_URL =
   'https://docs.google.com/spreadsheets/d/1UsUM0SLdDf4uHXhJuao96Twkd-Eq5Yxl4_VHM_sFw90/edit?gid=0#gid=0';
-
-async function fetchAllInventoryState() {
-  const supabase = getSupabaseAdmin();
-  const [itemsRes, ordersRes] = await Promise.all([
-    supabase.from('inventory_items').select('*').order('name'),
-    supabase
-      .from('inventory_orders')
-      .select('*, inventory_order_items(*)')
-      .order('timestamp', { ascending: true })
-      .limit(1000),
-  ]);
-
-  const items = (itemsRes.data || []) as InventoryItem[];
-  const orders: InventoryOrderWithItems[] = (ordersRes.data || []).map(
-    (row: Record<string, unknown>) => ({
-      order: {
-        order_id: String(row.order_id || ''),
-        timestamp: Number(row.timestamp || 0),
-        supplier_name: String(row.supplier_name || ''),
-        total_amount: Number(row.total_amount || 0),
-        notes: String(row.notes || ''),
-        sync_status: String(row.sync_status || 'SYNCED'),
-      } as InventoryOrder,
-      items: Array.isArray(row.inventory_order_items)
-        ? (row.inventory_order_items as InventoryOrderItem[])
-        : [],
-    })
-  );
-
-  return { items, orders };
-}
-
-async function pushSkuPriceHistoryToWebhook(includeDateInCells: boolean = true) {
-  const webhookUrl = ((await getSyncMetadata('google_sheets_webhook_url')) || '').trim();
-  if (!webhookUrl) {
-    return { synced: false, reason: 'Google Sheets webhook URL is not configured yet.' };
-  }
-
-  const { items, orders } = await fetchAllInventoryState();
-  const matrix = buildSkuPriceHistoryMatrix(items, orders);
-  const ledger = buildBillLedger(items, orders);
-
-  const payload = {
-    action: 'syncSkuPriceHistory',
-    includeDateInCells,
-    maxBillColumns: matrix.maxBillColumns,
-    rows: matrix.rows.map((r) => ({
-      skuName: r.skuName,
-      unitWeightLabel: r.unitWeightLabel,
-      latestPrice: r.latestPrice,
-      priceChangeVsFirstPct: r.priceChangeVsFirstPct ?? 0,
-      hasChangePct: r.priceChangeVsFirstPct !== null,
-      isPriceHike: r.isPriceHike,
-      hasUnitAnomaly: r.hasUnitAnomaly,
-      bills: r.bills.map((b) => ({
-        billIndex: b.billIndex,
-        price: b.price,
-        dateLabel: b.dateLabel,
-        cellText: formatBillCell(b, includeDateInCells),
-        isUnitAnomaly: b.isUnitAnomaly,
-        orderId: b.orderId,
-        supplierName: b.supplierName,
-      })),
-    })),
-    ledger: ledger.map((l) => ({
-      orderId: l.orderId,
-      dateFormatted: l.dateFormatted,
-      supplierName: l.supplierName,
-      rawItemName: l.rawItemName,
-      matchedSkuName: l.matchedSkuName,
-      quantity: l.quantity,
-      unit: l.unit,
-      unitPrice: l.unitPrice,
-      subtotal: l.subtotal,
-      normalizedPrice: l.normalizedPrice,
-      statusLabel: l.statusLabel,
-      notes: l.notes,
-    })),
-  };
-
-  const sep = webhookUrl.includes('?') ? '&' : '?';
-  const res = await fetch(`${webhookUrl}${sep}action=syncSkuPriceHistory`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    redirect: 'follow',
-  });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    return { synced: false, reason: `HTTP ${res.status}: ${errText.slice(0, 120)}` };
-  }
-  return { synced: true, count: matrix.rows.length };
-}
 
 export async function GET() {
   const auth = await requireAdmin();
@@ -127,12 +36,12 @@ export async function GET() {
   try {
     const supabase = getSupabaseAdmin();
     const [{ items, orders }, waRes, sheetUrlRaw, webhookUrlRaw] = await Promise.all([
-      fetchAllInventoryState(),
+      fetchAllInventoryStateServer(),
       supabase
         .from('whatsapp_messages')
         .select('*')
         .order('created_at', { ascending: false })
-        .limit(60),
+        .limit(80),
       getSyncMetadata('google_sheets_url'),
       getSyncMetadata('google_sheets_webhook_url'),
     ]);
@@ -144,10 +53,20 @@ export async function GET() {
       (m: { status?: string }) => m.status === 'retry_pending' || m.status === 'config_error'
     ).length;
 
+    const totalBillSpend = Math.round(
+      orders.reduce((s, o) => s + Number(o.order.total_amount || 0), 0) * 100
+    ) / 100;
+    const uniqueSuppliersCount = new Set(
+      orders.map((o) => (o.order.supplier_name || '').trim().toLowerCase()).filter(Boolean)
+    ).size;
+
     return NextResponse.json({
       items,
       skuMatrix,
       billLedger,
+      totalBillSpend,
+      billsCount: orders.length,
+      uniqueSuppliersCount,
       googleSheetsUrl: (sheetUrlRaw || '').trim() || DEFAULT_SHEET_URL,
       googleSheetsWebhookConfigured: Boolean((webhookUrlRaw || '').trim()),
       whatsappMessages,
@@ -180,18 +99,19 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'retryWhatsappPending') {
-      const supaUrl = getSupabaseServerUrl();
-      const resp = await fetch(`${supaUrl}/functions/v1/whatsapp-webhook?action=retry_pending`, {
-        method: 'GET',
-      });
-      const json = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        return NextResponse.json(
-          { error: json?.error || `Webhook returned HTTP ${resp.status}` },
-          { status: 502 }
-        );
+      const result = await reprocessPendingWhatsappMessages();
+      return NextResponse.json({ success: true, ...result });
+    }
+
+    if (action === 'scanUploadReceipt') {
+      const base64 = String(body?.base64 || '').trim();
+      const mimeType = String(body?.mimeType || 'image/jpeg').trim();
+      const filename = String(body?.filename || 'receipt').trim();
+      if (!base64) {
+        return NextResponse.json({ error: 'Uploaded file content is empty' }, { status: 400 });
       }
-      return NextResponse.json({ success: true, result: json });
+      const result = await parseUploadedReceiptAndSave({ base64, mimeType, filename });
+      return NextResponse.json({ success: true, ...result });
     }
 
     if (action === 'createPurchaseBill') {
@@ -280,6 +200,62 @@ export async function POST(request: NextRequest) {
       if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
       pushSkuPriceHistoryToWebhook(true).catch(() => {});
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === 'upsertInventoryItem') {
+      const id = Number(body?.id || 0);
+      const name = String(body?.name || '').trim();
+      const category = String(body?.category || 'General').trim() || 'General';
+      const unit = String(body?.unit || 'kg').trim() || 'kg';
+      const standardQuantity = Math.max(0.01, Number(body?.standard_quantity || 1));
+      const defaultPrice = Math.max(0, Number(body?.default_price || 0));
+      const currentStock = Math.max(0, Number(body?.current_stock || 0));
+      const isActive = body?.is_active !== false;
+
+      if (!name) {
+        return NextResponse.json({ error: 'Ingredient name is required' }, { status: 400 });
+      }
+
+      const payload = {
+        name,
+        category,
+        unit,
+        standard_quantity: standardQuantity,
+        default_price: defaultPrice,
+        current_stock: currentStock,
+        is_active: isActive,
+      };
+
+      if (id > 0) {
+        const { data, error } = await supabase
+          .from('inventory_items')
+          .update(payload)
+          .eq('id', id)
+          .select('*')
+          .single();
+        if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+        return NextResponse.json({ success: true, item: data });
+      } else {
+        const { data, error } = await supabase
+          .from('inventory_items')
+          .insert(payload)
+          .select('*')
+          .single();
+        if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+        return NextResponse.json({ success: true, item: data });
+      }
+    }
+
+    if (action === 'toggleInventoryItem') {
+      const id = Number(body?.id || 0);
+      const isActive = Boolean(body?.is_active);
+      if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
+      const { error } = await supabase
+        .from('inventory_items')
+        .update({ is_active: isActive })
+        .eq('id', id);
+      if (error) return NextResponse.json({ error: error.message }, { status: 500 });
       return NextResponse.json({ success: true });
     }
 

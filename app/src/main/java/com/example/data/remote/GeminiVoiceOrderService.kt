@@ -53,12 +53,12 @@ class GeminiVoiceOrderService {
         private const val GEMINI_BASE_URL =
             "https://generativelanguage.googleapis.com/v1beta/models"
         private const val GEMINI_GENERATE_URL =
-            "$GEMINI_BASE_URL/gemini-2.5-flash:generateContent"
+            "$GEMINI_BASE_URL/gemini-flash-lite-latest:generateContent"
         private val FALLBACK_MODELS = listOf(
-            "gemini-2.5-flash",
+            "gemini-flash-lite-latest",
+            "gemini-3-flash-preview",
             "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite"
+            "gemini-3.1-flash-lite-preview"
         )
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 

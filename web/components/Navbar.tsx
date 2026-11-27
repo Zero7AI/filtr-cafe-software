@@ -219,8 +219,8 @@ export default function Navbar({
 
         {/* Admin Portal Link */}
         <Link
-          href="/admin"
-          title="Open FILTR Admin Command Center"
+          href="/"
+          title="Open FILTR Admin Analytics Dashboard"
           className={`flex items-center gap-1.5 rounded-xl border px-2.5 sm:px-3 py-2 text-xs font-bold transition ${
             isDark
               ? 'border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'

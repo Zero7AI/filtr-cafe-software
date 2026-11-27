@@ -13,8 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "FILTR Coffee — Admin & POS",
-  description: "FILTR Coffee Admin Command Center, Live KDS, P&L, Inventory, Team & Tablet POS",
+  title: "FILTR Coffee — Admin Analytics",
+  description:
+    "FILTR Coffee Admin Command Center: Sales Analytics, P&L, SKU Price History, Exact Ingredient Usage, Live KDS, Kitchen Stock, Attendance & Devices",
   manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
@@ -42,9 +43,11 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
+      data-theme="dark"
+      suppressHydrationWarning
     >
-      <body className="min-h-full flex flex-col font-sans transition-colors duration-150">
+      <body className="min-h-full flex flex-col bg-background text-foreground font-sans antialiased">
         {children}
       </body>
     </html>

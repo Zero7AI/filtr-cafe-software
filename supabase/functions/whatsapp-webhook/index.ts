@@ -19,12 +19,13 @@ const SUPABASE_SERVICE_ROLE_KEY =
 const GRAPH_API_VERSION = "v21.0";
 
 // Verified active Gemini models for Google AI Studio API
-const PRIMARY_GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-2.5-flash";
+const PRIMARY_GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-flash-lite-latest";
 const FALLBACK_GEMINI_MODELS = [
-  "gemini-2.5-flash",
+  "gemini-flash-lite-latest",
+  "gemini-3-flash-preview",
   "gemini-2.5-flash-lite",
-  "gemini-2.0-flash",
-  "gemini-2.0-flash-lite",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-flash-latest",
 ];
 
 async function resolveGeminiKeys(supabase: any): Promise<string[]> {
@@ -697,6 +698,8 @@ For items in "inventory":
 - Quantities must be positive numbers
 - Prices should be in Indian Rupees (₹)
 - Round subtotals and totals to 2 decimal places
+- Indian Shorthand Text Bills ("<AMOUNT> - <items>"): When a text bill starts with a number followed by "-" (e.g., "1520 - condense milk", "1041 - 9 peach iced, 1 lemon iced"), the leading number is ALWAYS total_amount in INR — NEVER treat it as a quantity or invoice number; split item subtotals so they sum to that exact total.
+- Container Count Units: When an invoice bills a multi-kg/multi-L gallon, tub, carton, or box by count (e.g., "6 Nos" of "GALLON VANILLA 5LT @ 405"), output unit: "pack" (NOT "kg" or "L").
 
 ## OUTPUT FORMAT (STRICT JSON ONLY):
 {
