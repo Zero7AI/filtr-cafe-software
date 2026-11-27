@@ -175,7 +175,7 @@ export default function PosOrderView({
       setTimeout(() => {
         setLastPlacedOrder(null);
       }, 4000);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Order creation error:', err);
       alert('Error creating order. Please check connection.');
     } finally {

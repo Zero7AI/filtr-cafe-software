@@ -109,13 +109,94 @@ data class IngredientPriceSummary(
     }
 }
 
+/**
+ * Single chronological bill cell for the horizontal SKU Price History matrix.
+ */
+data class SkuBillPoint(
+    val billIndex: Int, // 1-based: Bill 1, Bill 2, ...
+    val price: Double,
+    val timestamp: Long,
+    val dateLabel: String, // e.g. "28 Oct"
+    val orderId: String,
+    val supplierName: String,
+    val isUnitAnomaly: Boolean = false,
+    val anomalyReason: String = ""
+) {
+    fun formatCell(includeDateInCells: Boolean): String {
+        val compact = formatCompactNumber(price)
+        return if (isUnitAnomaly) {
+            if (includeDateInCells) "CHECK UNIT ($compact, $dateLabel)" else "CHECK UNIT"
+        } else {
+            if (includeDateInCells) "$compact ($dateLabel)" else compact
+        }
+    }
+}
+
+/**
+ * One row in the horizontal SKU Price History sheet.
+ * Columns: SKU Name | Unit / Weight | Latest Price (INR) | Price Change vs First (%) | Bill 1 .. Bill N
+ */
+data class SkuPriceHistoryRow(
+    val skuName: String,
+    val unitWeightLabel: String,
+    val latestPrice: Double,
+    val firstPrice: Double,
+    val priceChangeVsFirstPct: Double?, // null when < 2 valid bills
+    val isPriceHike: Boolean,
+    val hasUnitAnomaly: Boolean,
+    val bills: List<SkuBillPoint>
+)
+
+data class SkuPriceHistoryMatrix(
+    val maxBillColumns: Int,
+    val rows: List<SkuPriceHistoryRow>
+)
+
+data class BillLedgerRow(
+    val orderId: String,
+    val timestamp: Long,
+    val dateFormatted: String,
+    val supplierName: String,
+    val rawItemName: String,
+    val matchedSkuName: String,
+    val quantity: Double,
+    val unit: String,
+    val unitPrice: Double,
+    val subtotal: Double,
+    val normalizedPrice: Double,
+    val statusLabel: String,
+    val notes: String
+)
+
+private fun formatCompactNumber(v: Double): String {
+    val rounded = kotlin.math.round(v * 100.0) / 100.0
+    return if (abs(rounded - rounded.roundToLong()) < 0.005) {
+        rounded.roundToLong().toString()
+    } else {
+        String.format(Locale.US, "%.2f", rounded)
+    }
+}
+
 object RawMaterialPriceTracker {
+
+    private val WEIGHT_G = setOf("g", "gm", "gms", "gram", "grams")
+    private val WEIGHT_KG = setOf("kg", "kgs", "kilo", "kilos", "kilogram", "kilograms")
+    private val VOL_ML = setOf("ml", "mls", "milliliter", "milliliters", "millilitre", "millilitres")
+    private val VOL_L = setOf("l", "lt", "ltr", "ltrs", "liter", "liters", "litre", "litres")
+    private val COUNT_CONTAINER = setOf(
+        "pcs", "pc", "piece", "pieces", "nos", "no", "unit", "units",
+        "pack", "packs", "pkt", "pkts", "packet", "packets",
+        "box", "boxes", "btl", "btls", "bottle", "bottles",
+        "jar", "jars", "tin", "tins", "can", "cans",
+        "case", "cases", "bag", "bags", "pouch", "pouches", "carton", "cartons", "bill"
+    )
 
     private fun round2(v: Double): Double = kotlin.math.round(v * 100.0) / 100.0
 
     /**
-     * Normalizes an ordered line item's cost to the InventoryItemEntity pack rate so
-     * unit conversions (e.g. 500 g ordered for a 1 kg pack item) always preserve accurate per-pack pricing.
+     * Normalizes an ordered line item's cost to a consistent per-SKU pack/unit rate.
+     * Prevents false multiplication spikes when bills use container/count units (e.g. "1 pcs" of a 250g pack
+     * or "1 pcs" of a 24-pack Water Bottle case).
      */
     fun resolvePackUnitPrice(
         orderItem: InventoryOrderItemEntity,
@@ -127,13 +208,310 @@ object RawMaterialPriceTracker {
         } else {
             orderItem.quantity * orderItem.unitPrice
         }
-        if (masterItem != null) {
-            val (packs, _) = calculatePacksAndCost(orderItem.quantity, orderItem.unit, masterItem)
-            if (packs > 0.0) {
-                return round2(effectiveTotal / packs)
+        if (effectiveTotal <= 0.0) return 0.0
+        val rawPerBilledUnit = effectiveTotal / orderItem.quantity
+        if (masterItem == null) return round2(rawPerBilledUnit)
+
+        val bUnit = orderItem.unit.trim().lowercase(Locale.US)
+        val mUnit = masterItem.unit.trim().lowercase(Locale.US)
+        val packSize = if (masterItem.standardQuantity > 0.0) masterItem.standardQuantity else 1.0
+
+        val bIsWeight = bUnit in WEIGHT_G || bUnit in WEIGHT_KG
+        val mIsWeight = mUnit in WEIGHT_G || mUnit in WEIGHT_KG
+        val bIsVol = bUnit in VOL_ML || bUnit in VOL_L
+        val mIsVol = mUnit in VOL_ML || mUnit in VOL_L
+        val bIsCount = bUnit.isEmpty() || bUnit in COUNT_CONTAINER
+        val mIsPcs = mUnit in setOf("pcs", "pc", "piece", "pieces")
+
+        // Case A: Both Weight (g <-> kg)
+        if (bIsWeight && mIsWeight) {
+            val convertedQty = when {
+                bUnit in WEIGHT_G && mUnit in WEIGHT_KG -> orderItem.quantity / 1000.0
+                bUnit in WEIGHT_KG && mUnit in WEIGHT_G -> orderItem.quantity * 1000.0
+                else -> orderItem.quantity
+            }
+            val packs = convertedQty / packSize
+            return if (packs > 0.0) round2(effectiveTotal / packs) else round2(rawPerBilledUnit)
+        }
+
+        // Case B: Both Volume (ml <-> L)
+        if (bIsVol && mIsVol) {
+            val convertedQty = when {
+                bUnit in VOL_ML && mUnit in VOL_L -> orderItem.quantity / 1000.0
+                bUnit in VOL_L && mUnit in VOL_ML -> orderItem.quantity * 1000.0
+                else -> orderItem.quantity
+            }
+            val packs = convertedQty / packSize
+            return if (packs > 0.0) round2(effectiveTotal / packs) else round2(rawPerBilledUnit)
+        }
+
+        // Case C: Billed in Count/Container ("1 pcs", "2 pkt", "1 btl") for a Weight/Volume pack item
+        // e.g. Peri Peri: "1 pcs @ ₹140" mapped to "Peri Peri Seasoning (250 g pack)" -> ₹140 (NOT 140 * 250 = ₹35,000!)
+        if (bIsCount && (mIsWeight || mIsVol)) {
+            return round2(rawPerBilledUnit)
+        }
+
+        // Case D: Billed in Count/Container ("1 pcs" or "12 pcs") mapped to multi-piece pack (e.g. 24-pack Water)
+        if (bIsCount && mIsPcs && packSize > 1.0) {
+            val defaultPackRate = masterItem.defaultPrice
+            // Only scale up by packSize if clearly billed per single bottle/piece (< 40% of standard pack price)
+            if (defaultPackRate > 0.0 && rawPerBilledUnit < defaultPackRate * 0.4 &&
+                bUnit !in setOf("pack", "packs", "pkt", "pkts", "box", "boxes", "case", "cases", "carton", "cartons")
+            ) {
+                val packs = orderItem.quantity / packSize
+                if (packs > 0.0) return round2(effectiveTotal / packs)
+            }
+            return round2(rawPerBilledUnit)
+        }
+
+        // Case E: Fallback — treat billed unit directly without hazardous division
+        return round2(rawPerBilledUnit)
+    }
+
+    fun formatUnitWeightLabel(masterItem: InventoryItemEntity?, fallbackUnit: String): String {
+        if (masterItem == null) {
+            val u = RawMaterialReceiptParser.normalizeUnit(fallbackUnit.ifBlank { "pcs" })
+            return "per $u"
+        }
+        val mUnit = masterItem.unit.trim().lowercase(Locale.US)
+        val qty = masterItem.standardQuantity.let { if (it > 0.0) it else 1.0 }
+        val qtyStr = formatCompactNumber(qty)
+        return when {
+            mUnit in WEIGHT_KG -> if (abs(qty - 1.0) < 0.01) "per kg" else "per ${qtyStr}kg pack"
+            mUnit in WEIGHT_G -> if (abs(qty - 1000.0) < 0.01) "per kg" else "per ${qtyStr}g pack"
+            mUnit in VOL_L -> if (abs(qty - 1.0) < 0.01) "per L" else "per ${qtyStr}L pack"
+            mUnit in VOL_ML -> if (abs(qty - 1000.0) < 0.01) "per L" else "per ${qtyStr}ml pack"
+            mUnit in setOf("pcs", "pc", "piece", "pieces") ->
+                if (abs(qty - 1.0) < 0.01) "per pcs" else "per $qtyStr-pack"
+            else -> if (abs(qty - 1.0) < 0.01) "per ${masterItem.unit}" else "per $qtyStr ${masterItem.unit}"
+        }
+    }
+
+    /**
+     * Builds the clean, compact horizontal SKU Price History matrix requested by the owner:
+     * - One row per billed SKU
+     * - Bill 1 (oldest) -> Bill N (latest), no empty date column gaps
+     * - Flags >3x or <0.3x sudden unit mismatches as CHECK UNIT without skewing % change or latest price
+     */
+    fun buildSkuPriceHistoryMatrix(
+        inventoryItems: List<InventoryItemEntity>,
+        inventoryOrders: List<InventoryOrderWithItems>
+    ): SkuPriceHistoryMatrix {
+        val sortedOrders = inventoryOrders.sortedBy { it.order.timestamp }
+        val dayDf = SimpleDateFormat("dd MMM", Locale.US)
+
+        data class RawEntry(
+            val rate: Double,
+            val timestamp: Long,
+            val dateLabel: String,
+            val orderId: String,
+            val supplier: String,
+            val master: InventoryItemEntity?,
+            val fallbackUnit: String,
+            val canonicalName: String
+        )
+
+        val entriesByKey = linkedMapOf<String, MutableList<RawEntry>>()
+
+        for (orderWithItems in sortedOrders) {
+            val order = orderWithItems.order
+            val ts = if (order.timestamp > 0L) order.timestamp else System.currentTimeMillis()
+            val dateLabel = dayDf.format(Date(ts))
+            for (line in orderWithItems.items) {
+                if (line.itemName.isBlank() || line.quantity <= 0.0) continue
+                if (RawMaterialReceiptParser.isLikelyNonIngredientHardware(line.itemName)) continue
+                val matchedMaster = RawMaterialReceiptParser.matchCatalogItem(line.itemName, inventoryItems)
+                val canonicalName = matchedMaster?.name ?: RawMaterialReceiptParser.normalizeSkuMatchText(line.itemName)
+                    .split(" ")
+                    .joinToString(" ") { w -> w.replaceFirstChar { c -> if (c.isLowerCase()) c.titlecase(Locale.US) else c.toString() } }
+                    .ifBlank { line.itemName.trim() }
+                val key = canonicalName.trim().lowercase(Locale.US)
+                val rate = resolvePackUnitPrice(line, matchedMaster)
+                if (rate <= 0.0) continue
+
+                entriesByKey.getOrPut(key) { mutableListOf() }.add(
+                    RawEntry(
+                        rate = rate,
+                        timestamp = ts,
+                        dateLabel = dateLabel,
+                        orderId = order.orderId,
+                        supplier = order.supplierName.ifBlank { "Supplier" },
+                        master = matchedMaster,
+                        fallbackUnit = line.unit,
+                        canonicalName = canonicalName
+                    )
+                )
             }
         }
-        return round2(effectiveTotal / orderItem.quantity)
+
+        val rows = mutableListOf<SkuPriceHistoryRow>()
+        var maxBills = 0
+
+        for ((_, rawList) in entriesByKey) {
+            if (rawList.isEmpty()) continue
+            val sample = rawList.first()
+            val displaySku = sample.canonicalName
+            val unitWeight = formatUnitWeightLabel(sample.master, sample.fallbackUnit)
+
+            val billPoints = mutableListOf<SkuBillPoint>()
+            var lastValidPrice: Double? = null
+            var hasAnomaly = false
+
+            rawList.forEachIndexed { idx, entry ->
+                val isAnomaly = lastValidPrice != null &&
+                    (entry.rate > lastValidPrice!! * 3.0 || entry.rate < lastValidPrice!! * 0.3)
+                if (isAnomaly) {
+                    hasAnomaly = true
+                } else {
+                    lastValidPrice = entry.rate
+                }
+                billPoints.add(
+                    SkuBillPoint(
+                        billIndex = idx + 1,
+                        price = entry.rate,
+                        timestamp = entry.timestamp,
+                        dateLabel = entry.dateLabel,
+                        orderId = entry.orderId,
+                        supplierName = entry.supplier,
+                        isUnitAnomaly = isAnomaly,
+                        anomalyReason = if (isAnomaly) "CHECK UNIT" else ""
+                    )
+                )
+            }
+
+            if (billPoints.size > maxBills) {
+                maxBills = billPoints.size
+            }
+
+            val validBills = billPoints.filter { !it.isUnitAnomaly }
+            val firstValid = validBills.firstOrNull()?.price ?: billPoints.first().price
+            val latestValid = validBills.lastOrNull()?.price ?: billPoints.last().price
+            val pctChange = if (validBills.size >= 2 && firstValid > 0.0) {
+                round2(((latestValid - firstValid) / firstValid) * 100.0)
+            } else {
+                null
+            }
+            val isHike = (pctChange ?: 0.0) > 0.0
+
+            rows.add(
+                SkuPriceHistoryRow(
+                    skuName = displaySku,
+                    unitWeightLabel = unitWeight,
+                    latestPrice = round2(latestValid),
+                    firstPrice = round2(firstValid),
+                    priceChangeVsFirstPct = pctChange,
+                    isPriceHike = isHike,
+                    hasUnitAnomaly = hasAnomaly,
+                    bills = billPoints
+                )
+            )
+        }
+
+        // Put price hikes (> 0%) at the very top descending, then anomalies, then rest alphabetically
+        val sortedRows = rows.sortedWith(
+            compareBy<SkuPriceHistoryRow>(
+                { if (it.isPriceHike) 0 else if (it.hasUnitAnomaly) 1 else 2 },
+                { -(it.priceChangeVsFirstPct ?: 0.0) },
+                { it.skuName.lowercase(Locale.US) }
+            )
+        )
+
+        return SkuPriceHistoryMatrix(
+            maxBillColumns = maxBills,
+            rows = sortedRows
+        )
+    }
+
+    /**
+     * Chronological Bill Ledger (oldest -> newest) for the second Excel/Google Sheet tab.
+     */
+    fun buildBillLedger(
+        inventoryItems: List<InventoryItemEntity>,
+        inventoryOrders: List<InventoryOrderWithItems>
+    ): List<BillLedgerRow> {
+        val df = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.US)
+        val sortedOrders = inventoryOrders.sortedBy { it.order.timestamp }
+        val result = mutableListOf<BillLedgerRow>()
+
+        val lastValidByKey = mutableMapOf<String, Double>()
+
+        for (orderWithItems in sortedOrders) {
+            val order = orderWithItems.order
+            val dateStr = if (order.timestamp > 0L) df.format(Date(order.timestamp)) else ""
+            for (line in orderWithItems.items) {
+                if (line.itemName.isBlank() || line.quantity <= 0.0) continue
+                val isHardware = RawMaterialReceiptParser.isLikelyNonIngredientHardware(line.itemName)
+                val matched = if (isHardware) null else RawMaterialReceiptParser.matchCatalogItem(line.itemName, inventoryItems)
+                val matchedName = matched?.name ?: if (isHardware) "Non-Ingredient / Hardware" else line.itemName.trim()
+                val rate = resolvePackUnitPrice(line, matched)
+                val key = matchedName.lowercase(Locale.US)
+                val prev = lastValidByKey[key]
+                val isAnomaly = !isHardware && prev != null && rate > 0.0 && (rate > prev * 3.0 || rate < prev * 0.3)
+                if (!isAnomaly && !isHardware && rate > 0.0) {
+                    lastValidByKey[key] = rate
+                }
+                val status = when {
+                    isHardware -> "HARDWARE / EXCLUDED"
+                    isAnomaly -> "CHECK UNIT"
+                    else -> "OK"
+                }
+                result.add(
+                    BillLedgerRow(
+                        orderId = order.orderId,
+                        timestamp = order.timestamp,
+                        dateFormatted = dateStr,
+                        supplierName = order.supplierName.ifBlank { "Supplier" },
+                        rawItemName = line.itemName,
+                        matchedSkuName = matchedName,
+                        quantity = line.quantity,
+                        unit = line.unit,
+                        unitPrice = line.unitPrice,
+                        subtotal = line.subtotal,
+                        normalizedPrice = rate,
+                        statusLabel = status,
+                        notes = order.notes
+                    )
+                )
+            }
+        }
+        return result
+    }
+
+    fun buildSkuPriceHistoryCsv(
+        matrix: SkuPriceHistoryMatrix,
+        includeDateInCells: Boolean = true
+    ): String {
+        val sb = StringBuilder()
+        sb.append('\uFEFF')
+        val headerCols = mutableListOf(
+            "SKU Name",
+            "Unit / Weight",
+            "Latest Price (INR)",
+            "Price Change vs First (%)"
+        )
+        for (i in 1..matrix.maxBillColumns) {
+            headerCols.add("Bill $i")
+        }
+        sb.appendLine(headerCols.joinToString(",") { escapeCsv(it) })
+
+        for (row in matrix.rows) {
+            val pctStr = row.priceChangeVsFirstPct?.let {
+                val prefix = if (it > 0.0) "+" else ""
+                "$prefix${String.format(Locale.US, "%.1f", it)}%"
+            } ?: "0.0%"
+            val cols = mutableListOf(
+                escapeCsv(row.skuName),
+                escapeCsv(row.unitWeightLabel),
+                formatCompactNumber(row.latestPrice),
+                escapeCsv(pctStr)
+            )
+            for (i in 0 until matrix.maxBillColumns) {
+                val cell = row.bills.getOrNull(i)?.formatCell(includeDateInCells).orEmpty()
+                cols.add(escapeCsv(cell))
+            }
+            sb.appendLine(cols.joinToString(","))
+        }
+        return sb.toString()
     }
 
     fun buildIngredientPricingSummaries(
@@ -150,12 +528,13 @@ object RawMaterialPriceTracker {
         )
 
         val historyByKey = linkedMapOf<String, MutableList<PurchasePoint>>()
-        val uncatalogedSamples = linkedMapOf<String, Pair<String, String>>() // key -> (DisplayName, Unit)
+        val uncatalogedSamples = linkedMapOf<String, Pair<String, String>>()
 
         for (orderWithItems in sortedOrders) {
             val order = orderWithItems.order
             for (line in orderWithItems.items) {
                 if (line.itemName.isBlank() || line.quantity <= 0.0) continue
+                if (RawMaterialReceiptParser.isLikelyNonIngredientHardware(line.itemName)) continue
                 val matchedMaster = RawMaterialReceiptParser.matchCatalogItem(line.itemName, inventoryItems)
                 val canonicalName = matchedMaster?.name ?: line.itemName.trim()
                 val key = canonicalName.trim().lowercase(Locale.US)
@@ -177,7 +556,6 @@ object RawMaterialPriceTracker {
 
         val summaries = mutableListOf<IngredientPriceSummary>()
 
-        // 1. All cataloged master inventory items
         for (master in inventoryItems) {
             val key = master.name.trim().lowercase(Locale.US)
             val points = historyByKey[key].orEmpty()
@@ -195,7 +573,6 @@ object RawMaterialPriceTracker {
             )
         }
 
-        // 2. Any ingredients present only in purchase orders so nothing is missed in Excel
         for ((key, meta) in uncatalogedSamples) {
             if (key in masterByLower) continue
             val points = historyByKey[key].orEmpty()
@@ -213,7 +590,6 @@ object RawMaterialPriceTracker {
             )
         }
 
-        // Surface price increases first so owner spots hikes immediately on open
         return summaries.sortedWith(
             compareBy<IngredientPriceSummary> {
                 when (it.trend) {
@@ -237,15 +613,21 @@ object RawMaterialPriceTracker {
         fallbackRate: Double,
         points: List<Triple<Double, String, Long>>
     ): IngredientPriceSummary {
-        val latest = points.lastOrNull()
-        val latestRate = latest?.first ?: fallbackRate
-        // Find previous distinct-bill entry (last bill before the latest purchase)
-        val prevPoint = if (points.size >= 2) {
-            points[points.size - 2]
-        } else {
-            null
+        // Filter >3x/<0.3x anomalies out when determining previous/latest rate
+        val validPoints = mutableListOf<Triple<Double, String, Long>>()
+        var lastValid: Double? = null
+        for (p in points) {
+            val isAnomaly = lastValid != null && (p.first > lastValid!! * 3.0 || p.first < lastValid!! * 0.3)
+            if (!isAnomaly) {
+                validPoints.add(p)
+                lastValid = p.first
+            }
         }
-        val prevRate = prevPoint?.first ?: if (points.size == 1 && fallbackRate > 0.0 && abs(fallbackRate - latestRate) > 0.005) {
+        val effective = validPoints.ifEmpty { points }
+        val latest = effective.lastOrNull()
+        val latestRate = latest?.first ?: fallbackRate
+        val prevPoint = if (effective.size >= 2) effective[effective.size - 2] else null
+        val prevRate = prevPoint?.first ?: if (effective.size == 1 && fallbackRate > 0.0 && abs(fallbackRate - latestRate) > 0.005) {
             fallbackRate
         } else {
             null
@@ -279,7 +661,7 @@ object RawMaterialPriceTracker {
             trend = trend,
             lastSupplier = latest?.second.orEmpty(),
             lastPurchasedTimestamp = latest?.third ?: 0L,
-            totalPurchasesCount = points.size
+            totalPurchasesCount = effective.size
         )
     }
 
@@ -460,6 +842,7 @@ object RawMaterialPriceTracker {
             var orderHasValidLine = false
             for (line in orderWithItems.items) {
                 if (line.itemName.isBlank() || line.quantity <= 0.0) continue
+                if (RawMaterialReceiptParser.isLikelyNonIngredientHardware(line.itemName)) continue
                 val matchedMaster = RawMaterialReceiptParser.matchCatalogItem(line.itemName, inventoryItems)
                 val canonicalName = matchedMaster?.name ?: line.itemName.trim()
                 val key = canonicalName.trim().lowercase(Locale.US)
@@ -514,109 +897,24 @@ object RawMaterialPriceTracker {
         usages: List<InventoryUsageEntity> = emptyList(),
         priceAlertThresholdPct: Double = 5.0
     ): String {
-        val df = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
-        val sb = StringBuilder()
-        // UTF-8 BOM so Microsoft Excel opens ₹ and ↑/↓ cleanly
-        sb.append('\uFEFF')
-
-        val effectiveItems = inventoryItems.ifEmpty {
-            summaries.map {
-                InventoryItemEntity(
-                    id = it.itemId,
-                    name = it.itemName,
-                    category = it.category,
-                    unit = it.unit,
-                    standardQuantity = it.packSize,
-                    defaultPrice = it.latestRate,
-                    currentStock = it.currentStock,
-                    isActive = true
-                )
-            }
-        }
-        val matrix = buildIngredientPriceMatrix(
-            inventoryItems = effectiveItems,
-            inventoryOrders = inventoryOrders,
-            usages = usages,
-            priceAlertThresholdPct = priceAlertThresholdPct
+        val skuMatrix = buildSkuPriceHistoryMatrix(
+            inventoryItems = inventoryItems.ifEmpty {
+                summaries.map {
+                    InventoryItemEntity(
+                        id = it.itemId,
+                        name = it.itemName,
+                        category = it.category,
+                        unit = it.unit,
+                        standardQuantity = it.packSize,
+                        defaultPrice = it.latestRate,
+                        currentStock = it.currentStock,
+                        isActive = true
+                    )
+                }
+            },
+            inventoryOrders = inventoryOrders
         )
-
-        sb.appendLine("FILTR COFFEE — DATE-WISE PRICE HISTORY & REORDER MATRIX,${escapeCsv("Generated: ${df.format(Date(exportedAtMs))}")},Alert Threshold,${String.format(Locale.US, "%.1f%%", priceAlertThresholdPct)}")
-        val matrixHeader = listOf(
-            "Ingredient Name",
-            "Category",
-            "Unit",
-            "Present Stock",
-            "Stock Alert",
-            "Suggested Order",
-            "Latest Price (INR)",
-            "Price Alert"
-        ) + matrix.dates
-        sb.appendLine(matrixHeader.joinToString(",") { escapeCsv(it) })
-        for (row in matrix.rows) {
-            val baseCols = listOf(
-                escapeCsv(row.itemName),
-                escapeCsv(row.category),
-                escapeCsv(row.unit),
-                String.format(Locale.US, "%.2f", row.currentStock),
-                escapeCsv(row.stockAlertLabel),
-                escapeCsv(row.suggestedOrderLabel),
-                String.format(Locale.US, "%.2f", row.latestRate),
-                escapeCsv(row.priceAlertLabel)
-            )
-            val dateCols = matrix.dates.map { d ->
-                row.ratesByDate[d]?.let { String.format(Locale.US, "%.2f", it) } ?: ""
-            }
-            sb.appendLine((baseCols + dateCols).joinToString(","))
-        }
-
-        sb.appendLine()
-        sb.appendLine("FILTR COFFEE — INGREDIENT PRICING & PRICE HIKE SHEET,${escapeCsv("Generated: ${df.format(Date(exportedAtMs))}")}")
-        sb.appendLine("Ingredient Name,Category,Unit,Pack Size,Current Stock,Latest Price (INR),Previous Price (INR),Price Change (INR),Change (%),Price Alert,Last Supplier,Last Updated,Purchase Count")
-        for (s in summaries) {
-            val prevStr = s.previousRate?.let { String.format(Locale.US, "%.2f", it) } ?: ""
-            val dateStr = if (s.lastPurchasedTimestamp > 0L) df.format(Date(s.lastPurchasedTimestamp)) else ""
-            sb.appendLine(
-                listOf(
-                    escapeCsv(s.itemName),
-                    escapeCsv(s.category),
-                    escapeCsv(s.unit),
-                    String.format(Locale.US, "%.2f", s.packSize),
-                    String.format(Locale.US, "%.2f", s.currentStock),
-                    String.format(Locale.US, "%.2f", s.latestRate),
-                    prevStr,
-                    String.format(Locale.US, "%.2f", s.priceDelta),
-                    String.format(Locale.US, "%.1f%%", s.priceChangePercent),
-                    escapeCsv(s.alertLabel),
-                    escapeCsv(s.lastSupplier.ifBlank { "-" }),
-                    escapeCsv(dateStr),
-                    s.totalPurchasesCount.toString()
-                ).joinToString(",")
-            )
-        }
-
-        sb.appendLine()
-        sb.appendLine("PURCHASE BILL LEDGER (CHRONOLOGICAL)")
-        sb.appendLine("Bill ID,Date,Supplier,Ingredient Name,Quantity,Unit,Unit Price (INR),Subtotal (INR),Notes")
-        for (orderWithItems in inventoryOrders.sortedByDescending { it.order.timestamp }) {
-            val order = orderWithItems.order
-            val dateStr = df.format(Date(order.timestamp))
-            for (line in orderWithItems.items) {
-                sb.appendLine(
-                    listOf(
-                        escapeCsv(order.orderId),
-                        escapeCsv(dateStr),
-                        escapeCsv(order.supplierName.ifBlank { "Supplier" }),
-                        escapeCsv(line.itemName),
-                        String.format(Locale.US, "%.2f", line.quantity),
-                        escapeCsv(line.unit),
-                        String.format(Locale.US, "%.2f", line.unitPrice),
-                        String.format(Locale.US, "%.2f", line.subtotal),
-                        escapeCsv(order.notes)
-                    ).joinToString(",")
-                )
-            }
-        }
-        return sb.toString()
+        return buildSkuPriceHistoryCsv(skuMatrix, includeDateInCells = true)
     }
 
     private fun escapeCsv(raw: String): String {

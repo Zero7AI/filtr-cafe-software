@@ -76,25 +76,27 @@ export default function Home() {
 
   // Load saved theme, auto-print & auth state on initial mount
   useEffect(() => {
-    try {
-      const savedAuth = localStorage.getItem('filtr_tablet_auth');
-      setIsAuthenticated(savedAuth === 'true');
+    Promise.resolve().then(() => {
+      try {
+        const savedAuth = localStorage.getItem('filtr_tablet_auth');
+        setIsAuthenticated(savedAuth === 'true');
 
-      const savedTheme = localStorage.getItem('filtr_pos_theme') as 'dark' | 'light';
-      if (savedTheme === 'light' || savedTheme === 'dark') {
-        applyTheme(savedTheme);
-      } else {
+        const savedTheme = localStorage.getItem('filtr_pos_theme') as 'dark' | 'light';
+        if (savedTheme === 'light' || savedTheme === 'dark') {
+          applyTheme(savedTheme);
+        } else {
+          applyTheme('dark');
+        }
+
+        const savedAutoPrint = localStorage.getItem('filtr_auto_print');
+        if (savedAutoPrint !== null) {
+          setAutoPrint(savedAutoPrint === 'true');
+        }
+      } catch {
+        setIsAuthenticated(false);
         applyTheme('dark');
       }
-
-      const savedAutoPrint = localStorage.getItem('filtr_auto_print');
-      if (savedAutoPrint !== null) {
-        setAutoPrint(savedAutoPrint === 'true');
-      }
-    } catch (e) {
-      setIsAuthenticated(false);
-      applyTheme('dark');
-    }
+    });
   }, []);
 
   // Fetch initial data when authenticated

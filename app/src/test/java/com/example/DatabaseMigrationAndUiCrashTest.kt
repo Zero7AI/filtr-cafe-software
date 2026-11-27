@@ -581,7 +581,7 @@ class DatabaseMigrationAndUiCrashTest {
     }
 
     @Test
-    fun `inventory order screen renders excel price hike strip queued retry card and sync badge`() {
+    fun `purchase tracking screen renders live sheet link xlsx export sku price history and retry queue`() {
         val now = System.currentTimeMillis()
         val milk = InventoryItemEntity(id = 1, name = "Milk", category = "Dairy", unit = "L", standardQuantity = 1.0, defaultPrice = 72.0)
         val b1 = InventoryOrderWithItems(
@@ -592,8 +592,9 @@ class DatabaseMigrationAndUiCrashTest {
             order = InventoryOrderEntity("INV-2", now, "Blinkit", 720.0, "", "SYNCED"),
             items = listOf(InventoryOrderItemEntity(2, "INV-2", "Milk", 10.0, "L", 72.0, 720.0))
         )
-        val summaries = RawMaterialPriceTracker.buildIngredientPricingSummaries(listOf(milk), listOf(b1, b2))
+        val skuMatrix = RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(listOf(milk), listOf(b1, b2))
         var retriedId = ""
+        var openedSheetUrl = ""
 
         composeTestRule.setContent {
             FiltrTheme {
@@ -610,7 +611,9 @@ class DatabaseMigrationAndUiCrashTest {
                     ),
                     inventoryOrders = listOf(b1, b2),
                     inventoryItems = listOf(milk),
-                    pricingSummaries = summaries,
+                    skuPriceHistoryMatrix = skuMatrix,
+                    googleSheetsUrl = "https://docs.google.com/spreadsheets/d/test123/edit",
+                    onOpenGoogleSheet = { openedSheetUrl = it },
                     onOpenAddOrder = {},
                     onOpenInventoryMaster = {},
                     onDeleteOrder = {},
@@ -626,83 +629,49 @@ class DatabaseMigrationAndUiCrashTest {
                     onSearchQueryChanged = {},
                     onRetryQueuedReceipt = { retriedId = it },
                     onSyncPricingToSheets = {},
-                    onExportPricingCsv = {}
+                    onExportPricingXlsx = {}
                 )
             }
         }
 
-        composeTestRule.onNodeWithText("EXCEL PRICING & HIKE TRACKER").assertExists()
-        composeTestRule.onNodeWithText("Excel CSV").assertExists()
-        composeTestRule.onNodeWithText("Sync Sheet").assertExists()
+        composeTestRule.onNodeWithText("Purchase Tracking").assertExists()
+        composeTestRule.onNodeWithTag("open_live_pricing_sheet_button").performClick()
+        assertEquals("https://docs.google.com/spreadsheets/d/test123/edit", openedSheetUrl)
+        composeTestRule.onNodeWithText("Export .xlsx").assertExists()
         composeTestRule.onNodeWithTag("inventory_orders_list").performScrollToKey("pending_receipt_queue")
         composeTestRule.onNodeWithText("metro_bill.pdf").assertExists()
-        composeTestRule.onNodeWithText("Retry AI").performClick()
+        composeTestRule.onNodeWithText("Retry").performClick()
         assertEquals("q1", retriedId)
-        composeTestRule.onNodeWithTag("inventory_orders_list").performScrollToKey("INV-2")
-        composeTestRule.onAllNodesWithText("Synced ✓", substring = true).fetchSemanticsNodes().let {
-            assertTrue("Expected at least one Synced badge", it.isNotEmpty())
-        }
+        composeTestRule.onNodeWithTag("inventory_orders_list").performScrollToKey("sku_price_history_table")
+        composeTestRule.onNodeWithText("Milk").assertExists()
     }
 
     @Test
-    fun `inventories screen renders admin alert hub threshold chips and price hike badge`() {
+    fun `inventory usage screen renders crisp two column recipe consumption without alert clutter`() {
         val now = System.currentTimeMillis()
-        val milk = InventoryItemEntity(
-            id = 1,
-            name = "Full Cream Milk",
-            category = "Dairy",
-            unit = "L",
-            standardQuantity = 1.0,
-            defaultPrice = 75.0,
-            currentStock = 0.5
+        val milk = InventoryItemEntity(id = 1, name = "Full Cream Milk", category = "Dairy", unit = "L", standardQuantity = 1.0, defaultPrice = 68.0)
+        val usages = listOf(
+            com.example.data.entity.InventoryUsageEntity(id = 1, menuItemId = 10, menuItemName = "Iced Latte", inventoryItemId = 1, inventoryItemName = "Full Cream Milk", quantityUsed = 250.0, unit = "ml")
         )
-        val b1 = InventoryOrderWithItems(
-            order = InventoryOrderEntity("INV-10", now - 86_400_000L, "Metro", 650.0, "", "SYNCED"),
-            items = listOf(InventoryOrderItemEntity(1, "INV-10", "Full Cream Milk", 10.0, "L", 65.0, 650.0))
+        val order = OrderWithItems(
+            order = OrderEntity("FLT-10", "Walk-in", "", 200.0, now),
+            items = listOf(OrderItemEntity(1, "FLT-10", 10, "Iced Latte", 100.0, 2, 200.0))
         )
-        val b2 = InventoryOrderWithItems(
-            order = InventoryOrderEntity("INV-11", now, "Blinkit", 750.0, "", "SYNCED"),
-            items = listOf(InventoryOrderItemEntity(2, "INV-11", "Full Cream Milk", 10.0, "L", 75.0, 750.0))
-        )
-        val alerts = RawMaterialPriceTracker.evaluateInventoryAlerts(
-            inventoryItems = listOf(milk),
-            inventoryOrders = listOf(b1, b2),
-            usages = emptyList(),
-            priceAlertThresholdPct = 5.0
-        )
-        var thresholdUpdated = 0.0
 
         composeTestRule.setContent {
             FiltrTheme {
-                com.example.ui.screens.InventoriesScreen(
+                com.example.ui.screens.InventoryUsageScreen(
                     state = BillingUiState(),
                     inventoryItems = listOf(milk),
-                    usages = emptyList(),
-                    ordersList = emptyList(),
-                    inventoryOrders = listOf(b1, b2),
-                    inventoryAlerts = alerts,
-                    priceAlertThresholdPct = 5.0,
-                    onUpdatePriceAlertThreshold = { thresholdUpdated = it },
-                    onUpdateStock = { _, _ -> },
-                    onStartEditingStock = {},
-                    onCancelEditingStock = {},
-                    onOpenAddStockDialog = {},
-                    onDismissAddStockDialog = {},
-                    onAddStockPacks = { _, _ -> },
-                    onOpenInventoryMaster = {},
-                    onSaveInventoryItem = { _, _, _, _, _ -> },
-                    onEditInventoryItem = {},
-                    onDeleteInventoryItem = {},
-                    onDismissInventoryMaster = {},
-                    onDismissAddInventoryItem = {},
-                    onSearchQueryChanged = {}
+                    usages = usages,
+                    ordersList = listOf(order)
                 )
             }
         }
 
-        composeTestRule.onNodeWithText("ADMIN INVENTORY ALERTS").assertExists()
+        composeTestRule.onNodeWithText("Inventory Usage").assertExists()
+        composeTestRule.onNodeWithText("1 Orders").assertExists()
         composeTestRule.onNodeWithText("Full Cream Milk").assertExists()
-        composeTestRule.onNodeWithText("±10%").performClick()
-        assertEquals(10.0, thresholdUpdated, 0.01)
+        composeTestRule.onNodeWithText("500 ml").assertExists()
     }
 }

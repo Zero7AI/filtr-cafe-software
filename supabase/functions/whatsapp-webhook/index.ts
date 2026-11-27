@@ -19,14 +19,39 @@ const SUPABASE_SERVICE_ROLE_KEY =
 const GRAPH_API_VERSION = "v21.0";
 
 // Verified active Gemini models for Google AI Studio API
-const PRIMARY_GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-3.1-flash-lite";
+const PRIMARY_GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-2.5-flash";
 const FALLBACK_GEMINI_MODELS = [
-  "gemini-3.1-flash-lite",
-  "gemini-3.5-flash-lite",
-  "gemini-3.6-flash",
-  "gemini-flash-lite-latest",
-  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
 ];
+
+async function resolveGeminiKeys(supabase: any): Promise<string[]> {
+  const keys: string[] = [];
+  const envKey = (GEMINI_API_KEY || "").trim();
+  if (envKey.length >= 30 && envKey.startsWith("AIza")) {
+    keys.push(envKey);
+  }
+  try {
+    const { data } = await supabase
+      .from("sync_metadata")
+      .select("value")
+      .eq("key", "gemini_config")
+      .maybeSingle();
+    const raw = data?.value;
+    if (raw) {
+      const text = typeof raw === "string" ? raw : JSON.stringify(raw);
+      const matches = text.match(/AIza[A-Za-z0-9_\-]{30,}/g) || [];
+      for (const m of matches) {
+        if (!keys.includes(m)) keys.push(m);
+      }
+    }
+  } catch (e: any) {
+    console.warn("Could not read gemini_config from sync_metadata:", e.message);
+  }
+  return keys;
+}
 
 // Phone number normalization & strict single-number whitelist: Somesh (+919907839311) ONLY
 function normalizePhoneNumber(raw: string): string {
@@ -59,10 +84,23 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // Manual/Cron Google Sheet SKU Price History backfill
+    if (action === "sync_sheets") {
+      const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+      const syncResult = await syncSkuPriceHistoryToGoogleSheet(supabase);
+      return new Response(JSON.stringify(syncResult), {
+        status: syncResult.synced ? 200 : 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     // Diagnostic: List all active Gemini models
     if (action === "list_models") {
       try {
-        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
+        const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+        const keys = await resolveGeminiKeys(supabase);
+        const keyToUse = keys[0] || GEMINI_API_KEY;
+        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${keyToUse}`);
         const data = await resp.json();
         return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
       } catch (e: any) {
@@ -122,9 +160,12 @@ Deno.serve(async (req: Request) => {
     // Health check & diagnostic check
     if (action === "diag" || action === "health") {
       try {
-        const testModel = url.searchParams.get("model") || "gemini-3.6-flash";
+        const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+        const keys = await resolveGeminiKeys(supabase);
+        const keyToUse = keys[0] || GEMINI_API_KEY;
+        const testModel = url.searchParams.get("model") || PRIMARY_GEMINI_MODEL;
         const testResp = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${testModel}:generateContent?key=${GEMINI_API_KEY}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${testModel}:generateContent?key=${keyToUse}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -135,7 +176,11 @@ Deno.serve(async (req: Request) => {
           }
         );
         const testData = await testResp.json();
-        // Meta token validation & phone number lookup
+        const { data: sheetMeta } = await supabase
+          .from("sync_metadata")
+          .select("value")
+          .eq("key", "google_sheets_webhook_url")
+          .maybeSingle();
         let metaStatus: any = null;
         let phoneNumbers: any = null;
         if (WA_ACCESS_TOKEN) {
@@ -143,7 +188,6 @@ Deno.serve(async (req: Request) => {
             const metaCheck = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/debug_token?input_token=${WA_ACCESS_TOKEN}&access_token=${WA_ACCESS_TOKEN}`);
             metaStatus = await metaCheck.json();
 
-            // Try to find business accounts and phone numbers
             const wabasResp = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/794984353144205/whatsapp_business_accounts`, {
               headers: { Authorization: `Bearer ${WA_ACCESS_TOKEN}` }
             });
@@ -158,7 +202,9 @@ Deno.serve(async (req: Request) => {
             status: "ok",
             model: testModel,
             apiStatus: testResp.status,
+            geminiKeyCount: keys.length,
             activeModels: FALLBACK_GEMINI_MODELS,
+            googleSheetsWebhookConfigured: Boolean(sheetMeta?.value && String(sheetMeta.value).trim()),
             waTokenConfigured: !!WA_ACCESS_TOKEN,
             waPhoneIdConfigured: !!WA_PHONE_NUMBER_ID,
             metaStatus,
@@ -337,19 +383,26 @@ async function processWebhookEvent(body: any) {
     );
   } catch (err: any) {
     console.error("Error processing message:", err);
+    const errMsg = err?.message || String(err);
+    const isAuthError =
+      errMsg.includes("(401)") ||
+      errMsg.includes("(403)") ||
+      errMsg.includes("UNAUTHENTICATED") ||
+      errMsg.includes("API key not valid") ||
+      errMsg.includes("No valid Gemini API key");
 
-    // Queue for automatic background retry instead of failing completely!
     await supabase.from("whatsapp_messages").update({
-      status: "retry_pending",
-      error_message: `AI service busy. Queued for auto-retry: ${err.message || String(err)}`,
+      status: isAuthError ? "config_error" : "retry_pending",
+      error_message: isAuthError
+        ? `AUTH_ERROR: Gemini API key invalid or missing. Queued for retry once key is updated: ${errMsg}`
+        : `Queued for auto-retry: ${errMsg}`,
     }).eq("message_id", messageId);
 
-    // Reassure Somesh on WhatsApp
-    await sendWhatsAppReply(
-      fromNumber,
-      activePhoneNumberId,
-      "⏳ *Inventory Bill Received*\n\nOur AI parser is momentarily busy due to high demand. We've queued your bill for *automatic background retry*.\n\n✅ *No need to resend!* You will receive your confirmation message as soon as it's processed."
-    );
+    const userNotice = isAuthError
+      ? "⚠️ *Inventory Bill Saved to Queue (Action Needed)*\n\nOur Gemini AI key needs renewal, so your bill could not be parsed automatically right now.\n\n✅ Your bill is safely queued and will auto-process once Admin updates the AI key."
+      : "⏳ *Inventory Bill Received*\n\nOur AI parser is momentarily busy due to high demand. We've queued your bill for *automatic background retry*.\n\n✅ *No need to resend!* You will receive your confirmation message as soon as it's processed.";
+
+    await sendWhatsAppReply(fromNumber, activePhoneNumberId, userNotice);
   }
 }
 
@@ -378,7 +431,7 @@ async function processSingleMessage(
   let parsedResult: any = null;
 
   if (messageType === "text") {
-    parsedResult = await parseTextMessage(messageBody, inventoryCatalog);
+    parsedResult = await parseTextMessage(supabase, messageBody, inventoryCatalog);
   } else if (messageType === "image" || messageType === "document") {
     if (!mediaId) {
       console.warn(`Message ID ${messageId} is missing mediaId. Cannot download media without mediaId.`);
@@ -392,7 +445,7 @@ async function processSingleMessage(
     const downloaded = await downloadWhatsAppMedia(mediaId);
     if (downloaded) {
       const actualMime = downloaded.mimeType || mimeType || (messageType === "document" ? "application/pdf" : "image/jpeg");
-      parsedResult = await parseMediaMessage(downloaded.base64, actualMime, messageBody, inventoryCatalog);
+      parsedResult = await parseMediaMessage(supabase, downloaded.base64, actualMime, messageBody, inventoryCatalog);
     } else {
       throw new Error("Could not download WhatsApp media from Meta");
     }
@@ -551,9 +604,9 @@ async function processPendingRetries(supabase: any, activePhoneNumberId: string)
   const { data: pendingMessages, error } = await supabase
     .from("whatsapp_messages")
     .select("*")
-    .eq("status", "retry_pending")
+    .in("status", ["retry_pending", "config_error"])
     .order("id", { ascending: true })
-    .limit(10);
+    .limit(25);
 
   if (error || !pendingMessages || pendingMessages.length === 0) {
     return [];
@@ -595,12 +648,13 @@ async function processPendingRetries(supabase: any, activePhoneNumberId: string)
 
 // ==================== GEMINI AI PARSING & FALLBACKS ====================
 
-async function parseTextMessage(text: string, inventoryCatalog: string): Promise<any> {
+async function parseTextMessage(supabase: any, text: string, inventoryCatalog: string): Promise<any> {
   const prompt = buildInventoryParsePrompt(text, inventoryCatalog, "text");
-  return callGeminiAPI(prompt, null, "text/plain");
+  return callGeminiAPI(supabase, prompt, null, "text/plain");
 }
 
 async function parseMediaMessage(
+  supabase: any,
   mediaBase64: string,
   mimeType: string,
   caption: string,
@@ -612,7 +666,7 @@ async function parseMediaMessage(
     inventoryCatalog,
     isPdf ? "pdf_document" : "image"
   );
-  return callGeminiAPI(prompt, mediaBase64, mimeType);
+  return callGeminiAPI(supabase, prompt, mediaBase64, mimeType);
 }
 
 function buildInventoryParsePrompt(userMessage: string, inventoryCatalog: string, inputType: string): string {
@@ -667,42 +721,66 @@ For items in "inventory":
 // ==================== RESILIENT GEMINI CALLER ====================
 
 async function callGeminiAPI(
+  supabase: any,
   prompt: string,
   mediaBase64: string | null,
   mimeType: string = "image/jpeg"
 ): Promise<any> {
+  const keys = await resolveGeminiKeys(supabase);
+  if (keys.length === 0) {
+    throw new Error("No valid Gemini API key configured (API key not valid)");
+  }
+
   let lastError: any = null;
 
-  for (const model of FALLBACK_GEMINI_MODELS) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        console.log(`🤖 Invoking Gemini [${model}] (attempt ${attempt}/2)...`);
-        const result = await callGeminiSingle(model, prompt, mediaBase64, mimeType);
-        console.log(`✅ Gemini [${model}] successfully parsed response!`);
-        return result;
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err.message || String(err);
-        const isTransient =
-          errMsg.includes("503") ||
-          errMsg.includes("429") ||
-          errMsg.includes("500") ||
-          errMsg.includes("502") ||
-          errMsg.includes("504") ||
-          errMsg.includes("high demand") ||
-          errMsg.includes("UNAVAILABLE") ||
-          errMsg.includes("RESOURCE_EXHAUSTED");
+  for (const apiKey of keys) {
+    for (const model of FALLBACK_GEMINI_MODELS) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          console.log(`🤖 Invoking Gemini [${model}] (attempt ${attempt}/2)...`);
+          const result = await callGeminiSingle(apiKey, model, prompt, mediaBase64, mimeType);
+          console.log(`✅ Gemini [${model}] successfully parsed response!`);
+          return result;
+        } catch (err: any) {
+          lastError = err;
+          const errMsg = err.message || String(err);
+          const isAuth =
+            errMsg.includes("(401)") ||
+            errMsg.includes("(403)") ||
+            errMsg.includes("API key not valid") ||
+            errMsg.includes("UNAUTHENTICATED");
+          if (isAuth) {
+            console.warn(`🔑 Key rejected (${errMsg.slice(0, 120)}); trying next key if available...`);
+            break;
+          }
+          const isTransient =
+            errMsg.includes("503") ||
+            errMsg.includes("429") ||
+            errMsg.includes("500") ||
+            errMsg.includes("502") ||
+            errMsg.includes("504") ||
+            errMsg.includes("high demand") ||
+            errMsg.includes("UNAVAILABLE") ||
+            errMsg.includes("RESOURCE_EXHAUSTED");
 
-        console.warn(`⚠️ Model [${model}] attempt ${attempt} failed: ${errMsg}`);
+          console.warn(`⚠️ Model [${model}] attempt ${attempt} failed: ${errMsg}`);
 
-        if (isTransient) {
-          const delayMs = attempt * 1500 + Math.floor(Math.random() * 800);
-          console.log(`⏳ Backoff: waiting ${delayMs}ms before next retry...`);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        } else {
-          // If 404 or other non-transient error, immediately cascade to next model
-          break;
+          if (isTransient) {
+            const delayMs = attempt * 1500 + Math.floor(Math.random() * 800);
+            console.log(`⏳ Backoff: waiting ${delayMs}ms before next retry...`);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          } else {
+            break;
+          }
         }
+      }
+      if (
+        lastError?.message &&
+        (lastError.message.includes("(401)") ||
+          lastError.message.includes("(403)") ||
+          lastError.message.includes("API key not valid"))
+      ) {
+        break;
       }
     }
   }
@@ -711,12 +789,13 @@ async function callGeminiAPI(
 }
 
 async function callGeminiSingle(
+  apiKey: string,
   modelName: string,
   prompt: string,
   mediaBase64: string | null,
   mimeType: string = "image/jpeg"
 ): Promise<any> {
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
 
   const parts: any[] = [];
 
@@ -956,7 +1035,249 @@ async function createInventoryOrder(
     }
   }
 
+  // Automatically sync updated SKU Price History to live Google Sheet without blocking confirmation
+  syncSkuPriceHistoryToGoogleSheet(supabase).catch((e) =>
+    console.warn("Google Sheet auto-sync skipped:", e?.message || e)
+  );
+
   return { orderId, isDuplicate: false };
+}
+
+// ==================== LIVE GOOGLE SHEET SKU PRICE HISTORY SYNC ====================
+
+const HARDWARE_TERMS = new Set([
+  "stand", "dispenser", "cover", "machine", "basket", "repair", "repairs",
+  "rent", "electricity", "wifi", "wi-fi", "rapido", "courier", "paint",
+  "table", "chair", "shelf", "rack", "stool", "signage", "board", "banner",
+  "delivery", "transport", "freight",
+]);
+
+function normalizeSkuForSheet(raw: string): string {
+  let s = (raw || "").trim().toLowerCase();
+  s = s
+    .replace(/\b(tht|tnt|tkt)\s*(vanilla|vancia)\b/gi, "vanilla base ice cream")
+    .replace(/\bgallon\s+vanilla\b/gi, "vanilla base ice cream")
+    .replace(/\bvanilla\s*5\s*(l|lt|ltr)\b/gi, "vanilla base ice cream")
+    .replace(/\bperi\s*[-]?\s*peri\b/gi, "peri peri seasoning")
+    .replace(/\b(pama|pamac)\b/gi, "caramel sauce pamac")
+    .replace(/\bdoodh\b/gi, "milk")
+    .replace(/\bcheeni\b/gi, "sugar")
+    .replace(/\bmonin\s+caramel(\s+syrup)?\b/gi, "monin caramel syrup")
+    .replace(/\b\d+(?:\.\d+)?\s*(?:kgs?|kilograms?|gms?|grams?|g|ltrs?|litres?|liters?|lt|l|mls?|ml|pcs?|pieces?|nos?|pkts?|packs?|packets?|btls?|bottles?|tins?|cans?|jars?|boxes?)\b/gi, " ")
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return s;
+}
+
+function matchMasterSkuForSheet(rawName: string, catalog: any[]): any | null {
+  const clean = (rawName || "").trim();
+  if (!clean || !catalog?.length) return null;
+  const exact = catalog.find((i: any) => i.name.trim().toLowerCase() === clean.toLowerCase());
+  if (exact) return exact;
+  const rawTokens = clean.toLowerCase().split(/[^a-z0-9-]+/).filter(Boolean);
+  if (rawTokens.some((t) => HARDWARE_TERMS.has(t))) return null;
+
+  const cleanNorm = normalizeSkuForSheet(clean);
+  if (!cleanNorm) return null;
+  const cleanWords = cleanNorm.split(" ").filter((w) => w.length >= 3);
+  let best: any = null;
+  let bestScore = 0;
+  for (const cand of catalog) {
+    const candNorm = normalizeSkuForSheet(cand.name);
+    if (!candNorm) continue;
+    if (candNorm === cleanNorm) return cand;
+    const candWords = candNorm.split(" ").filter((w) => w.length >= 3);
+    const overlap = cleanWords.filter((w) => candWords.includes(w));
+    const minLen = Math.max(1, Math.min(cleanWords.length, candWords.length));
+    const cov = overlap.length / minLen;
+    let score = 0;
+    if (overlap.length === 1 && ["water", "ice", "milk", "sugar", "cup", "cups"].includes(overlap[0]) && cleanWords.length >= 4) {
+      score = 0;
+    } else if (candNorm.includes(cleanNorm) || cleanNorm.includes(candNorm)) {
+      score = 120 + overlap.length * 5;
+    } else if (cov >= 0.6) {
+      score = 60 + cov * 30;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = cand;
+    }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+function normalizeUnitPriceForSheet(line: any, master: any): number {
+  const qty = Number(line.quantity || 0);
+  const unitPrice = Number(line.unit_price || 0);
+  const subtotal = Number(line.subtotal || 0);
+  if (qty <= 0) return Math.round(Math.max(0, unitPrice) * 100) / 100;
+  const total = subtotal > 0 ? subtotal : qty * unitPrice;
+  if (total <= 0) return 0;
+  const rawPerUnit = total / qty;
+  if (!master) return Math.round(rawPerUnit * 100) / 100;
+
+  const bUnit = String(line.unit || "").trim().toLowerCase();
+  const mUnit = String(master.unit || "").trim().toLowerCase();
+  const packSize = Number(master.standard_quantity || 1) > 0 ? Number(master.standard_quantity) : 1;
+
+  const isG = ["g", "gm", "gms", "gram", "grams"].includes(bUnit);
+  const isKg = ["kg", "kgs", "kilo", "kilos", "kilogram", "kilograms"].includes(bUnit);
+  const mIsG = ["g", "gm", "gms", "gram", "grams"].includes(mUnit);
+  const mIsKg = ["kg", "kgs", "kilo", "kilos", "kilogram", "kilograms"].includes(mUnit);
+
+  const isMl = ["ml", "mls", "milliliter", "milliliters"].includes(bUnit);
+  const isL = ["l", "lt", "ltr", "ltrs", "liter", "liters", "litre", "litres"].includes(bUnit);
+  const mIsMl = ["ml", "mls", "milliliter", "milliliters"].includes(mUnit);
+  const mIsL = ["l", "lt", "ltr", "ltrs", "liter", "liters", "litre", "litres"].includes(mUnit);
+
+  if ((isG || isKg) && (mIsG || mIsKg)) {
+    const conv = isG && mIsKg ? qty / 1000 : isKg && mIsG ? qty * 1000 : qty;
+    const packs = conv / packSize;
+    return packs > 0 ? Math.round((total / packs) * 100) / 100 : Math.round(rawPerUnit * 100) / 100;
+  }
+  if ((isMl || isL) && (mIsMl || mIsL)) {
+    const conv = isMl && mIsL ? qty / 1000 : isL && mIsMl ? qty * 1000 : qty;
+    const packs = conv / packSize;
+    return packs > 0 ? Math.round((total / packs) * 100) / 100 : Math.round(rawPerUnit * 100) / 100;
+  }
+  return Math.round(rawPerUnit * 100) / 100;
+}
+
+async function syncSkuPriceHistoryToGoogleSheet(supabase: any): Promise<{ synced: boolean; count?: number; error?: string }> {
+  const { data: metaRow } = await supabase
+    .from("sync_metadata")
+    .select("value")
+    .eq("key", "google_sheets_webhook_url")
+    .maybeSingle();
+
+  const webhookUrl = String(metaRow?.value || "").trim();
+  if (!webhookUrl) {
+    return { synced: false, error: "google_sheets_webhook_url not set" };
+  }
+
+  const [{ data: items }, { data: orders }] = await Promise.all([
+    supabase.from("inventory_items").select("*").order("name"),
+    supabase.from("inventory_orders").select("*, inventory_order_items(*)").order("timestamp", { ascending: true }).limit(1000),
+  ]);
+
+  const catalog = items || [];
+  const shortMonths = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const entriesByKey = new Map<string, any[]>();
+  const ledger: any[] = [];
+  const lastValidLedger = new Map<string, number>();
+
+  for (const ord of orders || []) {
+    const ts = Number(ord.timestamp || Date.now());
+    const dIst = new Date(ts + 5.5 * 60 * 60 * 1000);
+    const shortDate = `${String(dIst.getUTCDate()).padStart(2, "0")} ${shortMonths[dIst.getUTCMonth()]}`;
+    const fullDate = new Date(ts).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+
+    for (const line of ord.inventory_order_items || []) {
+      if (!line.item_name || line.quantity <= 0) continue;
+      const isHw = String(line.item_name).toLowerCase().split(/[^a-z0-9-]+/).some((t: string) => HARDWARE_TERMS.has(t));
+      const matched = isHw ? null : matchMasterSkuForSheet(line.item_name, catalog);
+      const skuName = matched ? matched.name : (isHw ? "Non-Ingredient / Hardware" : line.item_name.trim());
+      const rate = normalizeUnitPriceForSheet(line, matched);
+      const key = skuName.toLowerCase();
+      const prevL = lastValidLedger.get(key);
+      const isAnom = !isHw && prevL !== undefined && rate > 0 && (rate > prevL * 3.0 || rate < prevL * 0.3);
+      if (!isAnom && !isHw && rate > 0) lastValidLedger.set(key, rate);
+
+      ledger.push({
+        orderId: ord.order_id,
+        dateFormatted: fullDate,
+        supplierName: ord.supplier_name || "Supplier",
+        rawItemName: line.item_name,
+        matchedSkuName: skuName,
+        quantity: line.quantity,
+        unit: line.unit || "pcs",
+        unitPrice: line.unit_price || 0,
+        subtotal: line.subtotal || 0,
+        normalizedPrice: rate,
+        statusLabel: isHw ? "HARDWARE / EXCLUDED" : isAnom ? "CHECK UNIT" : "OK",
+        notes: ord.notes || "",
+      });
+
+      if (isHw || rate <= 0) continue;
+      const arr = entriesByKey.get(key) || [];
+      arr.push({
+        rate,
+        dateLabel: shortDate,
+        orderId: ord.order_id,
+        supplierName: ord.supplier_name || "Supplier",
+        master: matched,
+        fallbackUnit: line.unit || "pcs",
+        skuName,
+      });
+      entriesByKey.set(key, arr);
+    }
+  }
+
+  let maxBills = 0;
+  const rows: any[] = [];
+  for (const list of entriesByKey.values()) {
+    let lastValid: number | null = null;
+    const bills = list.map((e: any, idx: number) => {
+      const anom = lastValid !== null && (e.rate > lastValid * 3.0 || e.rate < lastValid * 0.3);
+      if (!anom) lastValid = e.rate;
+      const numStr = Math.abs(e.rate - Math.round(e.rate)) < 0.005 ? String(Math.round(e.rate)) : e.rate.toFixed(2);
+      return {
+        billIndex: idx + 1,
+        price: e.rate,
+        dateLabel: e.dateLabel,
+        cellText: anom ? `CHECK UNIT (${numStr}, ${e.dateLabel})` : `${numStr} (${e.dateLabel})`,
+        isUnitAnomaly: anom,
+        orderId: e.orderId,
+        supplierName: e.supplierName,
+      };
+    });
+    if (bills.length > maxBills) maxBills = bills.length;
+    const valid = bills.filter((b: any) => !b.isUnitAnomaly);
+    const first = valid.length ? valid[0].price : bills[0].price;
+    const latest = valid.length ? valid[valid.length - 1].price : bills[bills.length - 1].price;
+    const hasPct = valid.length >= 2 && first > 0;
+    const pct = hasPct ? Math.round(((latest - first) / first) * 10000) / 100 : 0;
+
+    const sample = list[0];
+    const m = sample.master;
+    const uWeight = m
+      ? (Number(m.standard_quantity || 1) === 1 ? `per ${m.unit}` : `per ${m.standard_quantity}${m.unit} pack`)
+      : `per ${sample.fallbackUnit}`;
+
+    rows.push({
+      skuName: sample.skuName,
+      unitWeightLabel: uWeight,
+      latestPrice: latest,
+      priceChangeVsFirstPct: pct,
+      hasChangePct: hasPct,
+      isPriceHike: pct > 0,
+      hasUnitAnomaly: bills.some((b: any) => b.isUnitAnomaly),
+      bills,
+    });
+  }
+
+  rows.sort((a, b) => {
+    const tA = a.isPriceHike ? 0 : a.hasUnitAnomaly ? 1 : 2;
+    const tB = b.isPriceHike ? 0 : b.hasUnitAnomaly ? 1 : 2;
+    if (tA !== tB) return tA - tB;
+    return (b.priceChangeVsFirstPct || 0) - (a.priceChangeVsFirstPct || 0);
+  });
+
+  const sep = webhookUrl.includes("?") ? "&" : "?";
+  const resp = await fetch(`${webhookUrl}${sep}action=syncSkuPriceHistory`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "syncSkuPriceHistory",
+      includeDateInCells: true,
+      maxBillColumns: maxBills,
+      rows,
+      ledger,
+    }),
+    redirect: "follow",
+  });
+  return { synced: resp.ok, count: rows.length };
 }
 
 // ==================== WHATSAPP REPLY ====================

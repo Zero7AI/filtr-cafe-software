@@ -61,7 +61,6 @@ export default function OrdersView({
 
   // Load all today's orders
   const loadOrders = useCallback(async () => {
-    setLoading(true);
     try {
       const data = await fetchOrders('ALL', 300, true);
       setAllTodayOrders(data);
@@ -78,7 +77,9 @@ export default function OrdersView({
   }, [onRefreshOrdersCount]);
 
   useEffect(() => {
-    loadOrders();
+    Promise.resolve().then(() => {
+      void loadOrders();
+    });
     // Auto-refresh orders every 8 seconds for real-time kitchen tablet display
     const interval = setInterval(() => {
       fetchOrders('ALL', 300, true).then((data) => {

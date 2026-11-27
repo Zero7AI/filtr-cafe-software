@@ -1,25 +1,17 @@
 package com.example.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ReceiptLong
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,21 +21,20 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.data.entity.InventoryItemEntity
-import com.example.data.entity.InventoryOrderEntity
-import com.example.data.entity.InventoryOrderItemEntity
 import com.example.data.entity.InventoryOrderWithItems
 import com.example.domain.inventory.IngredientPriceSummary
-import com.example.domain.inventory.PriceTrend
+import com.example.domain.inventory.RawMaterialPriceTracker
+import com.example.domain.inventory.SkuPriceHistoryMatrix
 import com.example.ui.BillingUiState
 import com.example.ui.InventoryOrderItemInput
-import kotlinx.coroutines.delay
-import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Locale
+import java.util.UUID
 
 val DarkBackground = Color(0xFF09090B)
 val SurfaceColor = Color(0xFF18181B)
@@ -51,7 +42,9 @@ val SurfaceVariantColor = Color(0xFF27272A)
 val AmberAccent = Color(0xFFF59E0B)
 val TextGray = Color(0xFFA1A1AA)
 
-@OptIn(ExperimentalMaterial3Api::class)
+private const val DEFAULT_SUPPLIER_SHEET_URL =
+    "https://docs.google.com/spreadsheets/d/1UsUM0SLdDf4uHXhJuao96Twkd-Eq5Yxl4_VHM_sFw90/edit?gid=0#gid=0"
+
 @Composable
 fun InventoryOrderScreen(
     state: BillingUiState,
@@ -73,594 +66,205 @@ fun InventoryOrderScreen(
     onUpdateInventoryItem: (InventoryItemEntity) -> Unit = {},
     onImportReceiptClick: (() -> Unit)? = null,
     pricingSummaries: List<IngredientPriceSummary> = emptyList(),
+    skuPriceHistoryMatrix: SkuPriceHistoryMatrix? = null,
+    googleSheetsUrl: String = "",
+    onOpenGoogleSheet: ((String) -> Unit)? = null,
     onRetryQueuedReceipt: (String) -> Unit = {},
     onDismissQueuedReceipt: (String) -> Unit = {},
-    onSyncPricingToSheets: (() -> Unit)? = null,
+    onSyncPricingToSheets: ((Boolean) -> Unit)? = null,
+    onExportPricingXlsx: ((Boolean) -> Unit)? = null,
     onExportPricingCsv: (() -> Unit)? = null
 ) {
-    // Date filter state
-    var dateFilter by remember { mutableStateOf("THIS_MONTH") } // TODAY, YESTERDAY, LAST_7_DAYS, THIS_MONTH, ALL_TIME, CUSTOM
-    var customStartMs by remember { mutableStateOf<Long?>(null) }
-    var customEndMs by remember { mutableStateOf<Long?>(null) }
-    var showCustomDateDialog by remember { mutableStateOf(false) }
-    var isSupplierBreakdownExpanded by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
+    var includeDateInCells by remember { mutableStateOf(true) }
 
-    var dayBoundaryTick by remember { mutableIntStateOf(0) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            val nowCal = Calendar.getInstance()
-            val nextMidnight = Calendar.getInstance().apply {
-                add(Calendar.DAY_OF_YEAR, 1)
-                set(Calendar.HOUR_OF_DAY, 0)
-                set(Calendar.MINUTE, 0)
-                set(Calendar.SECOND, 1)
-                set(Calendar.MILLISECOND, 0)
-            }
-            val delayMs = (nextMidnight.timeInMillis - nowCal.timeInMillis).coerceAtLeast(1_000L)
-            delay(delayMs)
-            dayBoundaryTick++
-        }
+    val resolvedMatrix = remember(skuPriceHistoryMatrix, inventoryItems, inventoryOrders) {
+        skuPriceHistoryMatrix ?: RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(
+            inventoryItems = inventoryItems,
+            inventoryOrders = inventoryOrders
+        )
     }
 
-    val todayStart = remember(dayBoundaryTick) {
-        Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
+    val filteredRows = remember(resolvedMatrix, searchQuery) {
+        val q = searchQuery.trim().lowercase(Locale.US)
+        if (q.isBlank()) resolvedMatrix.rows
+        else resolvedMatrix.rows.filter { it.skuName.lowercase(Locale.US).contains(q) }
     }
 
-    // Filter orders based on the selected date or date range
-    val dateFilteredOrders = remember(inventoryOrders, dateFilter, customStartMs, customEndMs, todayStart) {
-        inventoryOrders.filter { orderWithItems ->
-            val orderTime = orderWithItems.order.timestamp
-            when (dateFilter) {
-                "TODAY" -> orderTime >= todayStart
-                "YESTERDAY" -> {
-                    val yesterdayStart = Calendar.getInstance().apply {
-                        timeInMillis = todayStart
-                        add(Calendar.DAY_OF_YEAR, -1)
-                    }.timeInMillis
-                    orderTime in yesterdayStart until todayStart
-                }
-                "LAST_7_DAYS" -> {
-                    val weekAgo = Calendar.getInstance().apply {
-                        timeInMillis = todayStart
-                        add(Calendar.DAY_OF_YEAR, -6)
-                    }.timeInMillis
-                    orderTime >= weekAgo
-                }
-                "THIS_MONTH" -> {
-                    val thirtyDaysAgo = Calendar.getInstance().apply {
-                        timeInMillis = todayStart
-                        add(Calendar.DAY_OF_YEAR, -29)
-                    }.timeInMillis
-                    orderTime >= thirtyDaysAgo
-                }
-                "CUSTOM" -> {
-                    val start = customStartMs ?: 0L
-                    val end = customEndMs ?: Long.MAX_VALUE
-                    orderTime in start..end
-                }
-                else -> true // ALL_TIME
-            }
-        }
-    }
-
-    // Date range human-readable label
-    val sdf = remember { SimpleDateFormat("dd MMM", Locale.getDefault()) }
-    val dateRangeLabel = remember(dateFilter, customStartMs, customEndMs) {
-        when (dateFilter) {
-            "TODAY" -> "Today"
-            "YESTERDAY" -> "Yesterday"
-            "LAST_7_DAYS" -> "Last 7 Days"
-            "THIS_MONTH" -> "Last 30 Days"
-            "ALL_TIME" -> "All Time"
-            "CUSTOM" -> {
-                val start = customStartMs ?: 0L
-                val end = customEndMs ?: System.currentTimeMillis()
-                val cal1 = Calendar.getInstance().apply { timeInMillis = start }
-                val cal2 = Calendar.getInstance().apply { timeInMillis = end }
-                val isSame = cal1.get(Calendar.YEAR) == cal2.get(Calendar.YEAR) &&
-                        cal1.get(Calendar.DAY_OF_YEAR) == cal2.get(Calendar.DAY_OF_YEAR)
-                if (isSame) {
-                    sdf.format(Date(start))
-                } else {
-                    "${sdf.format(Date(start))} - ${sdf.format(Date(end))}"
-                }
-            }
-            else -> "Custom Range"
-        }
-    }
-
-    // Total spend & metrics for selected period
-    val totalSpendPeriod = remember(dateFilteredOrders) {
-        dateFilteredOrders.sumOf { it.order.totalAmount }
-    }
-    val orderCountPeriod = dateFilteredOrders.size
-    val avgSpendPerOrder = if (orderCountPeriod > 0) totalSpendPeriod / orderCountPeriod else 0.0
-
-    // Supplier spend breakdown
-    val supplierBreakdown = remember(dateFilteredOrders) {
-        dateFilteredOrders
-            .groupBy { it.order.supplierName.ifBlank { "WhatsApp Order" } }
-            .map { (supplier, orders) ->
-                val amount = orders.sumOf { it.order.totalAmount }
-                Triple(supplier, amount, orders.size)
-            }
-            .sortedByDescending { it.second }
-    }
-
-    // Filter by search query (supplier name, order ID, or item names)
-    val displayOrders = remember(dateFilteredOrders, searchQuery) {
-        val q = searchQuery.trim().lowercase()
-        if (q.isBlank()) {
-            dateFilteredOrders
-        } else {
-            dateFilteredOrders.filter { orderWithItems ->
-                orderWithItems.order.orderId.lowercase().contains(q) ||
-                orderWithItems.order.supplierName.lowercase().contains(q) ||
-                orderWithItems.order.notes.lowercase().contains(q) ||
-                orderWithItems.items.any { it.itemName.lowercase().contains(q) }
-            }
-        }
-    }
+    val liveSheetUrl = googleSheetsUrl.ifBlank { DEFAULT_SUPPLIER_SHEET_URL }
+    val hikeCount = resolvedMatrix.rows.count { it.isPriceHike }
+    val anomalyCount = resolvedMatrix.rows.count { it.hasUnitAnomaly }
 
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBackground)
             .testTag("inventory_orders_list"),
-        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 80.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 72.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Top Header Card: TOTAL INVENTORY PROCUREMENT SPEND with Balanced Metrics & Supplier Breakdown
-        item(key = "spend_card") {
+        item(key = "purchase_tracking_header") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Purchase Tracking",
+                        color = Color.White,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                    Text(
+                        text = "SKU Price History • ${resolvedMatrix.rows.size} SKUs tracked",
+                        color = TextGray,
+                        fontSize = 12.sp
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (onImportReceiptClick != null) {
+                        OutlinedButton(
+                            onClick = onImportReceiptClick,
+                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.6f)),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier
+                                .height(38.dp)
+                                .testTag("import_receipt_pdf_button")
+                        ) {
+                            Icon(Icons.Default.Description, contentDescription = null, tint = AmberAccent, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Bill PDF", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Button(
+                        onClick = onOpenAddOrder,
+                        colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = Color.Black),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(38.dp)
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Add Bill", fontSize = 11.sp, fontWeight = FontWeight.Black)
+                    }
+                }
+            }
+        }
+
+        item(key = "live_sheet_card") {
             Card(
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = SurfaceColor),
-                border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.8f)),
+                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.45f)),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier.padding(12.dp)
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Header line: Title & Tag on left; Item Master shortcut on right
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "TOTAL PROCUREMENT SPEND",
-                                color = TextGray,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.5.sp
+                                text = "LIVE SUPPLIER PRICING SHEET",
+                                color = Color(0xFF34D399),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Black,
+                                letterSpacing = 0.6.sp
                             )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Jump straight to all past-to-date supplier prices in Excel / Google Sheets",
+                                color = TextGray,
+                                fontSize = 11.sp
+                            )
+                        }
+                        if (hikeCount > 0) {
                             Surface(
-                                color = AmberAccent.copy(alpha = 0.15f),
-                                border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.3f)),
-                                shape = RoundedCornerShape(6.dp)
+                                color = Color(0xFFEF4444).copy(alpha = 0.16f),
+                                border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.45f)),
+                                shape = RoundedCornerShape(8.dp)
                             ) {
                                 Text(
-                                    text = dateRangeLabel.uppercase(),
-                                    color = AmberAccent,
-                                    fontSize = 9.sp,
+                                    text = "$hikeCount Hike${if (hikeCount == 1) "" else "s"}",
+                                    color = Color(0xFFFCA5A5),
+                                    fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                )
-                            }
-                        }
-
-                        OutlinedButton(
-                            onClick = onOpenInventoryMaster,
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                            border = BorderStroke(1.dp, SurfaceVariantColor),
-                            shape = RoundedCornerShape(8.dp),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                            modifier = Modifier.height(28.dp)
-                        ) {
-                            Icon(imageVector = Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(13.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Item Master", fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    Text(
-                        text = "₹${String.format(Locale.US, "%,.2f", totalSpendPeriod)}",
-                        color = Color.White,
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.Black
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Stats row: 3 balanced tiles (Bills, Avg Spend, Suppliers)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        // Tile 1: Bills
-                        Surface(
-                            color = SurfaceVariantColor.copy(alpha = 0.45f),
-                            border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.5f)),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-                                Text("BILLS", color = TextGray, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                Spacer(modifier = Modifier.height(1.dp))
-                                Text("$orderCountPeriod Orders", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-
-                        // Tile 2: Avg per Bill
-                        Surface(
-                            color = SurfaceVariantColor.copy(alpha = 0.45f),
-                            border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.5f)),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-                                Text("AVG / BILL", color = TextGray, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                Spacer(modifier = Modifier.height(1.dp))
-                                Text("₹${String.format(Locale.US, "%.0f", avgSpendPerOrder)}", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-
-                        // Tile 3: Suppliers
-                        Surface(
-                            color = SurfaceVariantColor.copy(alpha = 0.45f),
-                            border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.5f)),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-                                Text("VENDORS", color = TextGray, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                Spacer(modifier = Modifier.height(1.dp))
-                                Text("${supplierBreakdown.size} Vendors", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
-
-                    // Vendor Spend Breakdown Toggle
-                    if (supplierBreakdown.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Surface(
-                            color = if (isSupplierBreakdownExpanded) SurfaceVariantColor.copy(alpha = 0.4f) else Color.Transparent,
-                            shape = RoundedCornerShape(6.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { isSupplierBreakdownExpanded = !isSupplierBreakdownExpanded }
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 6.dp, vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.PieChart,
-                                        contentDescription = null,
-                                        tint = AmberAccent,
-                                        modifier = Modifier.size(13.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = "Vendor Spend Breakdown (${supplierBreakdown.size})",
-                                        color = AmberAccent,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                                Icon(
-                                    imageVector = if (isSupplierBreakdownExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                    contentDescription = null,
-                                    tint = AmberAccent,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                                 )
                             }
                         }
                     }
 
-                    // Expandable Supplier Breakdown
-                    AnimatedVisibility(
-                        visible = isSupplierBreakdownExpanded && supplierBreakdown.isNotEmpty(),
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) {
-                            HorizontalDivider(color = SurfaceVariantColor, modifier = Modifier.padding(bottom = 8.dp))
-
-                            supplierBreakdown.forEach { (supplier, amount, count) ->
-                                val percentage = if (totalSpendPeriod > 0) (amount / totalSpendPeriod * 100.0) else 0.0
-                                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = "$supplier ($count ${if (count == 1) "bill" else "bills"})",
-                                            color = Color.White,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Medium,
-                                            maxLines = 1,
-                                            modifier = Modifier.weight(1f, fill = false)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = "₹${String.format(Locale.US, "%,.2f", amount)}  (${String.format(Locale.US, "%.1f", percentage)}%)",
-                                            color = AmberAccent,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.height(3.dp))
-                                    LinearProgressIndicator(
-                                        progress = { (percentage / 100.0).toFloat().coerceIn(0f, 1f) },
-                                        modifier = Modifier.fillMaxWidth().height(3.dp),
-                                        color = AmberAccent,
-                                        trackColor = SurfaceVariantColor,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Date Filter Chips Row
-        item(key = "date_filters") {
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                val presetFilters = listOf(
-                    "TODAY" to "Today",
-                    "YESTERDAY" to "Yesterday",
-                    "LAST_7_DAYS" to "7 Days",
-                    "THIS_MONTH" to "30 Days",
-                    "ALL_TIME" to "All Time"
-                )
-
-                items(presetFilters, key = { it.first }) { (filter, label) ->
-                    val isSelected = dateFilter == filter
-                    FilterChip(
-                        selected = isSelected,
-                        onClick = { dateFilter = filter },
-                        label = {
-                            Text(
-                                text = label,
-                                fontSize = 12.sp,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
-                            )
-                        },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = AmberAccent,
-                            selectedLabelColor = Color.Black,
-                            containerColor = SurfaceColor,
-                            labelColor = TextGray
+                    Button(
+                        onClick = { onOpenGoogleSheet?.invoke(liveSheetUrl) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF10B981),
+                            contentColor = Color.Black
                         ),
-                        border = FilterChipDefaults.filterChipBorder(
-                            enabled = true,
-                            selected = isSelected,
-                            borderColor = SurfaceVariantColor,
-                            selectedBorderColor = AmberAccent
-                        ),
-                        shape = RoundedCornerShape(16.dp)
-                    )
-                }
-
-                item {
-                    val isCustom = dateFilter == "CUSTOM"
-                    FilterChip(
-                        selected = isCustom,
-                        onClick = { showCustomDateDialog = true },
-                        leadingIcon = {
-                            Icon(
-                                imageVector = Icons.Default.DateRange,
-                                contentDescription = "Select Custom Date",
-                                modifier = Modifier.size(14.dp)
-                            )
-                        },
-                        label = {
-                            Text(
-                                text = if (isCustom) dateRangeLabel else "Custom Date",
-                                fontSize = 12.sp,
-                                fontWeight = if (isCustom) FontWeight.Bold else FontWeight.Medium
-                            )
-                        },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = AmberAccent,
-                            selectedLabelColor = Color.Black,
-                            containerColor = SurfaceColor,
-                            labelColor = TextGray
-                        ),
-                        border = FilterChipDefaults.filterChipBorder(
-                            enabled = true,
-                            selected = isCustom,
-                            borderColor = SurfaceVariantColor,
-                            selectedBorderColor = AmberAccent
-                        ),
-                        shape = RoundedCornerShape(16.dp)
-                    )
-                }
-            }
-        }
-
-        // Search Bar & Add Bill Button - Pixel-perfect aligned at 50dp
-        item(key = "search_and_actions") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Search supplier, item, or bill ID...", color = TextGray, fontSize = 12.sp) },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search", tint = TextGray, modifier = Modifier.size(18.dp)) },
-                    trailingIcon = {
-                        if (searchQuery.isNotBlank()) {
-                            IconButton(onClick = { searchQuery = "" }, modifier = Modifier.size(20.dp)) {
-                                Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextGray)
-                            }
-                        }
-                    },
-                    modifier = Modifier.weight(1f),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = AmberAccent,
-                        unfocusedBorderColor = SurfaceVariantColor,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        cursorColor = AmberAccent,
-                        focusedContainerColor = SurfaceColor,
-                        unfocusedContainerColor = SurfaceColor
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                    singleLine = true
-                )
-
-                if (onImportReceiptClick != null) {
-                    OutlinedButton(
-                        onClick = onImportReceiptClick,
+                        shape = RoundedCornerShape(10.dp),
                         modifier = Modifier
-                            .height(50.dp)
-                            .testTag("import_receipt_pdf_button"),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                        border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.6f)),
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(horizontal = 10.dp)
+                            .fillMaxWidth()
+                            .height(46.dp)
+                            .testTag("open_live_pricing_sheet_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Description,
-                            contentDescription = "Import Receipt PDF or Image",
-                            tint = AmberAccent,
-                            modifier = Modifier.size(16.dp)
+                            imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("PDF", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Open Live Supplier Pricing Sheet",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Black
+                        )
                     }
-                }
 
-                Button(
-                    onClick = onOpenAddOrder,
-                    modifier = Modifier.height(50.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = Color.Black),
-                    shape = RoundedCornerShape(12.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp)
-                ) {
-                    Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Add Bill", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                }
-            }
-        }
-
-        // Excel / Google Sheets Price Balance & Export Strip + Price Hike Alerts
-        val priceIncreaseAlerts = pricingSummaries.filter { it.trend == PriceTrend.INCREASED }
-        if (onSyncPricingToSheets != null || onExportPricingCsv != null || priceIncreaseAlerts.isNotEmpty()) {
-            item(key = "excel_pricing_strip") {
-                Card(
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(containerColor = SurfaceColor),
-                    border = BorderStroke(
-                        1.dp,
-                        if (priceIncreaseAlerts.isNotEmpty()) Color(0xFFEF4444).copy(alpha = 0.55f) else SurfaceVariantColor
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        OutlinedButton(
+                            onClick = {
+                                if (onExportPricingXlsx != null) {
+                                    onExportPricingXlsx(includeDateInCells)
+                                } else {
+                                    onExportPricingCsv?.invoke()
+                                }
+                            },
+                            border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.5f)),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF34D399)),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(38.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "EXCEL PRICING & HIKE TRACKER",
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    letterSpacing = 0.5.sp
-                                )
-                                Text(
-                                    text = if (priceIncreaseAlerts.isNotEmpty()) {
-                                        "↑ ${priceIncreaseAlerts.size} ingredient price increase(s) detected"
-                                    } else {
-                                        "${pricingSummaries.size} ingredient rates tracked (Latest vs Previous)"
-                                    },
-                                    color = if (priceIncreaseAlerts.isNotEmpty()) Color(0xFFFCA5A5) else TextGray,
-                                    fontSize = 11.sp
-                                )
-                            }
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                if (onExportPricingCsv != null) {
-                                    OutlinedButton(
-                                        onClick = onExportPricingCsv,
-                                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.6f)),
-                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF34D399)),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                        shape = RoundedCornerShape(8.dp),
-                                        modifier = Modifier.height(32.dp)
-                                    ) {
-                                        Text("Excel CSV", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                                if (onSyncPricingToSheets != null) {
-                                    Button(
-                                        onClick = onSyncPricingToSheets,
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = Color(0xFF10B981),
-                                            contentColor = Color.Black
-                                        ),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                        shape = RoundedCornerShape(8.dp),
-                                        modifier = Modifier.height(32.dp)
-                                    ) {
-                                        Text("Sync Sheet", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
+                            Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Export .xlsx", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
-                        if (priceIncreaseAlerts.isNotEmpty()) {
-                            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                items(priceIncreaseAlerts.take(8), key = { "hike_${it.itemName}" }) { alert ->
-                                    Surface(
-                                        color = Color(0xFFEF4444).copy(alpha = 0.16f),
-                                        border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.45f)),
-                                        shape = RoundedCornerShape(8.dp)
-                                    ) {
-                                        Text(
-                                            text = "${alert.itemName}: ₹${String.format(Locale.US, "%.0f", alert.previousRate ?: 0.0)} → ₹${String.format(Locale.US, "%.0f", alert.latestRate)} (+${String.format(Locale.US, "%.0f", alert.priceChangePercent)}%)",
-                                            color = Color(0xFFFCA5A5),
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                        )
-                                    }
-                                }
+
+                        if (onSyncPricingToSheets != null) {
+                            OutlinedButton(
+                                onClick = { onSyncPricingToSheets(includeDateInCells) },
+                                border = BorderStroke(1.dp, SurfaceVariantColor),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(38.dp)
+                            ) {
+                                Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Sync Sheet", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -668,7 +272,6 @@ fun InventoryOrderScreen(
             }
         }
 
-        // Visible Queued Bills Retry Banner (never leaves shared receipts in limbo)
         if (state.pendingReceiptQueue.isNotEmpty()) {
             item(key = "pending_receipt_queue") {
                 Card(
@@ -679,54 +282,32 @@ fun InventoryOrderScreen(
                 ) {
                     Column(
                         modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Text(
-                            text = "⏳ ${state.pendingReceiptQueue.size} Queued Receipt(s) Waiting for AI Scan",
+                            text = "${state.pendingReceiptQueue.size} Queued Receipt(s) Waiting for Retry",
                             color = AmberAccent,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.ExtraBold
                         )
                         state.pendingReceiptQueue.forEach { intake ->
                             Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(DarkBackground.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
-                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = intake.sourceLabel,
-                                        color = Color.White,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    if (intake.lastError.isNotBlank()) {
-                                        Text(
-                                            text = "Attempts: ${intake.attemptCount} • ${intake.lastError}",
-                                            color = Color(0xFFFCA5A5),
-                                            fontSize = 10.sp,
-                                            maxLines = 2
-                                        )
-                                    }
-                                }
+                                Text(
+                                    text = intake.sourceLabel,
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.weight(1f)
+                                )
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Button(
-                                        onClick = { onRetryQueuedReceipt(intake.id) },
-                                        colors = ButtonDefaults.buttonColors(containerColor = AmberAccent, contentColor = Color.Black),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                        shape = RoundedCornerShape(8.dp),
-                                        modifier = Modifier.height(30.dp)
-                                    ) {
-                                        Text("Retry AI", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    TextButton(onClick = { onRetryQueuedReceipt(intake.id) }) {
+                                        Text("Retry", color = AmberAccent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                     }
-                                    TextButton(
-                                        onClick = { onDismissQueuedReceipt(intake.id) },
-                                        contentPadding = PaddingValues(horizontal = 6.dp),
-                                        modifier = Modifier.height(30.dp)
-                                    ) {
+                                    TextButton(onClick = { onDismissQueuedReceipt(intake.id) }) {
                                         Text("Clear", color = TextGray, fontSize = 11.sp)
                                     }
                                 }
@@ -737,73 +318,213 @@ fun InventoryOrderScreen(
             }
         }
 
-        // Orders List
-        if (displayOrders.isEmpty()) {
-            item(key = "empty_state") {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 40.dp)
+        item(key = "matrix_controls") {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ReceiptLong,
-                        contentDescription = null,
-                        modifier = Modifier.size(52.dp),
-                        tint = SurfaceVariantColor
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text("Search SKU name...", color = TextGray, fontSize = 12.sp) },
+                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = TextGray, modifier = Modifier.size(18.dp)) },
+                        trailingIcon = {
+                            if (searchQuery.isNotBlank()) {
+                                IconButton(onClick = { searchQuery = "" }, modifier = Modifier.size(20.dp)) {
+                                    Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextGray)
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AmberAccent,
+                            unfocusedBorderColor = SurfaceVariantColor,
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            cursorColor = AmberAccent,
+                            focusedContainerColor = SurfaceColor,
+                            unfocusedContainerColor = SurfaceColor
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        singleLine = true
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
+
+                    FilterChip(
+                        selected = includeDateInCells,
+                        onClick = { includeDateInCells = !includeDateInCells },
+                        label = {
+                            Text(
+                                text = if (includeDateInCells) "Dates On" else "Numbers Only",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AmberAccent,
+                            selectedLabelColor = Color.Black,
+                            containerColor = SurfaceColor,
+                            labelColor = TextGray
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                }
+
+                if (anomalyCount > 0) {
                     Text(
-                        text = if (searchQuery.isNotBlank()) "No orders match \"$searchQuery\""
-                               else "No inventory orders found for $dateRangeLabel",
-                        color = Color.White,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp
+                        text = "$anomalyCount SKU(s) have a >3x/<0.3x unit jump flagged CHECK UNIT (excluded from % change).",
+                        color = Color(0xFFFBBF24),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = if (searchQuery.isNotBlank()) "Try searching for a different supplier or item"
-                               else "Add a bill using the '+ Add Bill' button above",
-                        color = TextGray,
-                        fontSize = 12.sp
-                    )
-                    if (dateFilter != "ALL_TIME") {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        OutlinedButton(
-                            onClick = { dateFilter = "ALL_TIME" },
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberAccent),
-                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.4f)),
-                            shape = RoundedCornerShape(8.dp)
+                }
+            }
+        }
+
+        item(key = "sku_price_history_table") {
+            if (filteredRows.isEmpty()) {
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = SurfaceColor),
+                    border = BorderStroke(1.dp, SurfaceVariantColor),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(28.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = if (searchQuery.isNotBlank()) "No SKUs matching \"$searchQuery\"" else "No supplier bills recorded yet",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Upload bills on WhatsApp or tap + Add Bill to track SKU prices.",
+                            color = TextGray,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            } else {
+                val horizontalScroll = rememberScrollState()
+                val billColsCount = resolvedMatrix.maxBillColumns.coerceAtLeast(1)
+
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = SurfaceColor),
+                    border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.8f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.horizontalScroll(horizontalScroll)) {
+                        Row(
+                            modifier = Modifier
+                                .background(SurfaceVariantColor.copy(alpha = 0.65f))
+                                .padding(horizontal = 10.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("View All Time Orders", fontSize = 12.sp)
+                            Text("SKU Name", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black, modifier = Modifier.width(170.dp))
+                            Text("Unit / Weight", color = TextGray, fontSize = 11.sp, fontWeight = FontWeight.Black, modifier = Modifier.width(105.dp))
+                            Text("Latest (₹)", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black, modifier = Modifier.width(85.dp))
+                            Text("vs First %", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black, modifier = Modifier.width(90.dp))
+                            for (b in 1..billColsCount) {
+                                Text("Bill $b", color = AmberAccent, fontSize = 11.sp, fontWeight = FontWeight.Black, modifier = Modifier.width(105.dp))
+                            }
+                        }
+
+                        HorizontalDivider(color = SurfaceVariantColor)
+
+                        filteredRows.forEachIndexed { idx, row ->
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = row.skuName,
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.width(170.dp).padding(end = 6.dp)
+                                )
+                                Text(
+                                    text = row.unitWeightLabel,
+                                    color = TextGray,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    modifier = Modifier.width(105.dp)
+                                )
+                                Text(
+                                    text = "₹${formatCompactRate(row.latestPrice)}",
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Black,
+                                    modifier = Modifier.width(85.dp)
+                                )
+                                val pct = row.priceChangeVsFirstPct
+                                val pctText = if (pct != null) {
+                                    "${if (pct > 0) "+" else ""}${String.format(Locale.US, "%.1f", pct)}%"
+                                } else {
+                                    "0.0%"
+                                }
+                                val pctColor = when {
+                                    pct != null && pct > 0.0 -> Color(0xFFFCA5A5)
+                                    pct != null && pct < 0.0 -> Color(0xFF34D399)
+                                    else -> TextGray
+                                }
+                                Box(modifier = Modifier.width(90.dp)) {
+                                    Surface(
+                                        color = when {
+                                            pct != null && pct > 0.0 -> Color(0xFFEF4444).copy(alpha = 0.2f)
+                                            pct != null && pct < 0.0 -> Color(0xFF10B981).copy(alpha = 0.16f)
+                                            else -> Color.Transparent
+                                        },
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Text(
+                                            text = pctText,
+                                            color = pctColor,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+
+                                for (bIdx in 0 until billColsCount) {
+                                    val bill = row.bills.getOrNull(bIdx)
+                                    val cellText = bill?.formatCell(includeDateInCells) ?: "—"
+                                    val cellColor = when {
+                                        bill == null -> TextGray.copy(alpha = 0.4f)
+                                        bill.isUnitAnomaly -> Color(0xFFFBBF24)
+                                        else -> Color.White.copy(alpha = 0.9f)
+                                    }
+                                    Text(
+                                        text = cellText,
+                                        color = cellColor,
+                                        fontSize = 11.sp,
+                                        fontWeight = if (bill?.isUnitAnomaly == true) FontWeight.Bold else FontWeight.Normal,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.width(105.dp).padding(end = 6.dp)
+                                    )
+                                }
+                            }
+                            if (idx < filteredRows.lastIndex) {
+                                HorizontalDivider(color = SurfaceVariantColor.copy(alpha = 0.45f))
+                            }
                         }
                     }
                 }
             }
-        } else {
-            items(displayOrders, key = { it.order.orderId }) { orderWithItems ->
-                InventoryOrderCard(
-                    orderWithItems = orderWithItems,
-                    onDelete = { onDeleteOrder(orderWithItems.order.orderId) }
-                )
-            }
         }
     }
 
-    // Custom Date Range Picker Dialog
-    if (showCustomDateDialog) {
-        CustomDateRangePickerDialog(
-            onDismiss = { showCustomDateDialog = false },
-            onDateRangeApplied = { start, end ->
-                customStartMs = start
-                customEndMs = end
-                dateFilter = "CUSTOM"
-                showCustomDateDialog = false
-            }
-        )
-    }
-
-    // Dialogs triggered by ViewModel state
     if (state.showAddInventoryOrderDialog) {
         AddInventoryOrderDialog(
             inventoryItems = inventoryItems,
@@ -828,7 +549,6 @@ fun InventoryOrderScreen(
         )
     }
 
-    // Delete confirmation
     state.inventoryOrderToDelete?.let { orderId ->
         AlertDialog(
             onDismissRequest = onDismissDeleteOrder,
@@ -851,305 +571,12 @@ fun InventoryOrderScreen(
     }
 }
 
-@Composable
-fun InventoryOrderCard(
-    orderWithItems: InventoryOrderWithItems,
-    onDelete: () -> Unit
-) {
-    val order = orderWithItems.order
-    val items = orderWithItems.items
-    val sdf = remember { SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()) }
-    val dateStr = remember(order.timestamp) { sdf.format(Date(order.timestamp)) }
-    var isExpanded by remember { mutableStateOf(false) }
-
-    Card(
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = SurfaceColor),
-        border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.8f)),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { isExpanded = !isExpanded }
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            // Header Row: Order ID badge, Supplier, Date & Time on left; Amount & Expand on right
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Top
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Surface(
-                            color = AmberAccent.copy(alpha = 0.15f),
-                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.4f)),
-                            shape = RoundedCornerShape(6.dp)
-                        ) {
-                            Text(
-                                text = order.orderId,
-                                color = AmberAccent,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                            )
-                        }
-
-                        val isOrderSynced = order.syncStatus.equals("SYNCED", ignoreCase = true)
-                        Surface(
-                            color = if (isOrderSynced) Color(0xFF10B981).copy(alpha = 0.16f) else AmberAccent.copy(alpha = 0.16f),
-                            shape = RoundedCornerShape(6.dp)
-                        ) {
-                            Text(
-                                text = if (isOrderSynced) "Synced ✓" else "Pending Sync",
-                                color = if (isOrderSynced) Color(0xFF34D399) else AmberAccent,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-
-                        if (order.supplierName.isNotBlank()) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Default.LocalShipping,
-                                    contentDescription = null,
-                                    tint = TextGray,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = order.supplierName,
-                                    color = Color.White,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Schedule,
-                            contentDescription = null,
-                            tint = TextGray,
-                            modifier = Modifier.size(12.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = dateStr,
-                            color = TextGray,
-                            fontSize = 11.sp
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.width(12.dp))
-
-                // Right side: Total Amount & Expand Arrow
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text(
-                            text = "₹${String.format(Locale.US, "%,.2f", order.totalAmount)}",
-                            color = Color.White,
-                            fontWeight = FontWeight.Black,
-                            fontSize = 17.sp
-                        )
-                        Text(
-                            text = "${items.size} ${if (items.size == 1) "item" else "items"}",
-                            color = TextGray,
-                            fontSize = 11.sp
-                        )
-                    }
-
-                    Icon(
-                        imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                        contentDescription = if (isExpanded) "Collapse" else "Expand",
-                        tint = AmberAccent,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
-            }
-
-            // Optional Notes row
-            if (order.notes.isNotBlank()) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Surface(
-                    color = SurfaceVariantColor.copy(alpha = 0.4f),
-                    shape = RoundedCornerShape(6.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Description,
-                            contentDescription = null,
-                            tint = TextGray,
-                            modifier = Modifier.size(13.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = order.notes,
-                            color = TextGray,
-                            fontSize = 11.sp,
-                            maxLines = if (isExpanded) 10 else 1
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            // Items Content: Preview when collapsed, Detailed Table when expanded
-            if (!isExpanded) {
-                // Collapsed: preview items
-                Surface(
-                    color = SurfaceVariantColor.copy(alpha = 0.35f),
-                    border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.4f)),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(8.dp)) {
-                        val previewItems = items.take(2)
-                        previewItems.forEach { item ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 2.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "• ${item.itemName} (${item.quantity.let { if (it % 1 == 0.0) it.toInt() else it }} ${item.unit})",
-                                    color = Color.White.copy(alpha = 0.85f),
-                                    fontSize = 12.sp,
-                                    maxLines = 1,
-                                    modifier = Modifier.weight(1f, fill = false)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "₹${String.format(Locale.US, "%,.2f", item.subtotal)}",
-                                    color = TextGray,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium
-                                )
-                            }
-                        }
-
-                        if (items.size > 2) {
-                            Text(
-                                text = "+ ${items.size - 2} more items (tap to view all)",
-                                color = AmberAccent,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
-                        }
-                    }
-                }
-            } else {
-                // Expanded: Full itemized table
-                Surface(
-                    color = SurfaceVariantColor.copy(alpha = 0.35f),
-                    border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.6f)),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(10.dp)) {
-                        // Table Header
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("ITEM", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(2f))
-                            Text("QTY", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            Text("RATE", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            Text("TOTAL", color = TextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1.2f))
-                        }
-
-                        HorizontalDivider(color = SurfaceVariantColor, modifier = Modifier.padding(bottom = 6.dp))
-
-                        // Table Rows
-                        items.forEach { item ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = item.itemName,
-                                    color = Color.White,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    modifier = Modifier.weight(2f),
-                                    maxLines = 2
-                                )
-                                Text(
-                                    text = "${item.quantity.let { if (it % 1 == 0.0) it.toInt() else it }} ${item.unit}",
-                                    color = TextGray,
-                                    fontSize = 12.sp,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text(
-                                    text = "₹${String.format(Locale.US, "%.2f", item.unitPrice)}",
-                                    color = TextGray,
-                                    fontSize = 12.sp,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text(
-                                    text = "₹${String.format(Locale.US, "%.2f", item.subtotal)}",
-                                    color = AmberAccent,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.weight(1.2f)
-                                )
-                            }
-                        }
-
-                        HorizontalDivider(color = SurfaceVariantColor, modifier = Modifier.padding(vertical = 8.dp))
-
-                        // Bottom action inside expanded card: Delete button
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Total: ₹${String.format(Locale.US, "%,.2f", order.totalAmount)}",
-                                color = Color.White,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-
-                            OutlinedButton(
-                                onClick = onDelete,
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFEF4444)),
-                                border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f)),
-                                shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier.height(32.dp)
-                            ) {
-                                Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(14.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Delete Bill", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
-                }
-            }
-        }
+private fun formatCompactRate(value: Double): String {
+    val rounded = kotlin.math.round(value * 100.0) / 100.0
+    return if (kotlin.math.abs(rounded - Math.round(rounded)) < 0.005) {
+        Math.round(rounded).toString()
+    } else {
+        String.format(Locale.US, "%.2f", rounded)
     }
 }
 
@@ -1261,7 +688,7 @@ fun AddInventoryOrderDialog(
                                 )
                                 if (!sharedErrorText.isNullOrBlank()) {
                                     Text(
-                                        text = "Could not auto-read everything ($sharedErrorText) — verify or retry AI scan below.",
+                                        text = "Could not auto-read everything ($sharedErrorText) â€” verify or retry AI scan below.",
                                         color = Color(0xFFFCA5A5),
                                         fontSize = 11.sp
                                     )
@@ -1329,7 +756,7 @@ fun AddInventoryOrderDialog(
                                                 shape = RoundedCornerShape(4.dp)
                                             ) {
                                                 Text(
-                                                    text = "= ₹${String.format(Locale.US, "%,.2f", rowSubtotal)}",
+                                                    text = "= â‚¹${String.format(Locale.US, "%,.2f", rowSubtotal)}",
                                                     color = AmberAccent,
                                                     fontSize = 11.sp,
                                                     fontWeight = FontWeight.Bold,
@@ -1544,7 +971,7 @@ fun AddInventoryOrderDialog(
                         
                         Column {
                             Text("Total Amount", color = TextGray, fontSize = 12.sp)
-                            Text("₹${String.format(Locale.US, "%.2f", total)}", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                            Text("â‚¹${String.format(Locale.US, "%.2f", total)}", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                         }
                         
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1703,13 +1130,13 @@ fun InventoryMasterDialog(
                                         )
                                         Spacer(modifier = Modifier.height(4.dp))
                                         Text(
-                                            text = "Category: ${item.category.ifBlank { "N/A" }} • Unit: ${item.unit} • Stock: ${item.currentStock}",
+                                            text = "Category: ${item.category.ifBlank { "N/A" }} â€¢ Unit: ${item.unit} â€¢ Stock: ${item.currentStock}",
                                             color = TextGray,
                                             fontSize = 12.sp
                                         )
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(
-                                            text = "Default Price: ₹${item.defaultPrice}",
+                                            text = "Default Price: â‚¹${item.defaultPrice}",
                                             color = AmberAccent,
                                             fontSize = 13.sp,
                                             fontWeight = FontWeight.SemiBold

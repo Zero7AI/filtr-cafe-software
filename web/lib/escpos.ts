@@ -185,8 +185,28 @@ export function buildEscPosReceipt(
 }
 
 // ==================== WEB BLUETOOTH PRINTER CLIENT ====================
-let bluetoothDevice: any = null;
-let writeCharacteristic: any = null;
+interface BluetoothCharacteristicLike {
+  properties: { write?: boolean; writeWithoutResponse?: boolean };
+  writeValue: (value: BufferSource) => Promise<void>;
+  writeValueWithoutResponse?: (value: BufferSource) => Promise<void>;
+}
+
+interface BluetoothDeviceLike {
+  name?: string;
+  gatt?: {
+    connected?: boolean;
+    connect: () => Promise<{
+      getPrimaryServices: () => Promise<Array<{
+        getCharacteristics: () => Promise<BluetoothCharacteristicLike[]>;
+      }>>;
+    }>;
+    disconnect: () => void;
+  };
+  addEventListener: (event: string, cb: () => void) => void;
+}
+
+let bluetoothDevice: BluetoothDeviceLike | null = null;
+let writeCharacteristic: BluetoothCharacteristicLike | null = null;
 
 export function isBluetoothSupported(): boolean {
   return typeof navigator !== 'undefined' && 'bluetooth' in navigator;
@@ -198,7 +218,10 @@ export async function connectBluetoothPrinter(): Promise<{ success: boolean; nam
   }
 
   try {
-    const device = await (navigator as any).bluetooth.requestDevice({
+    const nav = navigator as unknown as {
+      bluetooth: { requestDevice: (opts: unknown) => Promise<BluetoothDeviceLike> };
+    };
+    const device = await nav.bluetooth.requestDevice({
       acceptAllDevices: true,
       optionalServices: [
         '000018f0-0000-1000-8000-00805f9b34fb', // Standard Thermal Printer Service
@@ -208,7 +231,7 @@ export async function connectBluetoothPrinter(): Promise<{ success: boolean; nam
       ],
     });
 
-    if (!device) {
+    if (!device || !device.gatt) {
       return { success: false, error: 'No printer device selected' };
     }
 
@@ -244,12 +267,13 @@ export async function connectBluetoothPrinter(): Promise<{ success: boolean; nam
     }
 
     return { success: false, error: 'No writable thermal printer characteristic found' };
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error('Bluetooth connection failed:', err);
-    if (err.name === 'NotFoundError' || err.message?.includes('cancelled')) {
+    const e = err as { name?: string; message?: string };
+    if (e?.name === 'NotFoundError' || e?.message?.includes('cancelled')) {
       return { success: false, error: 'Selection cancelled' };
     }
-    return { success: false, error: err.message || 'Connection failed' };
+    return { success: false, error: e?.message || 'Connection failed' };
   }
 }
 

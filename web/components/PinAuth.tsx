@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { Lock, Coffee, Delete, Sun, Moon } from 'lucide-react';
+import Link from 'next/link';
+import { Lock, Coffee, Delete, Sun, Moon, ShieldCheck } from 'lucide-react';
 import { verifyStaffPin } from '@/lib/pin';
 
 interface PinAuthProps {
@@ -37,8 +38,25 @@ export default function PinAuth({ onSuccess, theme = 'dark', onToggleTheme }: Pi
     setError('');
   };
 
-  const verifyPin = (inputPin: string) => {
-    if (verifyStaffPin(inputPin)) {
+  const verifyPin = async (inputPin: string) => {
+    let isValid = verifyStaffPin(inputPin);
+    if (!isValid) {
+      try {
+        const res = await fetch('/api/pos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'verifyPin', pin: inputPin }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          isValid = Boolean(data.valid);
+        }
+      } catch {
+        // Fallback already checked locally
+      }
+    }
+
+    if (isValid) {
       try {
         localStorage.setItem('filtr_tablet_auth', 'true');
         localStorage.setItem('filtr_tablet_auth_time', Date.now().toString());
@@ -192,6 +210,18 @@ export default function PinAuth({ onSuccess, theme = 'dark', onToggleTheme }: Pi
           >
             <Delete className="h-6 w-6" />
           </button>
+        </div>
+
+        <div className="mt-5 pt-4 border-t border-zinc-200 dark:border-zinc-800 text-center">
+          <Link
+            href="/admin"
+            className={`inline-flex items-center gap-1.5 text-xs font-bold transition ${
+              isDark ? 'text-amber-400 hover:text-amber-300' : 'text-amber-600 hover:text-amber-700'
+            }`}
+          >
+            <ShieldCheck className="h-3.5 w-3.5" />
+            <span>Open Admin Portal →</span>
+          </Link>
         </div>
       </div>
     </div>

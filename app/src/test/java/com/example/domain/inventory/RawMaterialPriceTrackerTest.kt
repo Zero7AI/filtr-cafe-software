@@ -129,12 +129,95 @@ class RawMaterialPriceTrackerTest {
 
         val csv = RawMaterialPriceTracker.buildIngredientPricingCsv(summaries, listOf(bill1, bill2))
         assertTrue(csv.startsWith("\uFEFF"))
-        assertTrue(csv.contains("DATE-WISE PRICE HISTORY & REORDER MATRIX"))
+        assertTrue(csv.contains("SKU Name"))
+        assertTrue(csv.contains("Unit / Weight"))
+        assertTrue(csv.contains("Latest Price (INR)"))
+        assertTrue(csv.contains("Price Change vs First (%)"))
         assertTrue(csv.contains("Full Cream Milk"))
-        assertTrue(csv.contains("Blinkit Wholesale"))
-        assertTrue(csv.contains("72.00"))
-        assertTrue(csv.contains("65.00"))
-        assertTrue(csv.contains("INV-20261126-002"))
+        assertTrue(csv.contains("Bill 1"))
+        assertTrue(csv.contains("Bill 2"))
+    }
+
+    @Test
+    fun `resolvePackUnitPrice prevents false pack multiplication spikes and flags gt3x CHECK UNIT`() {
+        val periPeri = InventoryItemEntity(
+            id = 10,
+            name = "Peri Peri Seasoning",
+            category = "Spices",
+            unit = "g",
+            standardQuantity = 250.0,
+            defaultPrice = 135.0
+        )
+        val water = InventoryItemEntity(
+            id = 11,
+            name = "Water Bottle (500ml)",
+            category = "Beverages",
+            unit = "pcs",
+            standardQuantity = 24.0,
+            defaultPrice = 130.0
+        )
+        // Billed as 1 pcs for ₹140 -> stays ₹140 (NOT ₹35,000!)
+        val periLine = InventoryOrderItemEntity(orderId = "INV-P1", itemName = "Peri Peri", quantity = 1.0, unit = "pcs", unitPrice = 140.0, subtotal = 140.0)
+        assertEquals(140.0, RawMaterialPriceTracker.resolvePackUnitPrice(periLine, periPeri), 0.01)
+
+        // Billed as 1 pcs (one 24-pack) for ₹130 -> stays ₹130 (NOT ₹3,120!)
+        val waterLine = InventoryOrderItemEntity(orderId = "INV-W1", itemName = "Water", quantity = 1.0, unit = "pcs", unitPrice = 130.0, subtotal = 130.0)
+        assertEquals(130.0, RawMaterialPriceTracker.resolvePackUnitPrice(waterLine, water), 0.01)
+
+        // Build compact Bill 1..N matrix + CHECK UNIT (>3x jump) + 2-sheet .xlsx export
+        val b1 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-P1", 1_761_600_000_000L, "Metro", 135.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(1, "INV-P1", "Peri Peri", 1.0, "pcs", 135.0, 135.0))
+        )
+        val b2 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-P2", 1_762_000_000_000L, "Metro", 500.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(2, "INV-P2", "Peri Peri", 1.0, "g", 500.0, 500.0)) // 500 INR/g -> 125000 INR -> CHECK UNIT!
+        )
+        val b3 = InventoryOrderWithItems(
+            order = InventoryOrderEntity("INV-P3", 1_763_000_000_000L, "Metro", 150.0, "", "SYNCED"),
+            items = listOf(InventoryOrderItemEntity(3, "INV-P3", "Peri Peri", 1.0, "pcs", 150.0, 150.0))
+        )
+
+        val skuMatrix = RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(
+            inventoryItems = listOf(periPeri, water),
+            inventoryOrders = listOf(b3, b1, b2) // out-of-order input tests chronological sort
+        )
+        assertEquals(1, skuMatrix.rows.size)
+        val row = skuMatrix.rows.first()
+        assertEquals("Peri Peri Seasoning", row.skuName)
+        assertEquals("per 250g pack", row.unitWeightLabel)
+        assertEquals(150.0, row.latestPrice, 0.01) // spike excluded from latestPrice!
+        assertTrue(row.hasUnitAnomaly)
+        assertTrue(row.bills[1].isUnitAnomaly)
+        assertTrue(row.bills[1].formatCell(false) == "CHECK UNIT")
+
+        val ledger = RawMaterialPriceTracker.buildBillLedger(listOf(periPeri, water), listOf(b1, b2, b3))
+        val xlsxBytes = XlsxWorkbookBuilder.buildSkuPriceHistoryXlsx(skuMatrix, ledger, includeDateInCells = true)
+        assertTrue(xlsxBytes.size > 500)
+        // Verify ZIP magic bytes 'P','K'
+        assertEquals('P'.code.toByte(), xlsxBytes[0])
+        assertEquals('K'.code.toByte(), xlsxBytes[1])
+    }
+
+    @Test
+    fun `inventoryUsageCalculator computes exact recipe usage scaled to kg and L`() {
+        val milkItem = milk
+        val beansItem = beans
+        val recipes = listOf(
+            com.example.data.entity.InventoryUsageEntity(id = 1, menuItemId = 10, menuItemName = "Iced Latte", inventoryItemId = milkItem.id, inventoryItemName = milkItem.name, quantityUsed = 200.0, unit = "ml"),
+            com.example.data.entity.InventoryUsageEntity(id = 2, menuItemId = 10, menuItemName = "Iced Latte", inventoryItemId = beansItem.id, inventoryItemName = beansItem.name, quantityUsed = 18.0, unit = "g")
+        )
+        val order = com.example.data.entity.OrderWithItems(
+            order = com.example.data.entity.OrderEntity(orderId = "FLT-1", customerName = "Walk-in", contactNumber = "", totalAmount = 1500.0, timestamp = 1_764_000_000_000L),
+            items = listOf(com.example.data.entity.OrderItemEntity(id = 1, orderId = "FLT-1", menuItemId = 10, itemName = "Iced Latte", itemPrice = 150.0, quantity = 10, subtotal = 1500.0))
+        )
+        val report = InventoryUsageCalculator.computeIngredientUsage(listOf(order), listOf(milkItem, beansItem), recipes)
+        assertEquals(1, report.ordersCount)
+        assertEquals(2, report.items.size)
+        val beansRow = report.items.first { it.inventoryItemId == beansItem.id }
+        val milkRow = report.items.first { it.inventoryItemId == milkItem.id }
+        assertEquals("180 g", beansRow.exactUsageLabel)
+        assertEquals("2 L", milkRow.exactUsageLabel)
     }
 
     @Test

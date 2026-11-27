@@ -3648,6 +3648,23 @@ class FiltrRepository(
         )
     }
 
+    suspend fun syncSkuPriceHistoryToSheets(
+        webhookUrl: String,
+        includeDateInCells: Boolean = true
+    ): Result<String> {
+        if (webhookUrl.isBlank()) return Result.failure(IllegalArgumentException("Webhook URL not configured"))
+        val masterItems = try { allInventoryItems.first() } catch (_: Exception) { emptyList() }
+        val allOrders = try { allInventoryOrders.first() } catch (_: Exception) { emptyList() }
+        val matrix = RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(masterItems, allOrders)
+        val ledger = RawMaterialPriceTracker.buildBillLedger(masterItems, allOrders)
+        return sheetsSyncService.syncSkuPriceHistoryToGoogleSheets(
+            webhookUrl = webhookUrl,
+            matrix = matrix,
+            ledger = ledger,
+            includeDateInCells = includeDateInCells
+        )
+    }
+
     suspend fun syncInventoryPurchaseToSheets(
         webhookUrl: String,
         order: InventoryOrderEntity,
@@ -3665,12 +3682,13 @@ class FiltrRepository(
             usages = usages,
             priceAlertThresholdPct = priceAlertThresholdPct
         )
-        return sheetsSyncService.syncInventoryPurchaseToGoogleSheets(
+        val skuMatrix = RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(masterItems, allOrders)
+        val billLedger = RawMaterialPriceTracker.buildBillLedger(masterItems, allOrders)
+        return sheetsSyncService.syncSkuPriceHistoryToGoogleSheets(
             webhookUrl = webhookUrl,
-            order = order,
-            items = items,
-            pricingSummaries = summaries,
-            priceMatrix = matrix
+            matrix = skuMatrix,
+            ledger = billLedger,
+            includeDateInCells = true
         )
     }
 

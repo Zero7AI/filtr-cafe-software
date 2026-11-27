@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import {
   Coffee,
   ShoppingBag,
@@ -13,6 +14,7 @@ import {
   KeyRound,
   Sun,
   Moon,
+  ShieldCheck,
 } from 'lucide-react';
 import { connectBluetoothPrinter, isBluetoothSupported } from '@/lib/escpos';
 import ChangePinModal from './ChangePinModal';
@@ -214,6 +216,20 @@ export default function Navbar({
           <KeyRound className="h-4 w-4 text-amber-500" />
           <span className="hidden sm:inline">Change PIN</span>
         </button>
+
+        {/* Admin Portal Link */}
+        <Link
+          href="/admin"
+          title="Open FILTR Admin Command Center"
+          className={`flex items-center gap-1.5 rounded-xl border px-2.5 sm:px-3 py-2 text-xs font-bold transition ${
+            isDark
+              ? 'border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+              : 'border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 shadow-sm'
+          }`}
+        >
+          <ShieldCheck className="h-4 w-4" />
+          <span className="hidden sm:inline">Admin</span>
+        </Link>
 
         {/* Lock / Logout */}
         <button

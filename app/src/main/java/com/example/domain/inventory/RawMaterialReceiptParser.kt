@@ -31,6 +31,53 @@ object RawMaterialReceiptParser {
         }
     }
 
+    private val NON_INGREDIENT_EQUIPMENT_KEYWORDS = setOf(
+        "stand", "dispenser", "cover", "machine", "basket", "repair", "repairs",
+        "rent", "electricity", "wifi", "wi-fi", "rapido", "courier", "paint",
+        "table", "chair", "shelf", "rack", "stool", "signage", "board", "banner",
+        "delivery", "transport", "freight"
+    )
+
+    private val SKU_ALIAS_MAP: List<Pair<Regex, String>> = listOf(
+        Regex("\\b(tht|tnt|tkt)\\s*(vanilla|vancia)\\b") to "vanilla base ice cream",
+        Regex("\\bgallon\\s+vanilla\\b") to "vanilla base ice cream",
+        Regex("\\bvanilla\\s*5\\s*(l|lt|ltr)\\b") to "vanilla base ice cream",
+        Regex("\\bperi\\s*[-]?\\s*peri\\b") to "peri peri seasoning",
+        Regex("\\b(pama|pamac)\\b") to "caramel sauce pamac",
+        Regex("\\bdoodh\\b") to "milk",
+        Regex("\\bcheeni\\b") to "sugar",
+        Regex("\\bmonin\\s+caramel(\\s+syrup)?\\b") to "monin caramel syrup"
+    )
+
+    private val PACK_SUFFIX_REGEX = Regex(
+        "\\b\\d+(?:\\.\\d+)?\\s*(?:kgs?|kilograms?|gms?|grams?|g|ltrs?|litres?|liters?|lt|l|mls?|ml|pcs?|pieces?|nos?|pkts?|packs?|packets?|btls?|bottles?|tins?|cans?|jars?|boxes?)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val GENERIC_SINGLE_TOKENS = setOf("water", "ice", "milk", "sugar", "cup", "cups", "sauce", "syrup", "base", "powder")
+
+    fun normalizeSkuMatchText(raw: String): String {
+        var normalized = raw.trim().lowercase(Locale.US)
+        for ((pattern, replacement) in SKU_ALIAS_MAP) {
+            if (pattern.containsMatchIn(normalized)) {
+                normalized = normalized.replace(pattern, replacement)
+            }
+        }
+        normalized = normalized
+            .replace(PACK_SUFFIX_REGEX, " ")
+            .replace(Regex("[^a-z0-9\\s]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return normalized
+    }
+
+    fun isLikelyNonIngredientHardware(rawName: String): Boolean {
+        val tokens = rawName.trim().lowercase(Locale.US)
+            .split(Regex("[^a-z0-9-]+"))
+            .filter { it.isNotBlank() }
+        return tokens.any { it in NON_INGREDIENT_EQUIPMENT_KEYWORDS }
+    }
+
     fun matchCatalogItem(
         rawName: String,
         catalog: List<InventoryItemEntity>
@@ -38,28 +85,48 @@ object RawMaterialReceiptParser {
         val clean = rawName.trim()
         if (clean.isEmpty() || catalog.isEmpty()) return null
 
+        // Exact case-insensitive match always wins
         catalog.firstOrNull { it.name.equals(clean, ignoreCase = true) }?.let { return it }
 
-        val cleanLower = clean.lowercase(Locale.US)
-        val cleanTokens = cleanLower
-            .split(Regex("[^a-z0-9]+"))
-            .filter { it.length >= 3 }
-            .toSet()
+        // Guard: never coerce non-consumable store hardware (e.g. "3 Tier Water Dispenser Stand") into consumables
+        if (isLikelyNonIngredientHardware(clean)) return null
+
+        val cleanNorm = normalizeSkuMatchText(clean)
+        if (cleanNorm.isEmpty()) return null
+
+        val cleanTokens = cleanNorm.split(" ").filter { it.length >= 2 }.toSet()
 
         return catalog
             .mapNotNull { candidate ->
-                val candLower = candidate.name.trim().lowercase(Locale.US)
+                val candRaw = candidate.name.trim()
+                val candNorm = normalizeSkuMatchText(candRaw)
+                if (candNorm.isEmpty()) return@mapNotNull null
+
+                if (candNorm == cleanNorm) {
+                    return@mapNotNull candidate to 150
+                }
+
+                val candTokens = candNorm.split(" ").filter { it.length >= 2 }.toSet()
+                val meaningfulClean = cleanTokens.filter { it.length >= 3 }.toSet()
+                val meaningfulCand = candTokens.filter { it.length >= 3 }.toSet()
+                val overlap = meaningfulClean.intersect(meaningfulCand)
+
+                val minLen = minOf(meaningfulClean.size, meaningfulCand.size).coerceAtLeast(1)
+                val maxLen = maxOf(meaningfulClean.size, meaningfulCand.size).coerceAtLeast(1)
+                val shorterCoverage = overlap.size.toDouble() / minLen.toDouble()
+                val jaccard = overlap.size.toDouble() / (meaningfulClean.size + meaningfulCand.size - overlap.size).coerceAtLeast(1).toDouble()
+
+                // Prevent naive substring collision like "water" matching a long unrelated phrase
+                val isSingleGenericOverlap = overlap.size == 1 &&
+                    overlap.first() in GENERIC_SINGLE_TOKENS &&
+                    meaningfulClean.size >= 4
+
                 val score = when {
-                    candLower.contains(cleanLower) || cleanLower.contains(candLower) -> 100
-                    cleanTokens.isNotEmpty() -> {
-                        val candTokens = candLower.split(Regex("[^a-z0-9]+")).filter { it.length >= 3 }.toSet()
-                        val overlap = cleanTokens.intersect(candTokens).size
-                        if (overlap > 0 && overlap * 2 >= minOf(cleanTokens.size, candTokens.size).coerceAtLeast(1)) {
-                            50 + overlap * 10
-                        } else {
-                            0
-                        }
-                    }
+                    isSingleGenericOverlap -> 0
+                    (candNorm.contains(cleanNorm) || cleanNorm.contains(candNorm)) &&
+                        (minOf(cleanTokens.size, candTokens.size) >= 2 || maxLen <= 3) -> 120 + overlap.size * 5
+                    shorterCoverage >= 0.6 && jaccard >= 0.35 ->
+                        (60 + shorterCoverage * 30 + jaccard * 20).toInt()
                     else -> 0
                 }
                 if (score > 0) candidate to score else null

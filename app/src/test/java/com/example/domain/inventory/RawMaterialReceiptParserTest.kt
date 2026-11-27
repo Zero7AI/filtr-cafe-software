@@ -20,6 +20,21 @@ class RawMaterialReceiptParserTest {
     )
 
     @Test
+    fun `matchCatalogItem normalizes noisy aliases and excludes store hardware`() {
+        val fullCatalog = catalog + listOf(
+            InventoryItemEntity(id = 4, name = "Monin Caramel Syrup", category = "Syrups", unit = "L", standardQuantity = 1.0, defaultPrice = 750.0),
+            InventoryItemEntity(id = 5, name = "Peri Peri Seasoning", category = "Spices", unit = "g", standardQuantity = 250.0, defaultPrice = 135.0),
+            InventoryItemEntity(id = 6, name = "Vanilla Base Ice Cream", category = "Dairy", unit = "L", standardQuantity = 5.0, defaultPrice = 480.0),
+            InventoryItemEntity(id = 7, name = "Water Bottle (500ml)", category = "Beverages", unit = "pcs", standardQuantity = 24.0, defaultPrice = 130.0)
+        )
+        assertEquals("Monin Caramel Syrup", RawMaterialReceiptParser.matchCatalogItem("MONIN CARAMEL SYRUP 1LTR", fullCatalog)?.name)
+        assertEquals("Peri Peri Seasoning", RawMaterialReceiptParser.matchCatalogItem("Peri Peri", fullCatalog)?.name)
+        assertEquals("Vanilla Base Ice Cream", RawMaterialReceiptParser.matchCatalogItem("THT VANILLA", fullCatalog)?.name)
+        assertEquals("Vanilla Base Ice Cream", RawMaterialReceiptParser.matchCatalogItem("TKT VANCIA", fullCatalog)?.name)
+        assertEquals(null, RawMaterialReceiptParser.matchCatalogItem("3 Tier Water Dispenser Can and Water Bottle Stand", fullCatalog))
+    }
+
+    @Test
     fun `normalizeUnit maps supplier units cleanly to supported app units`() {
         assertEquals("kg", RawMaterialReceiptParser.normalizeUnit("KGS"))
         assertEquals("L", RawMaterialReceiptParser.normalizeUnit("litres"))

@@ -50,6 +50,8 @@ import com.example.domain.attendance.MonthlyAttendanceSummary
 import com.example.domain.attendance.StoreGeofenceConfig
 import com.example.domain.attendance.TeamRollCallRow
 import com.example.domain.inventory.IngredientPriceSummary
+import com.example.domain.inventory.SkuPriceHistoryMatrix
+import com.example.domain.inventory.XlsxWorkbookBuilder
 import com.example.domain.inventory.ParsedRawMaterialReceipt
 import com.example.domain.inventory.PendingReceiptIntake
 import com.example.domain.inventory.PendingReceiptQueueStore
@@ -404,6 +406,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val inventoryOrders: StateFlow<List<InventoryOrderWithItems>> = repository.allInventoryOrders
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val skuPriceHistoryMatrix: StateFlow<SkuPriceHistoryMatrix> = combine(
+        inventoryItems,
+        inventoryOrders
+    ) { items, orders ->
+        RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(items, orders)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SkuPriceHistoryMatrix(0, emptyList()))
 
     val ingredientPricingSummaries: StateFlow<List<IngredientPriceSummary>> = combine(
         inventoryItems,
@@ -3577,6 +3586,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 repository.deleteInventoryOrder(orderId)
+                val url = _uiState.value.googleSheetsWebhookUrl.trim()
+                if (url.isNotBlank()) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        repository.syncSkuPriceHistoryToSheets(url)
+                    }
+                }
                 _uiState.update { it.copy(inventoryOrderToDelete = null, snackbarMessage = "Inventory order $orderId deleted") }
             } catch (e: Exception) {
                 _uiState.update { it.copy(inventoryOrderToDelete = null, snackbarMessage = "Failed to delete order: ${e.message}") }
@@ -5414,36 +5429,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(pendingReceiptQueue = refreshed) }
     }
 
-    fun syncIngredientPricingToSheets() {
+    fun syncIngredientPricingToSheets(includeDateInCells: Boolean = true) {
         if (!requireAdmin("Syncing pricing to Google Sheets")) return
         val url = _uiState.value.googleSheetsWebhookUrl.trim()
         if (url.isBlank()) {
-            _uiState.update { it.copy(snackbarMessage = "Configure Google Sheets Webhook URL in Settings first, or use Excel CSV Export.") }
+            _uiState.update { it.copy(snackbarMessage = "Configure Google Sheets Webhook URL in Settings first, or export .xlsx.") }
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
-            val summaries = ingredientPricingSummaries.value
-            val orders = inventoryOrders.value
-            val matrix = ingredientPriceMatrix.value
-            val res = repository.syncIngredientPricingToSheets(url, summaries, orders, matrix)
+            val res = repository.syncSkuPriceHistoryToSheets(url, includeDateInCells)
             val msg = res.getOrElse { "Sheets sync failed: ${it.message}" }
             _uiState.update { it.copy(snackbarMessage = msg) }
         }
     }
 
-    fun buildIngredientPricingCsvFile(context: Context): File {
-        val summaries = ingredientPricingSummaries.value
+    fun buildSkuPriceHistoryXlsxFile(context: Context, includeDateInCells: Boolean = true): File {
+        val items = inventoryItems.value
         val orders = inventoryOrders.value
-        val csvContent = RawMaterialPriceTracker.buildIngredientPricingCsv(
-            summaries = summaries,
-            inventoryOrders = orders,
-            inventoryItems = inventoryItems.value,
-            usages = inventoryUsages.value,
-            priceAlertThresholdPct = _uiState.value.priceAlertThresholdPct
+        val matrix = RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(items, orders)
+        val ledger = RawMaterialPriceTracker.buildBillLedger(items, orders)
+        val xlsxBytes = XlsxWorkbookBuilder.buildSkuPriceHistoryXlsx(
+            matrix = matrix,
+            ledger = ledger,
+            includeDateInCells = includeDateInCells
         )
         val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
         val exportDir = File(context.cacheDir, "inventory_reports").apply { mkdirs() }
-        val outFile = File(exportDir, "FILTR_Ingredient_Pricing_$dateStr.csv")
+        val outFile = File(exportDir, "FILTR_SKU_Price_History_$dateStr.xlsx")
+        outFile.writeBytes(xlsxBytes)
+        return outFile
+    }
+
+    fun buildIngredientPricingCsvFile(context: Context): File {
+        val matrix = RawMaterialPriceTracker.buildSkuPriceHistoryMatrix(
+            inventoryItems = inventoryItems.value,
+            inventoryOrders = inventoryOrders.value
+        )
+        val csvContent = RawMaterialPriceTracker.buildSkuPriceHistoryCsv(matrix, includeDateInCells = true)
+        val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+        val exportDir = File(context.cacheDir, "inventory_reports").apply { mkdirs() }
+        val outFile = File(exportDir, "FILTR_SKU_Price_History_$dateStr.csv")
         outFile.writeText(csvContent, Charsets.UTF_8)
         return outFile
     }

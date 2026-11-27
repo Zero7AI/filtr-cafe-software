@@ -90,7 +90,6 @@ export default function OrderBillModal({
   // Generate QR code data URL whenever upiPaymentUrl changes
   useEffect(() => {
     if (!upiPaymentUrl) {
-      setQrDataUrl('');
       return;
     }
 

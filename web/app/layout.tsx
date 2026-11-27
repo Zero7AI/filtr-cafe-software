@@ -13,18 +13,24 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "FILTR Coffee - Tablet POS & Orders",
-  description: "Tablet Point of Sale and Live Kitchen Display for FILTR Coffee",
+  title: "FILTR Coffee — Admin & POS",
+  description: "FILTR Coffee Admin Command Center, Live KDS, P&L, Inventory, Team & Tablet POS",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "FILTR Admin",
+  },
   icons: {
-    icon: "/favicon.ico",
+    icon: "/icons/icon-192.svg",
+    apple: "/icons/icon-192.svg",
   },
 };
 
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
+  maximumScale: 5,
   themeColor: "#09090b",
 };
 

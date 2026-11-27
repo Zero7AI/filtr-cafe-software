@@ -8,8 +8,10 @@ import com.example.data.entity.MenuItemEntity
 import com.example.data.entity.OrderEntity
 import com.example.data.entity.OrderItemEntity
 import com.example.data.entity.OrderWithItems
+import com.example.domain.inventory.BillLedgerRow
 import com.example.domain.inventory.IngredientPriceMatrix
 import com.example.domain.inventory.IngredientPriceSummary
+import com.example.domain.inventory.SkuPriceHistoryMatrix
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -662,6 +664,83 @@ class GoogleSheetsSyncService {
         }
     }
 
+    suspend fun syncSkuPriceHistoryToGoogleSheets(
+        webhookUrl: String,
+        matrix: SkuPriceHistoryMatrix,
+        ledger: List<BillLedgerRow>,
+        includeDateInCells: Boolean = true
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val cleanUrl = webhookUrl.trim()
+        if (cleanUrl.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Google Sheets Webhook URL is not configured."))
+        }
+
+        executeWithRetry("syncSkuPriceHistory(${matrix.rows.size})") {
+            try {
+                val urlWithParams = if (cleanUrl.contains("?")) "$cleanUrl&action=syncSkuPriceHistory" else "$cleanUrl?action=syncSkuPriceHistory"
+                val rowsArr = JSONArray()
+                for (row in matrix.rows) {
+                    val billsArr = JSONArray()
+                    row.bills.forEach { b ->
+                        billsArr.put(JSONObject().apply {
+                            put("billIndex", b.billIndex)
+                            put("price", b.price)
+                            put("dateLabel", b.dateLabel)
+                            put("cellText", b.formatCell(includeDateInCells))
+                            put("isUnitAnomaly", b.isUnitAnomaly)
+                            put("orderId", b.orderId)
+                            put("supplierName", b.supplierName)
+                        })
+                    }
+                    rowsArr.put(JSONObject().apply {
+                        put("skuName", row.skuName)
+                        put("unitWeightLabel", row.unitWeightLabel)
+                        put("latestPrice", row.latestPrice)
+                        put("priceChangeVsFirstPct", row.priceChangeVsFirstPct ?: 0.0)
+                        put("hasChangePct", row.priceChangeVsFirstPct != null)
+                        put("isPriceHike", row.isPriceHike)
+                        put("hasUnitAnomaly", row.hasUnitAnomaly)
+                        put("bills", billsArr)
+                    })
+                }
+
+                val ledgerArr = JSONArray()
+                ledger.forEach { l ->
+                    ledgerArr.put(JSONObject().apply {
+                        put("orderId", l.orderId)
+                        put("dateFormatted", l.dateFormatted)
+                        put("supplierName", l.supplierName)
+                        put("rawItemName", l.rawItemName)
+                        put("matchedSkuName", l.matchedSkuName)
+                        put("quantity", l.quantity)
+                        put("unit", l.unit)
+                        put("unitPrice", l.unitPrice)
+                        put("subtotal", l.subtotal)
+                        put("normalizedPrice", l.normalizedPrice)
+                        put("statusLabel", l.statusLabel)
+                        put("notes", l.notes)
+                    })
+                }
+
+                val payload = JSONObject().apply {
+                    put("action", "syncSkuPriceHistory")
+                    put("includeDateInCells", includeDateInCells)
+                    put("maxBillColumns", matrix.maxBillColumns)
+                    put("rows", rowsArr)
+                    put("ledger", ledgerArr)
+                }
+
+                val requestBody = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+                val request = Request.Builder().url(urlWithParams).post(requestBody).build()
+                client.newCall(request).execute().use { response ->
+                    parseMutationResponse(response, "Synced SKU Price History (${matrix.rows.size} SKUs)")
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+
     suspend fun syncIngredientPricingToGoogleSheets(
         webhookUrl: String,
         pricingSummaries: List<IngredientPriceSummary>,
@@ -901,6 +980,15 @@ function doPost(e) {
       });
       logSync_(ss, "syncInventoryPurchase", "bill=" + (data.orderId || ""), "OK", Date.now() - startTime);
       return successResponse_("Inventory purchase & pricing synced");
+    }
+
+    if (action === "syncSkuPriceHistory") {
+      withLock_(function() {
+        syncSkuPriceHistory_(ss, data);
+      });
+      var rowCount = (data.rows || []).length;
+      logSync_(ss, "syncSkuPriceHistory", rowCount + " SKUs", "OK", Date.now() - startTime);
+      return successResponse_("SKU Price History synced: " + rowCount + " SKUs");
     }
 
     if (action === "syncIngredientPricing") {
@@ -1876,6 +1964,154 @@ function syncPriceHistoryMatrixSheet_(ss, matrix) {
   sheet.getRange(2, 5, values.length, 1).setBackgrounds(stockColors);
   sheet.getRange(2, 8, values.length, 1).setBackgrounds(priceColors);
   sheet.setFrozenColumns(1);
+}
+
+// ======================== v6.0 CLEAN SKU PRICE HISTORY & BILL LEDGER ========================
+
+function syncSkuPriceHistory_(ss, data) {
+  var rows = data.rows || [];
+  var ledger = data.ledger || [];
+  var includeDates = data.includeDateInCells !== false;
+  var maxBills = Number(data.maxBillColumns || 0);
+  for (var i = 0; i < rows.length; i++) {
+    var bl = (rows[i].bills || []).length;
+    if (bl > maxBills) maxBills = bl;
+  }
+  if (maxBills < 1) maxBills = 1;
+
+  // 1. Primary Sheet: "SKU Price History"
+  var headers = ["SKU Name", "Unit / Weight", "Latest Price (INR)", "Price Change vs First (%)"];
+  for (var b = 1; b <= maxBills; b++) {
+    headers.push("Bill " + b);
+  }
+  var sheet = ensureSheet_(ss, "SKU Price History", headers);
+  try {
+    ss.setActiveSheet(sheet);
+    ss.moveActiveSheet(1);
+  } catch (e) {}
+
+  var lastRow = sheet.getLastRow();
+  var maxCols = Math.max(sheet.getLastColumn(), headers.length);
+  if (lastRow > 1 && maxCols > 0) {
+    sheet.getRange(2, 1, lastRow - 1, maxCols).clearContent().setBackground(null).setFontColor("#18181B").setFontWeight("normal");
+  }
+  if (maxCols > headers.length) {
+    sheet.getRange(1, headers.length + 1, 1, maxCols - headers.length).clearContent().setBackground(null);
+  }
+
+  if (rows.length > 0) {
+    var sheetValues = [];
+    var pctBgs = [];
+    var pctColors = [];
+    var pctWeights = [];
+    var billBgs = [];
+    var billColors = [];
+
+    for (var r = 0; r < rows.length; r++) {
+      var sku = rows[r];
+      var pctNum = Number(sku.priceChangeVsFirstPct || 0);
+      var pctLabel = sku.hasChangePct
+        ? ((pctNum > 0 ? "+" : "") + (Math.round(pctNum * 10) / 10).toFixed(1) + "%")
+        : "0.0%";
+
+      var rowVals = [
+        sku.skuName || "",
+        sku.unitWeightLabel || "",
+        roundNum_(Number(sku.latestPrice || 0)),
+        pctLabel
+      ];
+      var rowBillBgs = [];
+      var rowBillColors = [];
+      var bills = sku.bills || [];
+      for (var c = 0; c < maxBills; c++) {
+        var bill = c < bills.length ? bills[c] : null;
+        if (!bill) {
+          rowVals.push("");
+          rowBillBgs.push(null);
+          rowBillColors.push("#18181B");
+        } else if (bill.isUnitAnomaly) {
+          rowVals.push(bill.cellText || "CHECK UNIT");
+          rowBillBgs.push("#FEF3C7");
+          rowBillColors.push("#B45309");
+        } else {
+          rowVals.push(includeDates ? (bill.cellText || String(bill.price)) : roundNum_(Number(bill.price || 0)));
+          rowBillBgs.push(null);
+          rowBillColors.push("#18181B");
+        }
+      }
+      sheetValues.push(rowVals);
+      billBgs.push(rowBillBgs);
+      billColors.push(rowBillColors);
+
+      if (sku.hasChangePct && pctNum > 0) {
+        pctBgs.push(["#FEE2E2"]);
+        pctColors.push(["#B91C1C"]);
+        pctWeights.push(["bold"]);
+      } else if (sku.hasChangePct && pctNum < 0) {
+        pctBgs.push(["#DCFCE7"]);
+        pctColors.push(["#15803D"]);
+        pctWeights.push(["bold"]);
+      } else {
+        pctBgs.push([null]);
+        pctColors.push(["#52525B"]);
+        pctWeights.push(["normal"]);
+      }
+    }
+
+    sheet.getRange(2, 1, sheetValues.length, headers.length).setValues(sheetValues);
+    sheet.getRange(2, 1, sheetValues.length, 1).setFontWeight("bold");
+    sheet.getRange(2, 3, sheetValues.length, 1).setFontWeight("bold");
+    var pctRange = sheet.getRange(2, 4, sheetValues.length, 1);
+    pctRange.setBackgrounds(pctBgs).setFontColors(pctColors).setFontWeights(pctWeights);
+    if (maxBills > 0) {
+      sheet.getRange(2, 5, sheetValues.length, maxBills).setBackgrounds(billBgs).setFontColors(billColors);
+    }
+    sheet.setFrozenRows(1);
+    sheet.setFrozenColumns(1);
+    try { sheet.autoResizeColumns(1, headers.length); } catch (e) {}
+  }
+
+  // 2. Second Sheet: "Bill Ledger"
+  var ledgerHeaders = [
+    "Bill ID", "Date", "Supplier", "SKU Name (Raw)", "Matched SKU",
+    "Quantity", "Unit", "Unit Price (INR)", "Subtotal (INR)",
+    "Normalized Rate (INR)", "Status", "Notes"
+  ];
+  var ledgerSheet = ensureSheet_(ss, "Bill Ledger", ledgerHeaders);
+  try {
+    ss.setActiveSheet(ledgerSheet);
+    ss.moveActiveSheet(2);
+  } catch (e) {}
+  var ledgerLastRow = ledgerSheet.getLastRow();
+  if (ledgerLastRow > 1) {
+    ledgerSheet.getRange(2, 1, ledgerLastRow - 1, ledgerHeaders.length).clearContent().setBackground(null);
+  }
+  if (ledger.length > 0) {
+    var lVals = [];
+    var lStatusBgs = [];
+    for (var i = 0; i < ledger.length; i++) {
+      var l = ledger[i];
+      lVals.push([
+        "'" + String(l.orderId || ""),
+        l.dateFormatted || "",
+        l.supplierName || "Supplier",
+        l.rawItemName || "",
+        l.matchedSkuName || "",
+        roundNum_(Number(l.quantity || 0)),
+        l.unit || "",
+        roundNum_(Number(l.unitPrice || 0)),
+        roundNum_(Number(l.subtotal || 0)),
+        roundNum_(Number(l.normalizedPrice || 0)),
+        l.statusLabel || "OK",
+        l.notes || ""
+      ]);
+      lStatusBgs.push([l.statusLabel === "CHECK UNIT" ? "#FEF3C7" : (l.statusLabel === "HARDWARE / EXCLUDED" ? "#F4F4F5" : null)]);
+    }
+    ledgerSheet.getRange(2, 1, lVals.length, ledgerHeaders.length).setValues(lVals);
+    ledgerSheet.getRange(2, 11, lVals.length, 1).setBackgrounds(lStatusBgs);
+    ledgerSheet.setFrozenRows(1);
+    try { ledgerSheet.autoResizeColumns(1, ledgerHeaders.length); } catch (e) {}
+  }
 }
 """
     }

@@ -2,19 +2,46 @@ package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.Assessment
+import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.ReceiptLong
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -22,19 +49,14 @@ import androidx.compose.ui.unit.sp
 import com.example.data.entity.InventoryItemEntity
 import com.example.data.entity.InventoryUsageEntity
 import com.example.data.entity.OrderWithItems
-import com.example.data.entity.calculatePacksAndCost
+import com.example.domain.inventory.InventoryUsageCalculator
 import com.example.ui.BillingUiState
 import kotlinx.coroutines.delay
-import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
-private val EmeraldSuccess = Color(0xFF10B981)
-private val RedDanger = Color(0xFFEF4444)
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun InventoryUsageScreen(
     state: BillingUiState,
@@ -48,7 +70,6 @@ fun InventoryUsageScreen(
     var customStartMs by remember { mutableStateOf<Long?>(null) }
     var customEndMs by remember { mutableStateOf<Long?>(null) }
 
-    // Date range filtering with midnight boundary refresh
     var dayBoundaryTick by remember { mutableIntStateOf(0) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -112,96 +133,31 @@ fun InventoryUsageScreen(
         }
     }
 
-    // Calculate aggregated inventory consumption for the selected period
-    val consumptionBreakdown = remember(filteredOrders, usages, inventoryItems) {
-        val rawUsageMap = mutableMapOf<Int, Pair<Double, String>>()
+    val report = remember(filteredOrders, inventoryItems, usages) {
+        InventoryUsageCalculator.computeIngredientUsage(
+            orders = filteredOrders,
+            inventoryItems = inventoryItems,
+            usages = usages
+        )
+    }
 
-        filteredOrders.forEach { orderWithItems ->
-            orderWithItems.items.forEach { orderItem ->
-                val recipeUsages = usages.filter {
-                    (orderItem.menuItemId > 0 && it.menuItemId == orderItem.menuItemId) ||
-                        it.menuItemName.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
-                }
-                if (recipeUsages.isNotEmpty()) {
-                    recipeUsages.forEach { usage ->
-                        val current = rawUsageMap[usage.inventoryItemId]?.first ?: 0.0
-                        val consumed = usage.quantityUsed * orderItem.quantity
-                        rawUsageMap[usage.inventoryItemId] = Pair(current + consumed, usage.unit)
-                    }
-                } else {
-                    // Exact-name fallback for direct inventory items without recipe mapping
-                    val directItem = inventoryItems.find {
-                        it.name.trim().equals(orderItem.itemName.trim(), ignoreCase = true)
-                    }
-                    if (directItem != null) {
-                        val current = rawUsageMap[directItem.id]?.first ?: 0.0
-                        val consumed = orderItem.quantity.toDouble()
-                        rawUsageMap[directItem.id] = Pair(current + consumed, directItem.unit)
-                    }
-                }
-            }
+    val sdf = remember { SimpleDateFormat("dd MMM", Locale.getDefault()) }
+    val customLabel = remember(usageDateFilter, customStartMs, customEndMs) {
+        if (usageDateFilter == "CUSTOM" && customStartMs != null && customEndMs != null) {
+            "${sdf.format(Date(customStartMs!!))} - ${sdf.format(Date(customEndMs!!))}"
+        } else {
+            "Pick Date"
         }
-
-        val items = rawUsageMap.mapNotNull { (invId, pair) ->
-            val (qty, usageUnit) = pair
-            val invItem = inventoryItems.find { it.id == invId } ?: return@mapNotNull null
-            val (packs, cost) = calculatePacksAndCost(qty, usageUnit, invItem)
-            ConsumedItemRecord(
-                item = invItem,
-                quantityUsed = qty,
-                unit = usageUnit,
-                packsUsed = packs,
-                cost = cost
-            )
-        }.sortedByDescending { it.cost }
-
-        val totalCost = items.sumOf { it.cost }
-        Pair(items, totalCost)
-    }
-
-    val (consumedItems, totalConsumedCost) = consumptionBreakdown
-
-    // Low stock alert items (estimated <= 7 orders remaining)
-    val lowStockAlerts = remember(inventoryItems, usages) {
-        inventoryItems.filter { it.isActive }.mapNotNull { item ->
-            val itemUsages = usages.filter { it.inventoryItemId == item.id }
-            val ordersLeft: Int = if (itemUsages.isNotEmpty()) {
-                val maxPacksPerOrder = itemUsages.maxOfOrNull { usage ->
-                    val (packs, _) = calculatePacksAndCost(usage.quantityUsed, usage.unit, item)
-                    packs
-                } ?: 0.0
-
-                if (maxPacksPerOrder > 0.0) {
-                    (item.currentStock / maxPacksPerOrder).toInt()
-                } else {
-                    (item.currentStock * item.standardQuantity).toInt()
-                }
-            } else {
-                (item.currentStock * (if (item.standardQuantity > 0) item.standardQuantity else 1.0)).toInt()
-            }
-
-            if (ordersLeft <= 7) {
-                LowStockAlertItem(item, ordersLeft.coerceAtLeast(0))
-            } else null
-        }.sortedBy { it.ordersRemaining }
-    }
-
-    val filterTitle = when (usageDateFilter) {
-        "TODAY" -> "Today's Usage"
-        "YESTERDAY" -> "Yesterday's Usage"
-        "LAST_7_DAYS" -> "Last 7 Days Usage"
-        "THIS_MONTH" -> "Last 30 Days Usage"
-        "CUSTOM" -> "Custom Date Usage"
-        else -> "All-Time Usage"
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBackground)
-            .padding(16.dp)
+            .padding(horizontal = 16.dp, vertical = 14.dp)
+            .testTag("inventory_usage_screen")
     ) {
-        // Header
+        // Minimal Header
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -213,27 +169,41 @@ fun InventoryUsageScreen(
                         imageVector = Icons.Default.Assessment,
                         contentDescription = null,
                         tint = AmberAccent,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "INVENTORY USAGE",
+                        text = "Inventory Usage",
                         color = Color.White,
-                        fontSize = 24.sp,
+                        fontSize = 22.sp,
                         fontWeight = FontWeight.Black
                     )
                 }
                 Text(
-                    text = "Daily Consumption & Ingredient Cost Breakdown",
+                    text = "Calculated from Recipe Master × Orders Made",
                     color = TextGray,
                     fontSize = 12.sp
                 )
             }
+
+            Surface(
+                color = AmberAccent.copy(alpha = 0.14f),
+                border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.4f)),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text(
+                    text = "${report.ordersCount} Orders",
+                    color = AmberAccent,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Black,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
-        // Quick Date Filter Chips
+        // Clean Date Chips
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -244,13 +214,12 @@ fun InventoryUsageScreen(
                 "LAST_7_DAYS" to "7 Days",
                 "THIS_MONTH" to "30 Days"
             )
-
             items(filters, key = { it.first }) { (key, label) ->
                 val isSelected = usageDateFilter == key
                 FilterChip(
                     selected = isSelected,
                     onClick = { usageDateFilter = key },
-                    label = { Text(label, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium) },
+                    label = { Text(label, fontSize = 12.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium) },
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = AmberAccent,
                         selectedLabelColor = Color.Black,
@@ -260,16 +229,15 @@ fun InventoryUsageScreen(
                     shape = RoundedCornerShape(20.dp)
                 )
             }
-
             item {
                 val isCustom = usageDateFilter == "CUSTOM"
                 FilterChip(
                     selected = isCustom,
                     onClick = { showCustomDateDialog = true },
                     leadingIcon = {
-                        Icon(Icons.Default.DateRange, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.DateRange, contentDescription = null, modifier = Modifier.size(15.dp))
                     },
-                    label = { Text("Custom Date", fontWeight = if (isCustom) FontWeight.Bold else FontWeight.Medium) },
+                    label = { Text(customLabel, fontSize = 12.sp, fontWeight = if (isCustom) FontWeight.Bold else FontWeight.Medium) },
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = AmberAccent,
                         selectedLabelColor = Color.Black,
@@ -281,358 +249,106 @@ fun InventoryUsageScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
-        LazyColumn(
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-            modifier = Modifier.fillMaxSize()
-        ) {
-            // LOW STOCK / REORDER ALERT BANNER (≤ 7 Orders Left)
-            if (lowStockAlerts.isNotEmpty()) {
-                item {
-                    Card(
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.cardColors(containerColor = RedDanger.copy(alpha = 0.12f)),
-                        border = BorderStroke(1.dp, RedDanger.copy(alpha = 0.5f)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(14.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.Warning,
-                                        contentDescription = "Alert",
-                                        tint = RedDanger,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = "CRITICAL REORDER ALERTS (≤ 7 Orders Left)",
-                                        color = RedDanger,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Black,
-                                        letterSpacing = 0.5.sp
-                                    )
-                                }
-                                Surface(
-                                    color = RedDanger.copy(alpha = 0.2f),
-                                    shape = RoundedCornerShape(6.dp)
-                                ) {
-                                    Text(
-                                        text = "${lowStockAlerts.size} Items",
-                                        color = RedDanger,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            // Alert item chips
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                lowStockAlerts.take(5).forEach { alert ->
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.weight(1f).padding(end = 8.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Circle,
-                                                contentDescription = null,
-                                                tint = RedDanger,
-                                                modifier = Modifier.size(6.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Text(
-                                                text = alert.item.name,
-                                                color = Color.White,
-                                                fontSize = 13.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                        ) {
-                                            Text(
-                                                text = "${formatDouble(alert.item.currentStock)} ${alert.item.unit}",
-                                                color = TextGray,
-                                                fontSize = 12.sp
-                                            )
-                                            Surface(
-                                                color = RedDanger.copy(alpha = 0.25f),
-                                                shape = RoundedCornerShape(6.dp)
-                                            ) {
-                                                Text(
-                                                    text = "~${alert.ordersRemaining} left",
-                                                    color = Color(0xFFFCA5A5),
-                                                    fontSize = 11.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                                )
-                                            }
-                                            if (onOpenAddStockDialog != null) {
-                                                Surface(
-                                                    color = EmeraldSuccess.copy(alpha = 0.2f),
-                                                    shape = RoundedCornerShape(6.dp),
-                                                    modifier = Modifier.clickable { onOpenAddStockDialog(alert.item) }
-                                                ) {
-                                                    Text(
-                                                        text = "+ Stock",
-                                                        color = EmeraldSuccess,
-                                                        fontSize = 11.sp,
-                                                        fontWeight = FontWeight.Bold,
-                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // CONSUMPTION SUMMARY HERO CARD
-            item {
-                Card(
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = SurfaceColor),
-                    border = BorderStroke(1.dp, SurfaceVariantColor),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(18.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = filterTitle.uppercase(),
-                                color = TextGray,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 1.sp
-                            )
-                            Surface(
-                                color = EmeraldSuccess.copy(alpha = 0.15f),
-                                shape = RoundedCornerShape(8.dp)
-                            ) {
-                                Text(
-                                    text = "${filteredOrders.size} Orders Served",
-                                    color = EmeraldSuccess,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        Text(
-                            text = formatCurrency(totalConsumedCost),
-                            color = AmberAccent,
-                            fontSize = 32.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                        Text(
-                            text = "Total procurement cost of ingredients consumed",
-                            color = TextGray,
-                            fontSize = 12.sp
-                        )
-
-                        Spacer(modifier = Modifier.height(14.dp))
-                        HorizontalDivider(color = SurfaceVariantColor.copy(alpha = 0.5f))
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text("Distinct Items Used", color = TextGray, fontSize = 11.sp)
-                                Text(
-                                    "${consumedItems.size} Ingredients",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
-                            }
-                            Column(horizontalAlignment = Alignment.End) {
-                                Text("Avg Cost / Order", color = TextGray, fontSize = 11.sp)
-                                val avg = if (filteredOrders.isNotEmpty()) totalConsumedCost / filteredOrders.size else 0.0
-                                Text(
-                                    formatCurrency(avg),
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ITEMIZED CONSUMPTION LIST HEADER
-            item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 4.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+        if (report.items.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = 48.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        imageVector = Icons.Default.ReceiptLong,
+                        contentDescription = null,
+                        tint = SurfaceVariantColor,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "ITEMIZED INVENTORY CONSUMED",
+                        text = if (report.ordersCount == 0) "No orders recorded for this period"
+                        else "No Recipe Master mappings matched these orders",
                         color = Color.White,
                         fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.5.sp
+                        fontWeight = FontWeight.SemiBold
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "${consumedItems.size} items",
+                        text = "Configure ingredients in Recipe Master to see exact usage",
                         color = TextGray,
                         fontSize = 12.sp
                     )
                 }
             }
-
-            if (consumedItems.isEmpty()) {
-                item {
-                    Card(
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = SurfaceColor),
-                        modifier = Modifier.fillMaxWidth()
+        } else {
+            Card(
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = SurfaceColor),
+                border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.8f)),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // Clean 2-column table header
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SurfaceVariantColor.copy(alpha = 0.45f))
+                            .padding(horizontal = 16.dp, vertical = 11.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(32.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = null,
-                                tint = TextGray.copy(alpha = 0.5f),
-                                modifier = Modifier.size(40.dp)
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "No inventory consumed in this period",
-                                color = TextGray,
-                                fontSize = 14.sp
-                            )
-                        }
+                        Text(
+                            text = "INGREDIENT (${report.items.size})",
+                            color = TextGray,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 0.6.sp
+                        )
+                        Text(
+                            text = "EXACT USAGE",
+                            color = TextGray,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 0.6.sp
+                        )
                     }
-                }
-            } else {
-                items(consumedItems, key = { it.item.id }) { record ->
-                    val sharePercent = if (totalConsumedCost > 0) (record.cost / totalConsumedCost) * 100 else 0.0
 
-                    Card(
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = SurfaceColor),
-                        border = BorderStroke(1.dp, SurfaceVariantColor.copy(alpha = 0.5f)),
-                        modifier = Modifier.fillMaxWidth()
+                    HorizontalDivider(color = SurfaceVariantColor)
+
+                    LazyColumn(
+                        contentPadding = PaddingValues(bottom = 24.dp),
+                        modifier = Modifier.fillMaxSize()
                     ) {
-                        Column(modifier = Modifier.padding(14.dp)) {
+                        itemsIndexed(report.items, key = { _, item -> item.inventoryItemId }) { idx, row ->
                             Row(
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = record.item.name,
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 15.sp
-                                    )
-                                    Text(
-                                        text = "${record.item.category} • Pack: ${record.item.standardQuantity} ${record.item.unit}",
-                                        color = TextGray,
-                                        fontSize = 11.sp
-                                    )
-                                }
-
-                                Column(horizontalAlignment = Alignment.End) {
-                                    Text(
-                                        text = formatCurrency(record.cost),
-                                        color = AmberAccent,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 15.sp
-                                    )
-                                    Text(
-                                        text = "${String.format(Locale.US, "%.1f", sharePercent)}% of total",
-                                        color = TextGray,
-                                        fontSize = 11.sp
-                                    )
-                                }
+                                Text(
+                                    text = row.itemName,
+                                    color = Color.White,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f).padding(end = 12.dp)
+                                )
+                                Text(
+                                    text = row.exactUsageLabel,
+                                    color = AmberAccent,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Black
+                                )
                             }
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            // Quantity details
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Surface(
-                                    color = SurfaceVariantColor.copy(alpha = 0.6f),
-                                    shape = RoundedCornerShape(6.dp)
-                                ) {
-                                    Text(
-                                        text = "Used: ${formatDouble(record.quantityUsed)} ${record.unit}",
-                                        color = Color.White,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                    )
-                                }
-
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Text(
-                                        text = "≈ ${formatDouble(record.packsUsed)} packs",
-                                        color = TextGray,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    if (onOpenAddStockDialog != null) {
-                                        Surface(
-                                            color = AmberAccent.copy(alpha = 0.16f),
-                                            shape = RoundedCornerShape(6.dp),
-                                            modifier = Modifier.clickable { onOpenAddStockDialog(record.item) }
-                                        ) {
-                                            Text(
-                                                text = "Restock",
-                                                color = AmberAccent,
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                            )
-                                        }
-                                    }
-                                }
+                            if (idx < report.items.lastIndex) {
+                                HorizontalDivider(
+                                    color = SurfaceVariantColor.copy(alpha = 0.5f),
+                                    modifier = Modifier.padding(horizontal = 16.dp)
+                                )
                             }
                         }
                     }
@@ -641,7 +357,6 @@ fun InventoryUsageScreen(
         }
     }
 
-    // Custom Date Range Picker Dialog
     if (showCustomDateDialog) {
         CustomDateRangePickerDialog(
             onDismiss = { showCustomDateDialog = false },
@@ -653,31 +368,4 @@ fun InventoryUsageScreen(
             }
         )
     }
-}
-
-private data class ConsumedItemRecord(
-    val item: InventoryItemEntity,
-    val quantityUsed: Double,
-    val unit: String,
-    val packsUsed: Double,
-    val cost: Double
-)
-
-private data class LowStockAlertItem(
-    val item: InventoryItemEntity,
-    val ordersRemaining: Int
-)
-
-private fun formatDouble(value: Double): String {
-    return if (value % 1.0 == 0.0) {
-        value.toInt().toString()
-    } else {
-        String.format(Locale.US, "%.2f", value)
-    }
-}
-
-private fun formatCurrency(value: Double): String {
-    val format = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
-    format.maximumFractionDigits = 2
-    return format.format(value)
 }

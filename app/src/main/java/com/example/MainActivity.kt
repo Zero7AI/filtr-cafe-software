@@ -213,10 +213,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Isolated low-stock notification observer (avoids root recomposition on inventory changes)
-                if (uiState.deviceAccessStatus == "ACTIVE") {
-                    LowStockNotificationEffect(viewModel = viewModel)
-                }
+                // Inventory alerts removed per user request (keeping Kitchen Inventory & Usage clean)
 
                 val isStaffMode = uiState.currentRole == "STAFF"
                 var showAdminUnlockDialog by remember { mutableStateOf(false) }
@@ -572,26 +569,7 @@ class MainActivity : ComponentActivity() {
                                     Text("INVENTORY & COSTING", color = Color(0xFF38BDF8), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 4.dp))
 
                                     NavigationDrawerItem(
-                                        label = { Text("Inventories & Alerts", fontWeight = FontWeight.Bold) },
-                                        icon = { Icon(imageVector = Icons.Default.Warehouse, contentDescription = null, tint = Color(0xFF38BDF8)) },
-                                        selected = uiState.currentTab == FiltrTab.INVENTORIES,
-                                        onClick = {
-                                            viewModel.selectTab(FiltrTab.INVENTORIES)
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        colors = NavigationDrawerItemDefaults.colors(
-                                            selectedContainerColor = Color(0xFFF59E0B).copy(alpha = 0.15f),
-                                            selectedIconColor = Color(0xFFF59E0B),
-                                            selectedTextColor = Color(0xFFF59E0B),
-                                            unselectedIconColor = Color.White.copy(alpha = 0.7f),
-                                            unselectedTextColor = Color.White.copy(alpha = 0.7f)
-                                        ),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(vertical = 2.dp)
-                                    )
-
-                                    NavigationDrawerItem(
-                                        label = { Text("Purchase Bills & Pricing", fontWeight = FontWeight.Bold) },
+                                        label = { Text("Purchase Tracking", fontWeight = FontWeight.Bold) },
                                         icon = { Icon(imageVector = Icons.Default.Inventory, contentDescription = null) },
                                         selected = uiState.currentTab == FiltrTab.INVENTORY_ORDER,
                                         onClick = {
@@ -1083,16 +1061,20 @@ class MainActivity : ComponentActivity() {
                                         )
                                     }
                                 }
-                                FiltrTab.INVENTORY_ORDER -> {
+                                FiltrTab.INVENTORY_ORDER, FiltrTab.INVENTORIES -> {
                                     if (!isStaffMode) {
                                         val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
                                         val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
                                         val pricingSummaries by viewModel.ingredientPricingSummaries.collectAsStateWithLifecycle()
+                                        val skuMatrix by viewModel.skuPriceHistoryMatrix.collectAsStateWithLifecycle()
                                         InventoryOrderScreen(
                                             state = uiState,
                                             inventoryOrders = inventoryOrdersList,
                                             inventoryItems = inventoryItemsList,
                                             pricingSummaries = pricingSummaries,
+                                            skuPriceHistoryMatrix = skuMatrix,
+                                            googleSheetsUrl = uiState.googleSheetsUrl,
+                                            onOpenGoogleSheet = { sheetUrl -> openLiveGoogleSheet(sheetUrl) },
                                             onOpenAddOrder = { viewModel.openAddInventoryOrderDialog() },
                                             onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
                                             onDeleteOrder = { viewModel.requestDeleteInventoryOrder(it) },
@@ -1114,47 +1096,11 @@ class MainActivity : ComponentActivity() {
                                             },
                                             onRetryQueuedReceipt = { viewModel.retryQueuedReceipt(it) },
                                             onDismissQueuedReceipt = { viewModel.dismissQueuedReceipt(it) },
-                                            onSyncPricingToSheets = { viewModel.syncIngredientPricingToSheets() },
-                                            onExportPricingCsv = {
-                                                val csvFile = viewModel.buildIngredientPricingCsvFile(context)
-                                                shareIngredientPricingCsv(csvFile)
-                                            }
-                                        )
-                                    }
-                                }
-                                FiltrTab.INVENTORIES -> {
-                                    if (!isStaffMode) {
-                                        val ordersList by viewModel.ordersList.collectAsStateWithLifecycle()
-                                        val inventoryItemsList by viewModel.inventoryItems.collectAsStateWithLifecycle()
-                                        val usagesList by viewModel.inventoryUsages.collectAsStateWithLifecycle()
-                                        val inventoryOrdersList by viewModel.inventoryOrders.collectAsStateWithLifecycle()
-                                        val pricingSummaries by viewModel.ingredientPricingSummaries.collectAsStateWithLifecycle()
-                                        val inventoryAlerts by viewModel.inventoryAlerts.collectAsStateWithLifecycle()
-                                        InventoriesScreen(
-                                            state = uiState,
-                                            inventoryItems = inventoryItemsList,
-                                            usages = usagesList,
-                                            ordersList = ordersList,
-                                            inventoryOrders = inventoryOrdersList,
-                                            pricingSummaries = pricingSummaries,
-                                            inventoryAlerts = inventoryAlerts,
-                                            priceAlertThresholdPct = uiState.priceAlertThresholdPct,
-                                            onUpdatePriceAlertThreshold = { viewModel.updatePriceAlertThreshold(it) },
-                                            onOpenPurchaseOrders = { viewModel.selectTab(FiltrTab.INVENTORY_ORDER) },
-                                            onUpdateStock = { id, stock -> viewModel.updateStockLevel(id, stock) },
-                                            onStartEditingStock = { viewModel.startEditingStock(it) },
-                                            onCancelEditingStock = { viewModel.cancelEditingStock() },
-                                            onOpenAddStockDialog = { viewModel.openAddStockDialog(it) },
-                                            onDismissAddStockDialog = { viewModel.dismissAddStockDialog() },
-                                            onAddStockPacks = { id, packs -> viewModel.addStockPacks(id, packs) },
-                                            onOpenInventoryMaster = { viewModel.openInventoryMasterDialog() },
-                                            onSaveInventoryItem = { name, cat, unit, price, stdQty -> viewModel.saveInventoryItem(name, cat, unit, price, stdQty) },
-                                            onEditInventoryItem = { viewModel.openAddInventoryItemDialog(it) },
-                                            onDeleteInventoryItem = { viewModel.deleteInventoryItem(it) },
-                                            onDismissInventoryMaster = { viewModel.dismissInventoryMasterDialog() },
-                                            onDismissAddInventoryItem = { viewModel.dismissAddInventoryItemDialog() },
-                                            onSearchQueryChanged = { viewModel.updateInventorySearchQuery(it) },
-                                            onSyncPricingToSheets = { viewModel.syncIngredientPricingToSheets() },
+                                            onSyncPricingToSheets = { includeDates -> viewModel.syncIngredientPricingToSheets(includeDates) },
+                                            onExportPricingXlsx = { includeDates ->
+                                                val xlsxFile = viewModel.buildSkuPriceHistoryXlsxFile(context, includeDates)
+                                                shareSkuPriceHistoryXlsx(xlsxFile)
+                                            },
                                             onExportPricingCsv = {
                                                 val csvFile = viewModel.buildIngredientPricingCsvFile(context)
                                                 shareIngredientPricingCsv(csvFile)
@@ -2007,6 +1953,34 @@ class MainActivity : ComponentActivity() {
             lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") -> "image/jpeg"
             !fallbackType.isNullOrBlank() && fallbackType != "*/*" -> fallbackType
             else -> "application/pdf"
+        }
+    }
+
+    private fun openLiveGoogleSheet(url: String) {
+        try {
+            val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            startActivity(browserIntent)
+        } catch (e: Exception) {
+            viewModel.showSnackbar("Unable to open sheet link: ${e.message}")
+        }
+    }
+
+    private fun shareSkuPriceHistoryXlsx(xlsxFile: java.io.File) {
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                xlsxFile
+            )
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "FILTR Coffee SKU Price History (.xlsx)")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(sendIntent, "Open / Share SKU Price History (.xlsx)"))
+        } catch (e: Exception) {
+            viewModel.showSnackbar("Failed to export Excel (.xlsx): ${e.message}")
         }
     }
 
