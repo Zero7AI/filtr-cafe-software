@@ -1,11 +1,17 @@
 import {
+  applyLatestPurchasePrices,
   calculatePacksAndCost,
+  isSafeAutomaticRateUpdate,
+  LatestPriceUpdate,
   matchCatalogItem,
   resolvePackUnitPrice,
+  SkuPriceHistoryMatrix,
 } from './inventory';
 import {
   InventoryItem,
+  InventoryOrder,
   InventoryOrderItem,
+  InventoryOrderWithItems,
   InventoryUsage,
 } from './types';
 import { getSupabaseAdmin } from '../supabase-server';
@@ -175,7 +181,7 @@ export async function addPurchasedStockForLinesServer(
       } as InventoryOrderItem,
       matched
     );
-    if (rate > 0) {
+    if (rate > 0 && isSafeAutomaticRateUpdate(Number(matched.default_price || 0), rate)) {
       runningRate.set(matched.id, rate);
     }
   }
@@ -222,4 +228,66 @@ export function formatLiveStockLabel(item: InventoryItem): string {
   }
   const totalBase = packs * std;
   return `${fmt(packs)} packs (${fmt(totalBase)} ${unit})`;
+}
+
+export async function persistLatestItemPricesServer(
+  updates: Array<{ id: number; latestPrice: number }>
+): Promise<void> {
+  if (!updates || updates.length === 0) return;
+  const supabase = getSupabaseAdmin();
+  for (const u of updates) {
+    if (u.id > 0 && u.latestPrice > 0) {
+      await supabase
+        .from('inventory_items')
+        .update({ default_price: u.latestPrice })
+        .eq('id', u.id);
+    }
+  }
+}
+
+/**
+ * Fetches `inventory_items` overlaid with each SKU's latest valid supplier purchase price
+ * and persists safe price updates back to Supabase so Web & Android stay automatically synced.
+ */
+export async function fetchEffectiveInventoryItemsServer(options?: {
+  persistUpdates?: boolean;
+}): Promise<{
+  items: InventoryItem[];
+  orders: InventoryOrderWithItems[];
+  matrix: SkuPriceHistoryMatrix;
+  priceUpdates: LatestPriceUpdate[];
+}> {
+  const supabase = getSupabaseAdmin();
+  const [itemsRes, ordersRes] = await Promise.all([
+    supabase.from('inventory_items').select('*').order('name'),
+    supabase
+      .from('inventory_orders')
+      .select('*, inventory_order_items(*)')
+      .order('timestamp', { ascending: true })
+      .limit(1000),
+  ]);
+
+  const rawItems = (itemsRes.data || []) as InventoryItem[];
+  const orders: InventoryOrderWithItems[] = (ordersRes.data || []).map(
+    (row: Record<string, unknown>) => ({
+      order: {
+        order_id: String(row.order_id || ''),
+        timestamp: Number(row.timestamp || 0),
+        supplier_name: String(row.supplier_name || ''),
+        total_amount: Number(row.total_amount || 0),
+        notes: String(row.notes || ''),
+        sync_status: String(row.sync_status || 'SYNCED'),
+      } as InventoryOrder,
+      items: Array.isArray(row.inventory_order_items)
+        ? (row.inventory_order_items as InventoryOrderItem[])
+        : [],
+    })
+  );
+
+  const { items, updates, matrix } = applyLatestPurchasePrices(rawItems, orders);
+  if (options?.persistUpdates !== false && updates.length > 0) {
+    await persistLatestItemPricesServer(updates).catch(() => {});
+  }
+
+  return { items, orders, matrix, priceUpdates: updates };
 }

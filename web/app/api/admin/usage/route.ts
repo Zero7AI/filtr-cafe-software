@@ -4,7 +4,10 @@ import {
   calculatePacksAndCost,
   computeIngredientUsage,
 } from '@/lib/domain/inventory';
-import { formatLiveStockLabel } from '@/lib/domain/stock-sync';
+import {
+  fetchEffectiveInventoryItemsServer,
+  formatLiveStockLabel,
+} from '@/lib/domain/stock-sync';
 import {
   DateRangePreset,
   getIstMonthKey,
@@ -43,13 +46,13 @@ export async function GET(request: NextRequest) {
     });
 
     const supabase = getSupabaseAdmin();
-    const [orders, itemsRes, usageRes] = await Promise.all([
+    const [orders, effectiveInv, usageRes] = await Promise.all([
       fetchOrdersInRangeServer(startMs, endMs),
-      supabase.from('inventory_items').select('*').order('name'),
+      fetchEffectiveInventoryItemsServer(),
       supabase.from('inventory_usage').select('*').order('id'),
     ]);
 
-    const items = (itemsRes.data || []) as InventoryItem[];
+    const items = effectiveInv.items;
     const usages = (usageRes.data || []) as InventoryUsage[];
     const report = computeIngredientUsage(orders, items, usages);
 

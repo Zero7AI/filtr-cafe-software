@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/admin-auth';
 import {
+  applyLatestPurchasePrices,
   buildSkuPriceHistoryMatrix,
   calculatePacksAndCost,
   computeIngredientUsage,
 } from '@/lib/domain/inventory';
+import { persistLatestItemPricesServer } from '@/lib/domain/stock-sync';
 import {
   DateRangePreset,
   getIstDateKey,
@@ -243,8 +245,7 @@ export async function GET(request: NextRequest) {
       .sort((a, b) => b.revenue - a.revenue);
 
     // v2.5.4 Purchase Tracking Matrix + Exact Ingredient Usage + P&L Snapshot
-    const invItems = (invItemsRes.data || []) as InventoryItem[];
-    const invById = new Map(invItems.map((i) => [i.id, i]));
+    const rawInvItems = (invItemsRes.data || []) as InventoryItem[];
     const invUsage = (invUsageRes.data || []) as InventoryUsage[];
     const invOrders: InventoryOrderWithItems[] = (invOrdersRes.data || []).map(
       (row: Record<string, unknown>) => ({
@@ -262,7 +263,13 @@ export async function GET(request: NextRequest) {
       })
     );
 
-    const skuMatrix = buildSkuPriceHistoryMatrix(invItems, invOrders);
+    const rawMatrix = buildSkuPriceHistoryMatrix(rawInvItems, invOrders);
+    const { items: invItems, updates: priceUpdates, matrix: skuMatrix } =
+      applyLatestPurchasePrices(rawInvItems, invOrders, rawMatrix);
+    if (priceUpdates.length > 0) {
+      persistLatestItemPricesServer(priceUpdates).catch(() => {});
+    }
+    const invById = new Map(invItems.map((i) => [i.id, i]));
     const topPriceHikes = skuMatrix.rows
       .filter((r) => r.isPriceHike || r.hasUnitAnomaly)
       .slice(0, 8)

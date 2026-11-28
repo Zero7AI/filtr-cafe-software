@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/admin-auth';
 import {
+  applyLatestPurchasePrices,
   buildBillLedger,
   buildSkuPriceHistoryMatrix,
 } from '@/lib/domain/inventory';
-import { addPurchasedStockForLinesServer } from '@/lib/domain/stock-sync';
+import {
+  addPurchasedStockForLinesServer,
+  persistLatestItemPricesServer,
+} from '@/lib/domain/stock-sync';
 import { getIstCompactDate } from '@/lib/domain/ist';
 import {
   InventoryItem,
@@ -34,7 +38,7 @@ export async function GET() {
 
   try {
     const supabase = getSupabaseAdmin();
-    const [{ items, orders }, waRes, sheetUrlRaw, webhookUrlRaw] = await Promise.all([
+    const [invState, waRes, sheetUrlRaw, webhookUrlRaw] = await Promise.all([
       fetchAllInventoryStateServer(),
       supabase
         .from('whatsapp_messages')
@@ -45,7 +49,16 @@ export async function GET() {
       getSyncMetadata('google_sheets_webhook_url'),
     ]);
 
-    const skuMatrix = buildSkuPriceHistoryMatrix(items, orders);
+    const { items: rawItems, orders } = invState;
+    const rawMatrix = buildSkuPriceHistoryMatrix(rawItems, orders);
+    const { items, updates, matrix: skuMatrix } = applyLatestPurchasePrices(
+      rawItems,
+      orders,
+      rawMatrix
+    );
+    if (updates.length > 0) {
+      persistLatestItemPricesServer(updates).catch(() => {});
+    }
     const billLedger = buildBillLedger(items, orders).reverse(); // newest first for UI ledger
     const whatsappMessages = waRes.data || [];
     const pendingWhatsappCount = whatsappMessages.filter(

@@ -274,7 +274,7 @@ export function resolvePackUnitPrice(
       defRate > 0 &&
       rawPerBilledUnit >= defRate * 0.4 &&
       rawPerBilledUnit <= defRate * 1.8 &&
-      ((packSize > 1.2 && KG_UNITS.has(bUnit) && normalized > defRate * 2.0) ||
+      ((packSize >= 1.2 && KG_UNITS.has(bUnit) && normalized > defRate * 2.0) ||
         (packSize >= 100 && G_UNITS.has(bUnit) && normalized > defRate * 5.0))
     ) {
       return round2(rawPerBilledUnit);
@@ -880,4 +880,72 @@ export function buildIngredientPricingCsv(
   _priceAlertThresholdPct: number = 5.0
 ): string {
   return buildSkuPriceHistoryCsv(buildSkuPriceHistoryMatrix(inventoryItems, inventoryOrders), true);
+}
+
+export interface LatestPriceUpdate {
+  id: number;
+  name: string;
+  previousPrice: number;
+  latestPrice: number;
+  orderId: string;
+  dateLabel: string;
+}
+
+/**
+ * Prevents packaging-sleeve bills (e.g. ₹162/sleeve vs ₹4/cup) or swapped lines
+ * from silently corrupting an existing per-unit/pack rate.
+ */
+export function isSafeAutomaticRateUpdate(
+  currentPrice: number,
+  candidatePrice: number
+): boolean {
+  if (!Number.isFinite(candidatePrice) || candidatePrice <= 0) return false;
+  if (!Number.isFinite(currentPrice) || currentPrice <= 0) return true;
+  return candidatePrice >= currentPrice * 0.55 && candidatePrice <= currentPrice * 1.85;
+}
+
+/**
+ * Applies each catalog item's latest non-anomalous supplier bill rate onto its `default_price`
+ * so Menu COGS, Margins, Inventory Usage Cost, P&L, and Overview always reflect current rates.
+ */
+export function applyLatestPurchasePrices(
+  inventoryItems: InventoryItem[],
+  inventoryOrders: InventoryOrderWithItems[],
+  precomputedMatrix?: SkuPriceHistoryMatrix
+): {
+  items: InventoryItem[];
+  updates: LatestPriceUpdate[];
+  matrix: SkuPriceHistoryMatrix;
+} {
+  const matrix =
+    precomputedMatrix || buildSkuPriceHistoryMatrix(inventoryItems, inventoryOrders);
+  const rowByKey = new Map(matrix.rows.map((r) => [r.skuName.trim().toLowerCase(), r]));
+  const updates: LatestPriceUpdate[] = [];
+
+  const items = inventoryItems.map((item) => {
+    const row = rowByKey.get((item.name || '').trim().toLowerCase());
+    if (!row || row.bills.length === 0) return item;
+    const validBills = row.bills.filter((b) => !b.isUnitAnomaly && b.price > 0);
+    const latest = validBills.length > 0 ? validBills[validBills.length - 1] : null;
+    if (!latest) return item;
+
+    const candidate = round2(latest.price);
+    const current = round2(Number(item.default_price || 0));
+    if (!isSafeAutomaticRateUpdate(current, candidate)) return item;
+
+    if (Math.abs(candidate - current) >= 0.01) {
+      updates.push({
+        id: item.id,
+        name: item.name,
+        previousPrice: current,
+        latestPrice: candidate,
+        orderId: latest.orderId,
+        dateLabel: latest.dateLabel,
+      });
+      return { ...item, default_price: candidate };
+    }
+    return item;
+  });
+
+  return { items, updates, matrix };
 }

@@ -6,10 +6,10 @@ import {
   getIstRangeBoundsMs,
 } from '@/lib/domain/ist';
 import { computePnlReport } from '@/lib/domain/pnl';
+import { fetchEffectiveInventoryItemsServer } from '@/lib/domain/stock-sync';
 import {
   FixedCostRecord,
   FixedCostStaffMember,
-  InventoryItem,
   InventoryUsage,
 } from '@/lib/domain/types';
 import {
@@ -51,9 +51,9 @@ export async function GET(request: NextRequest) {
     });
 
     const supabase = getSupabaseAdmin();
-    const [orders, invItemsRes, invUsageRes, fixedCostsMap] = await Promise.all([
+    const [orders, effectiveInv, invUsageRes, fixedCostsMap] = await Promise.all([
       fetchOrdersInRangeServer(startMs, endMs),
-      supabase.from('inventory_items').select('*'),
+      fetchEffectiveInventoryItemsServer(),
       supabase.from('inventory_usage').select('*'),
       getSyncMetadataJson<Record<string, FixedCostRecord>>('fixed_costs_config', {}),
     ]);
@@ -64,7 +64,7 @@ export async function GET(request: NextRequest) {
       startDate,
       endDate,
       orders,
-      inventoryItems: (invItemsRes.data || []) as InventoryItem[],
+      inventoryItems: effectiveInv.items,
       usages: (invUsageRes.data || []) as InventoryUsage[],
       fixedCostsMap,
     });

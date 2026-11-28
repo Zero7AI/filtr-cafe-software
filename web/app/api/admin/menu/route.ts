@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/admin-auth';
+import { fetchEffectiveInventoryItemsServer } from '@/lib/domain/stock-sync';
 import {
   getSupabaseAdmin,
   getSyncMetadataJson,
@@ -16,17 +17,17 @@ export async function GET() {
 
   try {
     const supabase = getSupabaseAdmin();
-    const [menuRes, usageRes, invItemsRes, itemOrder] = await Promise.all([
+    const [menuRes, usageRes, effectiveInv, itemOrder] = await Promise.all([
       supabase.from('menu_items').select('*').order('category').order('name'),
       supabase.from('inventory_usage').select('*').order('id'),
-      supabase.from('inventory_items').select('*').order('name'),
+      fetchEffectiveInventoryItemsServer(),
       getSyncMetadataJson<string[]>('menu_item_order', []),
     ]);
 
     return NextResponse.json({
       menuItems: menuRes.data || [],
       usages: usageRes.data || [],
-      inventoryItems: invItemsRes.data || [],
+      inventoryItems: effectiveInv.items,
       itemOrder,
     });
   } catch (err) {
