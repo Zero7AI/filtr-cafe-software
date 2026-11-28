@@ -31,7 +31,7 @@ const FALLBACK_GEMINI_MODELS = [
 async function resolveGeminiKeys(supabase: any): Promise<string[]> {
   const keys: string[] = [];
   const envKey = (GEMINI_API_KEY || "").trim();
-  if (envKey.length >= 30 && envKey.startsWith("AIza")) {
+  if ((envKey.startsWith("AIza") || envKey.startsWith("AQ.")) && envKey.length >= 30) {
     keys.push(envKey);
   }
   try {
@@ -43,7 +43,7 @@ async function resolveGeminiKeys(supabase: any): Promise<string[]> {
     const raw = data?.value;
     if (raw) {
       const text = typeof raw === "string" ? raw : JSON.stringify(raw);
-      const matches = text.match(/AIza[A-Za-z0-9_\-]{30,}/g) || [];
+      const matches = text.match(/(?:AIza|AQ\.)[A-Za-z0-9_\-.]{30,}/g) || [];
       for (const m of matches) {
         if (!keys.includes(m)) keys.push(m);
       }
