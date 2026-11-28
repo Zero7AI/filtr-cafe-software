@@ -105,16 +105,21 @@ export function calculatePacksAndCost(
     (G_UNITS.has(u1) && G_UNITS.has(u2)) ||
     (LITER_UNITS.has(u1) && LITER_UNITS.has(u2)) ||
     (ML_UNITS.has(u1) && ML_UNITS.has(u2)) ||
+    (KG_UNITS.has(u1) && LITER_UNITS.has(u2)) ||
+    (LITER_UNITS.has(u1) && KG_UNITS.has(u2)) ||
+    (G_UNITS.has(u1) && ML_UNITS.has(u2)) ||
+    (ML_UNITS.has(u1) && G_UNITS.has(u2)) ||
     (PCS_UNITS.has(u1) && PCS_UNITS.has(u2))
   ) {
     packs = quantity / packSize;
-  } else if (G_UNITS.has(u1) && KG_UNITS.has(u2)) {
+  } else if (
+    (G_UNITS.has(u1) && (KG_UNITS.has(u2) || LITER_UNITS.has(u2))) ||
+    (ML_UNITS.has(u1) && (KG_UNITS.has(u2) || LITER_UNITS.has(u2)))
+  ) {
     packs = quantity / 1000 / packSize;
-  } else if (KG_UNITS.has(u1) && G_UNITS.has(u2)) {
-    packs = (quantity * 1000) / packSize;
-  } else if (ML_UNITS.has(u1) && LITER_UNITS.has(u2)) {
-    packs = quantity / 1000 / packSize;
-  } else if (LITER_UNITS.has(u1) && ML_UNITS.has(u2)) {
+  } else if (
+    ((KG_UNITS.has(u1) || LITER_UNITS.has(u1)) && (G_UNITS.has(u2) || ML_UNITS.has(u2)))
+  ) {
     packs = (quantity * 1000) / packSize;
   } else if (isPackItem && (KG_UNITS.has(u1) || LITER_UNITS.has(u1))) {
     packs = packSize > 10.0 ? (quantity * 1000) / packSize : quantity / packSize;

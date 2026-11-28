@@ -29,6 +29,19 @@ import { calculatePacksAndCost } from '@/lib/domain/inventory';
 import { formatInr } from '@/lib/domain/ist';
 import { InventoryItem, InventoryUsage, MenuItem } from '@/lib/domain/types';
 
+function defaultRecipeUnitFor(inv?: InventoryItem): string {
+  const u = (inv?.unit || '').trim().toLowerCase();
+  if (u === 'l' || u === 'liter' || u === 'liters' || u === 'litre' || u === 'litres' || u === 'ml') {
+    return 'ml';
+  }
+  if (u === 'kg' || u === 'g' || u === 'packet' || u === 'pack') {
+    return 'g';
+  }
+  if (u === 'slices') return 'slices';
+  if (u === 'serving') return 'serving';
+  return 'pcs';
+}
+
 export default function AdminMenuPage() {
   const { refreshTick } = useAdminContext();
   const { pushToast } = useToast();
@@ -67,7 +80,12 @@ export default function AdminMenuPage() {
         setInventoryItems(invList);
         setItemOrder(d.itemOrder || []);
         setSelectedMenuId((prev) => prev || mItems[0]?.id || 0);
-        setRecipeInvId((prev) => prev || invList[0]?.id || 0);
+        setRecipeInvId((prev) => {
+          if (prev) return prev;
+          const firstInv = invList[0];
+          if (firstInv) setRecipeUnit(defaultRecipeUnitFor(firstInv));
+          return firstInv?.id || 0;
+        });
       }
     } finally {
       setLoading(false);
@@ -539,17 +557,29 @@ export default function AdminMenuPage() {
                       <Chip size="sm" variant="soft" color="accent">
                         COGS: {formatInr(selectedRecipeCogs, 2)}
                       </Chip>
-                      <Chip size="sm" variant="soft" color="success">
-                        Margin:{' '}
-                        {selectedMenuItem.price > 0
-                          ? (
-                              ((selectedMenuItem.price - selectedRecipeCogs) /
+                      {(() => {
+                        const headerMargin =
+                          selectedMenuItem.price > 0
+                            ? ((selectedMenuItem.price - selectedRecipeCogs) /
                                 selectedMenuItem.price) *
                               100
-                            ).toFixed(1)
-                          : '0.0'}
-                        %
-                      </Chip>
+                            : 0;
+                        return (
+                          <Chip
+                            size="sm"
+                            variant="soft"
+                            color={
+                              headerMargin >= 65
+                                ? 'success'
+                                : headerMargin >= 50
+                                  ? 'warning'
+                                  : 'danger'
+                            }
+                          >
+                            Margin: {headerMargin.toFixed(1)}%
+                          </Chip>
+                        );
+                      })()}
                     </div>
                   </div>
 
@@ -597,12 +627,17 @@ export default function AdminMenuPage() {
 
                   <form
                     onSubmit={addRecipeIngredient}
-                    className="pt-4 border-t border-separator grid grid-cols-1 sm:grid-cols-4 gap-2"
+                    className="pt-4 border-t border-separator grid grid-cols-1 sm:grid-cols-12 gap-2 items-center"
                   >
                     <select
                       value={recipeInvId}
-                      onChange={(e) => setRecipeInvId(Number(e.target.value))}
-                      className="sm:col-span-2 rounded-xl border border-border bg-surface-secondary px-3 py-2 text-xs text-foreground"
+                      onChange={(e) => {
+                        const nextId = Number(e.target.value);
+                        setRecipeInvId(nextId);
+                        const matched = inventoryItems.find((i) => i.id === nextId);
+                        if (matched) setRecipeUnit(defaultRecipeUnitFor(matched));
+                      }}
+                      className="sm:col-span-5 rounded-xl border border-border bg-surface-secondary px-3 py-2 text-xs text-foreground"
                     >
                       {inventoryItems.map((inv) => (
                         <option key={inv.id} value={inv.id}>
@@ -610,30 +645,29 @@ export default function AdminMenuPage() {
                         </option>
                       ))}
                     </select>
-                    <div className="flex gap-1.5">
-                      <Input
-                        type="number"
-                        step="0.01"
-                        variant="secondary"
-                        value={recipeQty}
-                        onChange={(e) => setRecipeQty(e.target.value)}
-                        placeholder="Qty"
-                        required
-                        className="text-xs"
-                      />
-                      <select
-                        value={recipeUnit}
-                        onChange={(e) => setRecipeUnit(e.target.value)}
-                        className="rounded-xl border border-border bg-surface-secondary px-2 py-2 text-xs text-foreground"
-                      >
-                        {['g', 'ml', 'kg', 'L', 'pcs', 'pack'].map((u) => (
-                          <option key={u} value={u}>
-                            {u}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <Button type="submit" variant="primary" size="sm">
+                    <Input
+                      type="number"
+                      step="0.01"
+                      variant="secondary"
+                      value={recipeQty}
+                      onChange={(e) => setRecipeQty(e.target.value)}
+                      placeholder="Qty"
+                      required
+                      className="sm:col-span-2 min-w-0 text-xs"
+                    />
+                    <select
+                      value={recipeUnit}
+                      onChange={(e) => setRecipeUnit(e.target.value)}
+                      aria-label="Ingredient unit"
+                      className="sm:col-span-2 rounded-xl border border-border bg-surface-secondary px-2 py-2 text-xs text-foreground"
+                    >
+                      {['g', 'ml', 'kg', 'L', 'pcs', 'pack', 'slices', 'serving'].map((u) => (
+                        <option key={u} value={u}>
+                          {u}
+                        </option>
+                      ))}
+                    </select>
+                    <Button type="submit" variant="primary" size="sm" className="sm:col-span-3 w-full">
                       + Add Ingredient
                     </Button>
                   </form>

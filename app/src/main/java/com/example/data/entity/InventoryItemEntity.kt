@@ -37,14 +37,19 @@ fun calculatePacksAndCost(
     val packs = when {
         // Explicit container unit (pack, box, bottle, etc.) represents whole packs directly
         u1 in CONTAINER_UNITS -> quantity
-        // Same base unit (e.g. kg->kg, g->g, L->L, ml->ml, pcs->pcs): divide by packSize
-        u1 == u2 || (u1 in KG_UNITS && u2 in KG_UNITS) || (u1 in LITER_UNITS && u2 in LITER_UNITS) || (u1 in PCS_UNITS && u2 in PCS_UNITS) -> {
+        // Same base unit or 1:1 density equivalent (kg<->L, g<->ml, pcs<->pcs): divide by packSize
+        u1 == u2 ||
+            (u1 in KG_UNITS && u2 in KG_UNITS) ||
+            (u1 in LITER_UNITS && u2 in LITER_UNITS) ||
+            (u1 in KG_UNITS && u2 in LITER_UNITS) ||
+            (u1 in LITER_UNITS && u2 in KG_UNITS) ||
+            (u1 == "g" && u2 == "ml") ||
+            (u1 == "ml" && u2 == "g") ||
+            (u1 in PCS_UNITS && u2 in PCS_UNITS) -> {
             quantity / packSize
         }
-        u1 == "g" && u2 in KG_UNITS -> (quantity / 1000.0) / packSize
-        u1 in KG_UNITS && u2 == "g" -> (quantity * 1000.0) / packSize
-        u1 == "ml" && u2 in LITER_UNITS -> (quantity / 1000.0) / packSize
-        u1 in LITER_UNITS && u2 == "ml" -> (quantity * 1000.0) / packSize
+        (u1 == "g" || u1 == "ml") && (u2 in KG_UNITS || u2 in LITER_UNITS) -> (quantity / 1000.0) / packSize
+        (u1 in KG_UNITS || u1 in LITER_UNITS) && (u2 == "g" || u2 == "ml") -> (quantity * 1000.0) / packSize
         isPackItem && (u1 in KG_UNITS || u1 in LITER_UNITS) -> {
             if (packSize > 10.0) (quantity * 1000.0) / packSize else quantity / packSize
         }
