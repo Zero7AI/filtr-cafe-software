@@ -93,14 +93,18 @@ export function calculatePacksAndCost(
   const u1 = (consumedUnit || '').trim().toLowerCase();
   const u2 = (item.unit || '').trim().toLowerCase();
   const packSize = item.standard_quantity > 0 ? item.standard_quantity : 1.0;
+  const packUnits = ['packet', 'packets', 'pack', 'packs', 'can', 'cans', 'tin', 'tins', 'box', 'boxes', 'bottle', 'bottles'];
+  const isPackItem = packUnits.includes(u2);
 
   let packs: number;
-  if (u1 in {} || ['packet', 'packets', 'pack', 'packs', 'can', 'cans', 'tin', 'tins', 'box', 'boxes', 'bottle', 'bottles'].includes(u1)) {
+  if (packUnits.includes(u1)) {
     packs = quantity;
   } else if (
     u1 === u2 ||
     (KG_UNITS.has(u1) && KG_UNITS.has(u2)) ||
+    (G_UNITS.has(u1) && G_UNITS.has(u2)) ||
     (LITER_UNITS.has(u1) && LITER_UNITS.has(u2)) ||
+    (ML_UNITS.has(u1) && ML_UNITS.has(u2)) ||
     (PCS_UNITS.has(u1) && PCS_UNITS.has(u2))
   ) {
     packs = quantity / packSize;
@@ -112,8 +116,12 @@ export function calculatePacksAndCost(
     packs = quantity / 1000 / packSize;
   } else if (LITER_UNITS.has(u1) && ML_UNITS.has(u2)) {
     packs = (quantity * 1000) / packSize;
+  } else if (isPackItem && (KG_UNITS.has(u1) || LITER_UNITS.has(u1))) {
+    packs = packSize > 10.0 ? (quantity * 1000) / packSize : quantity / packSize;
+  } else if (isPackItem && (G_UNITS.has(u1) || ML_UNITS.has(u1))) {
+    packs = packSize > 10.0 ? quantity / packSize : quantity / 1000 / packSize;
   } else {
-    packs = quantity;
+    packs = quantity / packSize;
   }
 
   return { packs, cost: packs * (item.default_price || 0) };
