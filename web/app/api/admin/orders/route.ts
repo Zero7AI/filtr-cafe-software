@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/admin-auth';
 import { DateRangePreset, getIstRangeBoundsMs } from '@/lib/domain/ist';
+import { applyOrderStockDeltaServer } from '@/lib/domain/stock-sync';
 import { KdsItemClaim } from '@/lib/domain/types';
 import {
   fetchOrdersInRangeServer,
@@ -148,10 +149,25 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'orderId required' }, { status: 400 });
     }
     const supabase = getSupabaseAdmin();
+    const { data: existingItems } = await supabase
+      .from('order_items')
+      .select('menu_item_id, item_name, quantity')
+      .eq('order_id', orderId);
+
     await supabase.from('order_items').delete().eq('order_id', orderId);
     const { error } = await supabase.from('orders').delete().eq('order_id', orderId);
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+    if (existingItems && existingItems.length > 0) {
+      await applyOrderStockDeltaServer(
+        existingItems.map((it) => ({
+          menu_item_id: Number(it.menu_item_id || 0),
+          item_name: String(it.item_name || ''),
+          quantity: Number(it.quantity || 0),
+        })),
+        'RESTORE'
+      ).catch(() => []);
     }
     const sheetsResult = await triggerGoogleSheetsWebhook('deleteOrder', { orderId });
     return NextResponse.json({ success: true, sheetsResult });

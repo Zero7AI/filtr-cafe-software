@@ -231,7 +231,17 @@ object RawMaterialPriceTracker {
                 else -> orderItem.quantity
             }
             val packs = convertedQty / packSize
-            return if (packs > 0.0) round2(effectiveTotal / packs) else round2(rawPerBilledUnit)
+            val normalized = if (packs > 0.0) round2(effectiveTotal / packs) else round2(rawPerBilledUnit)
+            val defRate = masterItem.defaultPrice
+            if (defRate > 0.0 &&
+                rawPerBilledUnit >= defRate * 0.4 &&
+                rawPerBilledUnit <= defRate * 1.8 &&
+                ((packSize > 1.2 && bUnit in WEIGHT_KG && normalized > defRate * 2.0) ||
+                    (packSize >= 100.0 && bUnit in WEIGHT_G && normalized > defRate * 5.0))
+            ) {
+                return round2(rawPerBilledUnit)
+            }
+            return normalized
         }
 
         // Case B: Both Volume (ml <-> L)
@@ -246,20 +256,41 @@ object RawMaterialPriceTracker {
         }
 
         // Case C: Billed in Count/Container ("1 pcs", "2 pkt", "1 btl") for a Weight/Volume pack item
-        // e.g. Peri Peri: "1 pcs @ ₹140" mapped to "Peri Peri Seasoning (250 g pack)" -> ₹140 (NOT 140 * 250 = ₹35,000!)
+        // Also normalizes explicit sub-pack bottles (e.g. "Monin Syrup 750ml" vs "1 L" catalog -> price / 0.75)
         if (bIsCount && (mIsWeight || mIsVol)) {
+            val sizeMatch = Regex("(\\d+(?:\\.\\d+)?)\\s*(ml|mls|l|lt|ltr|g|gm|gms|kg|kgs)\\b", RegexOption.IGNORE_CASE)
+                .find(orderItem.itemName)
+            if (sizeMatch != null) {
+                val qtyVal = sizeMatch.groupValues[1].toDoubleOrNull() ?: 0.0
+                val sizeUnit = sizeMatch.groupValues[2].lowercase(Locale.US)
+                if (qtyVal > 0.0) {
+                    val isSizeVol = sizeUnit in VOL_L || sizeUnit in VOL_ML
+                    val explicitBase = when {
+                        sizeUnit in VOL_L || sizeUnit in WEIGHT_KG -> qtyVal * 1000.0
+                        else -> qtyVal
+                    }
+                    if (isSizeVol == mIsVol) {
+                        val masterBase = if (mUnit in VOL_L || mUnit in WEIGHT_KG) packSize * 1000.0 else packSize
+                        val ratio = if (masterBase > 0.0) explicitBase / masterBase else 1.0
+                        if (ratio in 0.15..0.92) {
+                            return round2(rawPerBilledUnit / ratio)
+                        }
+                    }
+                }
+            }
             return round2(rawPerBilledUnit)
         }
 
         // Case D: Billed in Count/Container ("1 pcs" or "12 pcs") mapped to multi-piece pack (e.g. 24-pack Water)
         if (bIsCount && mIsPcs && packSize > 1.0) {
             val defaultPackRate = masterItem.defaultPrice
-            // Only scale up by packSize if clearly billed per single bottle/piece (< 40% of standard pack price)
+            // Only scale up by packSize if clearly billed per single bottle/piece and scaled result isn't an extreme outlier
             if (defaultPackRate > 0.0 && rawPerBilledUnit < defaultPackRate * 0.4 &&
                 bUnit !in setOf("pack", "packs", "pkt", "pkts", "box", "boxes", "case", "cases", "carton", "cartons")
             ) {
                 val packs = orderItem.quantity / packSize
-                if (packs > 0.0) return round2(effectiveTotal / packs)
+                val scaled = if (packs > 0.0) round2(effectiveTotal / packs) else 0.0
+                if (scaled > 0.0 && scaled <= defaultPackRate * 2.2) return scaled
             }
             return round2(rawPerBilledUnit)
         }
@@ -354,12 +385,22 @@ object RawMaterialPriceTracker {
             val unitWeight = formatUnitWeightLabel(sample.master, sample.fallbackUnit)
 
             val billPoints = mutableListOf<SkuBillPoint>()
+            val sortedRates = rawList.map { it.rate }.filter { it > 0.0 }.sorted()
+            val baselineMedian = when {
+                rawList.size < 3 || sortedRates.isEmpty() -> 0.0
+                sortedRates.size % 2 == 1 -> sortedRates[sortedRates.size / 2]
+                else -> (sortedRates[sortedRates.size / 2 - 1] + sortedRates[sortedRates.size / 2]) / 2.0
+            }
             var lastValidPrice: Double? = null
             var hasAnomaly = false
 
             rawList.forEachIndexed { idx, entry ->
-                val isAnomaly = lastValidPrice != null &&
-                    (entry.rate > lastValidPrice!! * 3.0 || entry.rate < lastValidPrice!! * 0.3)
+                val isAnomaly = if (baselineMedian > 0.0) {
+                    entry.rate > baselineMedian * 2.8 || entry.rate < baselineMedian * 0.35
+                } else {
+                    lastValidPrice != null &&
+                        (entry.rate > lastValidPrice!! * 3.0 || entry.rate < lastValidPrice!! * 0.3)
+                }
                 if (isAnomaly) {
                     hasAnomaly = true
                 } else {

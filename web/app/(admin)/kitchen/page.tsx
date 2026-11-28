@@ -240,6 +240,8 @@ export default function AdminKitchenPage() {
                     <Table.Column className="text-right">Opening</Table.Column>
                     <Table.Column className="text-right">Closing</Table.Column>
                     <Table.Column className="text-right">Consumed</Table.Column>
+                    <Table.Column className="text-right">POS Used</Table.Column>
+                    <Table.Column className="text-right">Cut-to-Cut Diff</Table.Column>
                     <Table.Column className="text-right">Wastage</Table.Column>
                     <Table.Column>Status</Table.Column>
                   </Table.Header>
@@ -258,6 +260,16 @@ export default function AdminKitchenPage() {
                         </Table.Cell>
                         <Table.Cell className="text-right text-xs font-bold text-accent tabular-nums">
                           {r.consumedQty !== null ? `${r.consumedQty} ${r.item.unitLabel}` : '—'}
+                        </Table.Cell>
+                        <Table.Cell className="text-right text-xs font-semibold tabular-nums">
+                          {r.posExpectedUsed !== null ? `${r.posExpectedUsed} ${r.item.unitLabel}` : '—'}
+                        </Table.Cell>
+                        <Table.Cell className="text-right text-xs font-bold tabular-nums">
+                          {r.unaccountedDiff !== null ? (
+                            <span className={Math.abs(r.unaccountedDiff) > 50 ? 'text-danger' : 'text-success'}>
+                              {r.unaccountedDiff > 0 ? `+${r.unaccountedDiff}` : r.unaccountedDiff} {r.item.unitLabel}
+                            </span>
+                          ) : '—'}
                         </Table.Cell>
                         <Table.Cell className="text-right text-xs text-danger tabular-nums">
                           {r.wastageQty > 0 ? `${r.wastageQty} ${r.item.unitLabel}` : '0'}

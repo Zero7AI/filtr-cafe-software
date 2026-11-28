@@ -160,13 +160,31 @@ export interface KitchenVarianceRow {
   wastageQty: number;
   wastageReason: string;
   consumedQty: number | null;
+  posExpectedUsed: number | null;
+  unaccountedDiff: number | null;
   latestStatus: KitchenStockStatus;
+}
+
+export function convertQtyToTargetUnit(
+  qty: number,
+  fromUnitRaw: string,
+  toUnitRaw: string
+): number {
+  const fromU = (fromUnitRaw || '').trim().toLowerCase();
+  const toU = (toUnitRaw || '').trim().toLowerCase();
+  if (!fromU || !toU || fromU === toU) return round2(qty);
+  if (fromU === 'kg' && toU === 'g') return round2(qty * 1000);
+  if (fromU === 'g' && toU === 'kg') return round2(qty / 1000);
+  if (fromU === 'l' && toU === 'ml') return round2(qty * 1000);
+  if (fromU === 'ml' && toU === 'l') return round2(qty / 1000);
+  return round2(qty);
 }
 
 export function computeVarianceRows(
   items: KitchenInventoryItem[],
   openingEntries: KitchenInventoryEntry[],
-  closingEntries: KitchenInventoryEntry[]
+  closingEntries: KitchenInventoryEntry[],
+  posUsageByKitchenId?: Map<string, number>
 ): KitchenVarianceRow[] {
   const openingByItem = new Map(openingEntries.map((e) => [e.itemId, e]));
   const closingByItem = new Map(closingEntries.map((e) => [e.itemId, e]));
@@ -183,6 +201,12 @@ export function computeVarianceRows(
         openQty !== null && closeQty !== null
           ? round2(Math.max(0, openQty - closeQty - waste))
           : null;
+      const posVal = posUsageByKitchenId?.get(item.id);
+      const posExpectedUsed = posVal !== undefined ? round2(posVal) : null;
+      const unaccountedDiff =
+        consumed !== null && posExpectedUsed !== null
+          ? round2(consumed - posExpectedUsed)
+          : null;
       const latestStatus: KitchenStockStatus = closeEntry
         ? closeEntry.stockStatus
         : openEntry
@@ -196,6 +220,8 @@ export function computeVarianceRows(
         wastageQty: round2(waste),
         wastageReason: closeEntry?.wastageReason || '',
         consumedQty: consumed,
+        posExpectedUsed,
+        unaccountedDiff,
         latestStatus,
       };
     });

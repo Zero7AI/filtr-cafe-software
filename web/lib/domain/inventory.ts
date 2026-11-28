@@ -26,7 +26,12 @@ const NON_INGREDIENT_HARDWARE = new Set([
 ]);
 
 const GENERIC_SINGLE_TOKENS = new Set([
-  'water', 'ice', 'milk', 'sugar', 'cup', 'cups', 'sauce', 'syrup', 'base', 'powder',
+  'water', 'ice', 'milk', 'sugar', 'cup', 'cups', 'sauce', 'syrup', 'base', 'powder', 'bottle', 'bottles', 'monin',
+]);
+
+const DISTINCT_FLAVOR_TOKENS = new Set([
+  'caramel', 'hazelnut', 'vanilla', 'tiramisu', 'coconut', 'chocolate', 'choc',
+  'peach', 'lemon', 'cranberry', 'strawberry', 'mango', 'mint', 'irish', 'mocha', 'toffee', 'cinnamon',
 ]);
 
 const SKU_ALIASES: Array<[RegExp, string]> = [
@@ -160,6 +165,22 @@ export function matchCatalogItem(
     const meaningfulCand = new Set(candTokens.filter((t) => t.length >= 3));
     const overlap = [...meaningfulClean].filter((t) => meaningfulCand.has(t));
 
+    // Prevent cross-flavor collisions (e.g. "Monin Tiramisu Syrup" -> "Monin Caramel Syrup")
+    const cleanFlavors = [...meaningfulClean].filter((t) => DISTINCT_FLAVOR_TOKENS.has(t));
+    const candFlavors = [...meaningfulCand].filter((t) => DISTINCT_FLAVOR_TOKENS.has(t));
+    if (
+      cleanFlavors.length > 0 &&
+      candFlavors.length > 0 &&
+      !cleanFlavors.some((f) => candFlavors.includes(f))
+    ) {
+      continue;
+    }
+
+    // Prevent bare "bottle" / "jar" single-word items matching multi-word SKU packs
+    if (cleanTokens.length === 1 && GENERIC_SINGLE_TOKENS.has(cleanTokens[0]) && cleanTokens[0] !== 'water' && candTokens.length >= 2) {
+      continue;
+    }
+
     const minLen = Math.max(1, Math.min(meaningfulClean.size, meaningfulCand.size));
     const maxLen = Math.max(1, Math.max(meaningfulClean.size, meaningfulCand.size));
     const shorterCoverage = overlap.length / minLen;
@@ -189,6 +210,27 @@ export function matchCatalogItem(
   }
 
   return best?.item;
+}
+
+function extractExplicitContainerSizeBase(
+  itemName: string
+): { kind: 'WEIGHT' | 'VOLUME'; baseQty: number } | null {
+  const m = (itemName || '').match(/(\d+(?:\.\d+)?)\s*(ml|mls|l|lt|ltr|g|gm|gms|kg|kgs)\b/i);
+  if (!m) return null;
+  const val = parseFloat(m[1]);
+  if (!Number.isFinite(val) || val <= 0) return null;
+  const u = m[2].toLowerCase();
+  if (LITER_UNITS.has(u)) return { kind: 'VOLUME', baseQty: val * 1000 };
+  if (ML_UNITS.has(u)) return { kind: 'VOLUME', baseQty: val };
+  if (KG_UNITS.has(u)) return { kind: 'WEIGHT', baseQty: val * 1000 };
+  return { kind: 'WEIGHT', baseQty: val };
+}
+
+function medianPrice(values: number[]): number {
+  const sorted = values.filter((v) => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 export function resolvePackUnitPrice(
@@ -224,7 +266,20 @@ export function resolvePackUnitPrice(
           ? orderItem.quantity * 1000
           : orderItem.quantity;
     const packs = converted / packSize;
-    return packs > 0 ? round2(effectiveTotal / packs) : round2(rawPerBilledUnit);
+    const normalized = packs > 0 ? round2(effectiveTotal / packs) : round2(rawPerBilledUnit);
+    // Guard: if catalog item is a multi-kg or multi-gram pack (e.g. 2.5kg Fries @ ₹270, 800g Oil @ ₹152)
+    // and bill mistakenly recorded weight units at pack rate
+    const defRate = masterItem.default_price || 0;
+    if (
+      defRate > 0 &&
+      rawPerBilledUnit >= defRate * 0.4 &&
+      rawPerBilledUnit <= defRate * 1.8 &&
+      ((packSize > 1.2 && KG_UNITS.has(bUnit) && normalized > defRate * 2.0) ||
+        (packSize >= 100 && G_UNITS.has(bUnit) && normalized > defRate * 5.0))
+    ) {
+      return round2(rawPerBilledUnit);
+    }
+    return normalized;
   }
 
   if (bIsVol && mIsVol) {
@@ -238,18 +293,32 @@ export function resolvePackUnitPrice(
     return packs > 0 ? round2(effectiveTotal / packs) : round2(rawPerBilledUnit);
   }
 
-  // Case C: Container/pcs bill unit mapped to weight/volume pack (e.g. Peri Peri 1 pcs = ₹140)
+  // Case C: Container/bottle/pcs bill unit mapped to weight/volume pack.
+  // If line name explicitly states a smaller bottle/pack (e.g. "750ml" vs "1 L" catalog), scale cleanly to per-L/kg!
   if (bIsCount && (mIsWeight || mIsVol)) {
+    const explicit = extractExplicitContainerSizeBase(orderItem.item_name);
+    if (explicit) {
+      const mKind = mIsVol ? 'VOLUME' : 'WEIGHT';
+      if (explicit.kind === mKind) {
+        const masterBase =
+          LITER_UNITS.has(mUnit) || KG_UNITS.has(mUnit) ? packSize * 1000 : packSize;
+        const ratio = masterBase > 0 ? explicit.baseQty / masterBase : 1;
+        if (ratio >= 0.15 && ratio <= 0.92) {
+          return round2(rawPerBilledUnit / ratio);
+        }
+      }
+    }
     return round2(rawPerBilledUnit);
   }
 
-  // Case D: Count/pcs bill unit mapped to multi-pcs pack (e.g. Water 1 pcs = ₹130)
+  // Case D: Count/pcs bill unit mapped to multi-pcs pack (e.g. 24-pack Water Bottles @ ₹130)
   if (bIsCount && mIsPcs && packSize > 1) {
     const defaultPackRate = masterItem.default_price || 0;
     const explicitContainer = ['pack', 'packs', 'pkt', 'pkts', 'box', 'boxes', 'case', 'cases', 'carton', 'cartons'].includes(bUnit);
     if (!explicitContainer && defaultPackRate > 0 && rawPerBilledUnit < defaultPackRate * 0.4) {
       const packs = orderItem.quantity / packSize;
-      if (packs > 0) return round2(effectiveTotal / packs);
+      const scaled = packs > 0 ? round2(effectiveTotal / packs) : 0;
+      if (scaled > 0 && scaled <= defaultPackRate * 2.2) return scaled;
     }
     return round2(rawPerBilledUnit);
   }
@@ -410,13 +479,16 @@ export function buildSkuPriceHistoryMatrix(
     if (rawList.length === 0) continue;
     const sample = rawList[0];
     const billPoints: SkuBillPoint[] = [];
+    const baselineMedian = rawList.length >= 3 ? medianPrice(rawList.map((r) => r.rate)) : 0;
     let lastValidPrice: number | null = null;
     let hasUnitAnomaly = false;
 
     rawList.forEach((entry, idx) => {
       const isAnomaly =
-        lastValidPrice !== null &&
-        (entry.rate > lastValidPrice * 3.0 || entry.rate < lastValidPrice * 0.3);
+        baselineMedian > 0
+          ? entry.rate > baselineMedian * 2.8 || entry.rate < baselineMedian * 0.35
+          : lastValidPrice !== null &&
+            (entry.rate > lastValidPrice * 3.0 || entry.rate < lastValidPrice * 0.3);
       if (isAnomaly) {
         hasUnitAnomaly = true;
       } else {

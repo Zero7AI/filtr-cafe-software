@@ -5,6 +5,7 @@ import {
   matchCatalogItem,
   resolvePackUnitPrice,
 } from './inventory';
+import { addPurchasedStockForLinesServer } from './stock-sync';
 import { getIstCompactDate, IST_OFFSET_MS } from './ist';
 import {
   InventoryItem,
@@ -420,19 +421,7 @@ export async function createDatedInventoryOrderServer(
 
   if (linePayloads.length > 0) {
     await supabase.from('inventory_order_items').insert(linePayloads);
-
-    for (const line of linePayloads) {
-      const matched = matchCatalogItem(line.item_name, catalog);
-      if (matched) {
-        const rate = resolvePackUnitPrice(line as InventoryOrderItem, matched);
-        if (rate > 0) {
-          await supabase
-            .from('inventory_items')
-            .update({ default_price: rate })
-            .eq('id', matched.id);
-        }
-      }
-    }
+    await addPurchasedStockForLinesServer(linePayloads, catalog).catch(() => []);
   }
 
   return { orderId, isDuplicate: false, totalAmount, dateKey: dateCompact };

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getIstCompactDate } from '@/lib/domain/ist';
+import { applyOrderStockDeltaServer } from '@/lib/domain/stock-sync';
 import {
   DEFAULT_RECEIPT_CONFIG,
   fetchAccessPolicyConfig,
@@ -189,7 +190,16 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      return NextResponse.json({ success: true });
+      const stockUpdates = await applyOrderStockDeltaServer(
+        items.map((it: Record<string, unknown>) => ({
+          menu_item_id: Number(it.menu_item_id || 0),
+          item_name: String(it.item_name || ''),
+          quantity: Number(it.quantity || 0),
+        })),
+        'DEDUCT'
+      ).catch(() => []);
+
+      return NextResponse.json({ success: true, stockUpdates });
     }
 
     if (action === 'updateOrderStatus') {
@@ -226,8 +236,25 @@ export async function POST(request: NextRequest) {
       if (!orderId) {
         return NextResponse.json({ success: false }, { status: 400 });
       }
+      const { data: existingItems } = await supabase
+        .from('order_items')
+        .select('menu_item_id, item_name, quantity')
+        .eq('order_id', orderId);
+
       await supabase.from('order_items').delete().eq('order_id', orderId);
       const { error } = await supabase.from('orders').delete().eq('order_id', orderId);
+
+      if (!error && existingItems && existingItems.length > 0) {
+        await applyOrderStockDeltaServer(
+          existingItems.map((it) => ({
+            menu_item_id: Number(it.menu_item_id || 0),
+            item_name: String(it.item_name || ''),
+            quantity: Number(it.quantity || 0),
+          })),
+          'RESTORE'
+        ).catch(() => []);
+      }
+
       return NextResponse.json({ success: !error });
     }
 

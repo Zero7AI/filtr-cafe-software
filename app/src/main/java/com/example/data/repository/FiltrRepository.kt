@@ -1864,10 +1864,13 @@ class FiltrRepository(
                 val allUsages = dao.getAllUsagesSnapshot()
                 val usagesByMenuId = allUsages.groupBy { it.menuItemId }
                 for (orderItem in orderItems) {
-                    val usages = if (orderItem.menuItemId > 0) {
+                    val byId = if (orderItem.menuItemId > 0) {
                         usagesByMenuId[orderItem.menuItemId].orEmpty()
+                    } else emptyList()
+                    val usages = if (byId.isNotEmpty()) {
+                        byId
                     } else {
-                        allUsages.filter { it.menuItemName.equals(orderItem.itemName, ignoreCase = true) }
+                        allUsages.filter { it.menuItemName.trim().equals(orderItem.itemName.trim(), ignoreCase = true) }
                     }
                     for (usage in usages) {
                         val totalUsed = usage.quantityUsed * orderItem.quantity

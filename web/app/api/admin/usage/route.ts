@@ -4,6 +4,7 @@ import {
   calculatePacksAndCost,
   computeIngredientUsage,
 } from '@/lib/domain/inventory';
+import { formatLiveStockLabel } from '@/lib/domain/stock-sync';
 import {
   DateRangePreset,
   getIstMonthKey,
@@ -65,6 +66,9 @@ export async function GET(request: NextRequest) {
         ...row,
         category: master?.category || 'General',
         estimatedCost,
+        currentStock: master ? Number(master.current_stock || 0) : 0,
+        stockLabel: master ? formatLiveStockLabel(master) : '—',
+        catalogUnit: master?.unit || row.unit,
       };
     });
 

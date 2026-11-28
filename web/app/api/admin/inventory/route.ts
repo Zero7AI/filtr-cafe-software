@@ -3,9 +3,8 @@ import { requireAdmin } from '@/lib/admin-auth';
 import {
   buildBillLedger,
   buildSkuPriceHistoryMatrix,
-  matchCatalogItem,
-  resolvePackUnitPrice,
 } from '@/lib/domain/inventory';
+import { addPurchasedStockForLinesServer } from '@/lib/domain/stock-sync';
 import { getIstCompactDate } from '@/lib/domain/ist';
 import {
   InventoryItem,
@@ -172,18 +171,7 @@ export async function POST(request: NextRequest) {
 
       const { data: catalogData } = await supabase.from('inventory_items').select('*');
       const catalog = (catalogData || []) as InventoryItem[];
-      for (const line of linePayloads) {
-        const matched = matchCatalogItem(line.item_name, catalog);
-        if (matched) {
-          const packRate = resolvePackUnitPrice(line, matched);
-          if (packRate > 0) {
-            await supabase
-              .from('inventory_items')
-              .update({ default_price: packRate })
-              .eq('id', matched.id);
-          }
-        }
-      }
+      await addPurchasedStockForLinesServer(linePayloads, catalog).catch(() => []);
 
       pushSkuPriceHistoryToWebhook(true).catch(() => {});
       return NextResponse.json({ success: true, orderId });

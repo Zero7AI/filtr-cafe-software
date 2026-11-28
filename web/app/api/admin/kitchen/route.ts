@@ -1,20 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/admin-auth';
-import { getIstDateKey } from '@/lib/domain/ist';
+import {
+  computeIngredientUsage,
+  matchCatalogItem,
+} from '@/lib/domain/inventory';
+import { getIstDateKey, getIstRangeBoundsMs } from '@/lib/domain/ist';
 import {
   buildShiftId,
   calculateTotalUsableQty,
   computeReorderRecommendation,
   computeVarianceRows,
+  convertQtyToTargetUnit,
   evaluateStockStatus,
   KITCHEN_SEED_CATALOG,
 } from '@/lib/domain/kitchen';
 import {
+  InventoryItem,
+  InventoryUsage,
   KitchenInventoryEntry,
   KitchenInventoryItem,
   KitchenInventoryShift,
 } from '@/lib/domain/types';
-import { getSyncMetadataJson, setSyncMetadata } from '@/lib/supabase-server';
+import {
+  fetchOrdersInRangeServer,
+  getSupabaseAdmin,
+  getSyncMetadataJson,
+  setSyncMetadata,
+} from '@/lib/supabase-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -38,8 +50,21 @@ export async function GET(request: NextRequest) {
 
     const openingId = buildShiftId(dateKey, 'OPENING');
     const closingId = buildShiftId(dateKey, 'CLOSING');
+    const { startMs, endMs } = getIstRangeBoundsMs('CUSTOM', {
+      startDate: dateKey,
+      endDate: dateKey,
+    });
+    const supabase = getSupabaseAdmin();
 
-    const [catalog, shiftIndex, openingShift, closingShift] = await Promise.all([
+    const [
+      catalog,
+      shiftIndex,
+      openingShift,
+      closingShift,
+      dayOrders,
+      invItemsRes,
+      invUsagesRes,
+    ] = await Promise.all([
       loadCatalog(),
       getSyncMetadataJson<string[]>('kitchen_inv_shift_index', []),
       getSyncMetadataJson<KitchenInventoryShift | null>(
@@ -50,14 +75,37 @@ export async function GET(request: NextRequest) {
         `kitchen_inv_shift_${closingId}`,
         null
       ),
+      fetchOrdersInRangeServer(startMs, endMs).catch(() => []),
+      supabase.from('inventory_items').select('*'),
+      supabase.from('inventory_usage').select('*'),
     ]);
+
+    const masterItems = (invItemsRes.data || []) as InventoryItem[];
+    const recipeUsages = (invUsagesRes.data || []) as InventoryUsage[];
+    const usageReport = computeIngredientUsage(dayOrders, masterItems, recipeUsages);
+
+    const posUsageByKitchenId = new Map<string, number>();
+    if (usageReport.items.length > 0 && masterItems.length > 0) {
+      const usageByInvId = new Map(usageReport.items.map((u) => [u.inventoryItemId, u]));
+      for (const kItem of catalog) {
+        const matchedMaster = matchCatalogItem(kItem.name, masterItems);
+        if (!matchedMaster) continue;
+        const used = usageByInvId.get(matchedMaster.id);
+        if (!used) continue;
+        posUsageByKitchenId.set(
+          kItem.id,
+          convertQtyToTargetUnit(used.totalQuantity, used.unit, kItem.unitLabel)
+        );
+      }
+    }
 
     const openingEntries = openingShift?.entries || [];
     const closingEntries = closingShift?.entries || [];
     const varianceRows = computeVarianceRows(
       catalog,
       openingEntries,
-      closingEntries
+      closingEntries,
+      posUsageByKitchenId
     );
 
     const latestByItem = new Map<string, KitchenInventoryEntry>();

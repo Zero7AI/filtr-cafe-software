@@ -54,7 +54,13 @@ object RawMaterialReceiptParser {
         RegexOption.IGNORE_CASE
     )
 
-    private val GENERIC_SINGLE_TOKENS = setOf("water", "ice", "milk", "sugar", "cup", "cups", "sauce", "syrup", "base", "powder")
+    private val GENERIC_SINGLE_TOKENS = setOf(
+        "water", "ice", "milk", "sugar", "cup", "cups", "sauce", "syrup", "base", "powder", "bottle", "bottles", "monin"
+    )
+    private val DISTINCT_FLAVOR_TOKENS = setOf(
+        "caramel", "hazelnut", "vanilla", "tiramisu", "coconut", "chocolate", "choc",
+        "peach", "lemon", "cranberry", "strawberry", "mango", "mint", "irish", "mocha", "toffee", "cinnamon"
+    )
 
     fun normalizeSkuMatchText(raw: String): String {
         var normalized = raw.trim().lowercase(Locale.US)
@@ -109,6 +115,16 @@ object RawMaterialReceiptParser {
                 val candTokens = candNorm.split(" ").filter { it.length >= 2 }.toSet()
                 val meaningfulClean = cleanTokens.filter { it.length >= 3 }.toSet()
                 val meaningfulCand = candTokens.filter { it.length >= 3 }.toSet()
+
+                val cleanFlavors = meaningfulClean.filter { it in DISTINCT_FLAVOR_TOKENS }
+                val candFlavors = meaningfulCand.filter { it in DISTINCT_FLAVOR_TOKENS }
+                if (cleanFlavors.isNotEmpty() && candFlavors.isNotEmpty() && cleanFlavors.none { it in candFlavors }) {
+                    return@mapNotNull null
+                }
+                if (cleanTokens.size == 1 && cleanTokens.first() in GENERIC_SINGLE_TOKENS && cleanTokens.first() != "water" && candTokens.size >= 2) {
+                    return@mapNotNull null
+                }
+
                 val overlap = meaningfulClean.intersect(meaningfulCand)
 
                 val minLen = minOf(meaningfulClean.size, meaningfulCand.size).coerceAtLeast(1)

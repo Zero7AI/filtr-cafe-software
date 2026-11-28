@@ -20,6 +20,9 @@ import { DateRangePreset, formatInr, getIstDateKey, getIstMonthKey } from '@/lib
 interface EnrichedUsageRow extends CleanIngredientUsageRow {
   category: string;
   estimatedCost: number;
+  currentStock?: number;
+  stockLabel?: string;
+  catalogUnit?: string;
 }
 
 export default function AdminUsagePage() {
@@ -79,7 +82,7 @@ export default function AdminUsagePage() {
 
   const exportCsv = () => {
     const rows = [
-      ['Ingredient', 'Category', 'Exact Usage', 'Quantity', 'Unit', 'Est. Cost (INR)'],
+      ['Ingredient', 'Category', 'Exact Usage', 'Quantity', 'Unit', 'Est. Cost (INR)', 'Live Stock Left'],
       ...filteredItems.map((it) => [
         it.itemName,
         it.category,
@@ -87,6 +90,7 @@ export default function AdminUsagePage() {
         String(it.totalQuantity),
         it.unit,
         it.estimatedCost.toFixed(2),
+        it.stockLabel || '—',
       ]),
     ];
     const csv =
@@ -219,6 +223,7 @@ export default function AdminUsagePage() {
                       <Table.Column>Category</Table.Column>
                       <Table.Column className="text-right">Exact Usage</Table.Column>
                       <Table.Column className="text-right">Est. Cost</Table.Column>
+                      <Table.Column className="text-right">Live Stock Left</Table.Column>
                     </Table.Header>
                     <Table.Body>
                       {filteredItems.map((row) => (
@@ -232,6 +237,16 @@ export default function AdminUsagePage() {
                           </Table.Cell>
                           <Table.Cell className="text-right font-semibold tabular-nums text-muted">
                             {row.estimatedCost > 0 ? formatInr(row.estimatedCost, 2) : '—'}
+                          </Table.Cell>
+                          <Table.Cell className="text-right whitespace-nowrap">
+                            <Chip
+                              size="sm"
+                              variant="soft"
+                              color={(row.currentStock ?? 0) > 0 ? 'success' : 'default'}
+                              className="tabular-nums"
+                            >
+                              {row.stockLabel || '0'}
+                            </Chip>
                           </Table.Cell>
                         </Table.Row>
                       ))}
